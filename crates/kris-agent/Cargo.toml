@@ -1,0 +1,8 @@
+[package]
+name = "kris-agent"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]

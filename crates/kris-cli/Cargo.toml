@@ -1,0 +1,13 @@
+[package]
+name = "kris-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+kris-core = { path = "../kris-core" }
+kris-tools = { path = "../kris-tools" }
+
+anyhow.workspace = true
+clap.workspace = true
