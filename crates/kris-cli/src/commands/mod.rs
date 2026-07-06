@@ -5,6 +5,7 @@ pub mod exit;
 pub mod fix;
 pub mod health;
 pub mod help;
+pub mod model;
 pub mod reset;
 pub mod serve;
 pub mod version;

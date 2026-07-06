@@ -129,12 +129,23 @@ kris /path/to/your/project
 
 ```
 kris > workspace          # show current workspace, or `workspace <path>` to switch
+kris > model              # list Qwen2.5-Coder sizes and which are downloaded
 kris > health             # check whether llama-server is reachable
 kris > serve              # start llama-server in the background if it isn't running
 kris > ask fix the bug in src/main.rs
 kris > fix                # build the project and iteratively fix errors until it works
 kris > reset              # clear the conversation history
 ```
+
+`model <1|2|3>` switches between Qwen2.5-Coder-1.5B/3B/7B-Instruct - it
+only updates `model`/`model_path` in the config (downloading the `.gguf`
+first if needed, with the exact `curl` command printed for you). Since
+llama-server can't swap models without restarting, stop it (Ctrl-C in its
+session, or `pkill -f llama-server`) and run `serve` again afterwards.
+There's no dedicated small "coder" fine-tune newer than Qwen2.5-Coder as of
+this writing - the flagship Qwen3-Coder releases are all large
+mixture-of-experts models (30B+ total parameters) that don't fit on a
+phone, so Qwen2.5-Coder remains the pick for on-device use.
 
 `serve` needs `llama_server_path` and `model_path` configured (the setup
 script does this for you automatically; set them manually otherwise):
