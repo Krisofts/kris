@@ -128,9 +128,9 @@ kris /path/to/your/project
 ```
 
 To switch workspace from inside KRIS without typing a full path, run
-`workspace` on its own - it lists every subfolder of `$HOME` and of
-`$HOME/project` as a numbered menu, and `workspace <number>` switches to
-whichever one you picked.
+`workspace` on its own - it lists every subfolder of `$HOME/project` as a
+numbered menu, and `workspace <number>` switches to whichever one you
+picked.
 
 ```
 kris > workspace          # show current workspace + a numbered list of switchable folders

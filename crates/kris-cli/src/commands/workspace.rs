@@ -95,8 +95,10 @@ fn print_info(context: &Context) {
     }
 }
 
-/// Folders you could plausibly switch to: immediate subfolders of `$HOME`
-/// and of `$HOME/project` (KRIS's default workspace root), deduplicated.
+/// Folders you could plausibly switch to: immediate subfolders of
+/// `$HOME/project` (KRIS's default workspace root). Deliberately scoped to
+/// just that folder rather than all of `$HOME`, which would also surface
+/// unrelated things like `llama.cpp`, `.cargo`, or Termux's `storage`.
 /// Lets `workspace <number>` work without typing a path at all.
 fn candidate_dirs() -> Vec<PathBuf> {
     let Some(home) = home_dir() else {
@@ -104,11 +106,9 @@ fn candidate_dirs() -> Vec<PathBuf> {
     };
 
     let mut dirs = Vec::new();
-    collect_subdirs(&home, &mut dirs);
     collect_subdirs(&home.join("project"), &mut dirs);
 
     dirs.sort();
-    dirs.dedup();
     dirs
 }
 
