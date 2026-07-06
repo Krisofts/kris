@@ -23,11 +23,13 @@ bash scripts/setup-termux.sh 1.5b   # or the smaller 1.5B model, for phones with
 
 This installs the required packages, builds `llama-server` (with the
 `libandroid-spawn` fix applied), downloads the GGUF model, starts
-`llama-server` in the background, builds KRIS, and drops you into the KRIS
-REPL. It's safe to re-run — steps that already finished (packages, the
-llama.cpp build, the model download, an already-running server) are
-skipped. The server keeps running in the background afterwards, so next
-time you just need `cd ~/kris && ./target/release/kris-cli`.
+`llama-server` in the background, creates `~/project` (KRIS's default
+workspace — put the code you want it to work on there), builds KRIS, and
+drops you into the KRIS REPL. It's safe to re-run — steps that already
+finished (packages, the llama.cpp build, the model download, an
+already-running server) are skipped. The server keeps running in the
+background afterwards, so next time you just need
+`cd ~/kris && ./target/release/kris-cli`.
 
 ### Manual setup (or if the script fails partway)
 
@@ -115,9 +117,9 @@ time you just need `cd ~/kris && ./target/release/kris-cli`.
 
 ## Usage
 
-By default KRIS detects the project root by walking up from the current
-working directory looking for `Cargo.toml`, `package.json`, or `artisan`.
-To point it at a specific folder instead, pass it as an argument:
+By default KRIS opens `$HOME/project` (e.g. `~/project` on Termux) as the
+workspace. Put the code you want KRIS to work on there, or point it at a
+different folder with an argument:
 
 ```
 ./target/release/kris-cli /path/to/your/project

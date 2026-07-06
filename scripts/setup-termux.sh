@@ -110,5 +110,7 @@ max_tool_iterations = 6
 EOF2
 fi
 
-log "All set. Launching KRIS..."
+mkdir -p "$HOME/project"
+
+log "All set. Launching KRIS (workspace: $HOME/project)..."
 exec "$KRIS_DIR/target/release/kris-cli"
