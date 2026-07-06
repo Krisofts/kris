@@ -129,10 +129,25 @@ kris /path/to/your/project
 
 ```
 kris > workspace          # show current workspace, or `workspace <path>` to switch
+kris > health             # check whether llama-server is reachable
+kris > serve              # start llama-server in the background if it isn't running
 kris > ask fix the bug in src/main.rs
 kris > fix                # build the project and iteratively fix errors until it works
 kris > reset              # clear the conversation history
 ```
+
+`serve` needs `llama_server_path` and `model_path` configured (the setup
+script does this for you automatically; set them manually otherwise):
+
+```
+kris > config set llama_server_path ~/llama.cpp/build/bin/llama-server
+kris > config set model_path ~/qwen2.5-coder-3b-instruct-q4_k_m.gguf
+kris > serve
+```
+
+Other server-related settings: `context_size` (default 4096), `threads`
+(default `auto`), `mlock` (default `false`) - see the Performance tips
+section below for what these do.
 
 Anything typed that isn't a built-in command is run as a real shell command
 inside the current workspace - `ls -la`, `git status`, `cargo build`,

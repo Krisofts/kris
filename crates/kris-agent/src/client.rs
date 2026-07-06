@@ -87,4 +87,18 @@ impl LlamaClient {
             .map(|choice| choice.message.content)
             .ok_or_else(|| anyhow!("llama-server returned an empty response"))
     }
+
+    /// Checks llama-server's `/health` endpoint with a short timeout, since
+    /// this is meant for quick "is it up?" checks, not waiting on inference.
+    pub async fn health(&self) -> bool {
+        let url = format!("{}/health", self.base_url.trim_end_matches('/'));
+
+        self.http
+            .get(url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+    }
 }

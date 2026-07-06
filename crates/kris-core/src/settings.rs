@@ -11,10 +11,23 @@ pub struct Settings {
     pub temperature: f32,
     pub max_tokens: u32,
     pub max_tool_iterations: u32,
+    /// Path to the llama-server binary, used by the `serve` command.
+    pub llama_server_path: String,
+    /// Path to the .gguf model file, used by the `serve` command.
+    pub model_path: String,
+    pub context_size: u32,
+    /// Passed as `-t` if set; left to llama-server's own default otherwise.
+    pub threads: Option<u32>,
+    pub mlock: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let llama_server_path = crate::home::home_dir()
+            .map(|home| home.join("llama.cpp/build/bin/llama-server"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+
         Self {
             llama_url: "http://127.0.0.1:8080".to_string(),
             model: "qwen2.5-coder-3b-instruct".to_string(),
@@ -24,6 +37,11 @@ impl Default for Settings {
             // Raise it with `config set max_tokens <n>` if answers get cut off.
             max_tokens: 1024,
             max_tool_iterations: 6,
+            llama_server_path,
+            model_path: String::new(),
+            context_size: 4096,
+            threads: None,
+            mlock: false,
         }
     }
 }

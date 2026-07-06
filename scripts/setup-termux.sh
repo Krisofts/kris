@@ -120,7 +120,15 @@ model = "${MODEL_FILE%.gguf}"
 temperature = 0.2
 max_tokens = 1024
 max_tool_iterations = 6
+llama_server_path = "$LLAMA_DIR/build/bin/llama-server"
+model_path = "$MODEL_PATH"
+context_size = $CTX_SIZE
+mlock = $( [ -n "$MLOCK" ] && echo true || echo false )
 EOF2
+
+  if [ -n "$THREADS" ]; then
+    echo "threads = $THREADS" >> "$HOME/.kris/config.toml"
+  fi
 fi
 
 mkdir -p "$HOME/project"

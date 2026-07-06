@@ -1,6 +1,4 @@
-use std::path::PathBuf;
-
-use kris_core::home::home_dir;
+use kris_core::home::resolve_path;
 use kris_core::project::ProjectType;
 use kris_core::workspace::Workspace;
 
@@ -77,27 +75,5 @@ fn print_info(context: &Context) {
         None => {
             println!("No workspace detected.");
         }
-    }
-}
-
-/// Expands a leading `~/`, and resolves any other relative path against the
-/// home directory (matching KRIS's default `$HOME/project` convention),
-/// rather than whatever the process's OS-level cwd happens to be.
-fn resolve_path(input: &str) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return home.join(rest);
-    }
-
-    let path = PathBuf::from(input);
-
-    if path.is_absolute() {
-        return path;
-    }
-
-    match home_dir() {
-        Some(home) => home.join(path),
-        None => path,
     }
 }
