@@ -1,4 +1,8 @@
+use std::io::Write;
+use std::time::Duration;
+
 use serde_json::Value;
+use tokio::time::sleep;
 
 use kris_agent::{Agent, LlamaClient};
 use kris_tools::tool::ToolRegistry;
@@ -51,19 +55,30 @@ impl Command for AskCommand {
             }
         };
 
-        let result = runtime.block_on(agent.run(
-            &mut context.history,
-            &project.root,
-            &project.name,
-            &prompt,
-            |tool_name, args: &Value| {
-                println!("→ using tool `{tool_name}` {args}");
-            },
-        ));
+        let result = runtime.block_on(async {
+            let spinner = tokio::spawn(spin());
+
+            let result = agent
+                .run(
+                    &mut context.history,
+                    &project.root,
+                    &project.name,
+                    &prompt,
+                    |tool_name, args: &Value| {
+                        clear_line();
+                        println!("→ using tool `{tool_name}` {args}");
+                    },
+                )
+                .await;
+
+            spinner.abort();
+            clear_line();
+
+            result
+        });
 
         match result {
             Ok(answer) => {
-                println!();
                 println!("{answer}");
             }
             Err(err) => {
@@ -74,5 +89,22 @@ impl Command for AskCommand {
                 );
             }
         }
+    }
+}
+
+fn clear_line() {
+    print!("\r{}\r", " ".repeat(24));
+    let _ = std::io::stdout().flush();
+}
+
+async fn spin() {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut i = 0;
+
+    loop {
+        print!("\r{} thinking...", FRAMES[i % FRAMES.len()]);
+        let _ = std::io::stdout().flush();
+        i += 1;
+        sleep(Duration::from_millis(90)).await;
     }
 }
