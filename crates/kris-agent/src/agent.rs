@@ -33,16 +33,23 @@ impl Agent {
         }
     }
 
-    fn system_prompt(&self, project_name: &str) -> String {
+    fn system_prompt(&self, project_name: &str, project_type_hint: &str) -> String {
         // Compact (not pretty-printed) to keep the prompt short - every extra
         // token here is reprocessed on every turn, which matters on
         // CPU-only, phone-class hardware.
         let tools_json =
             serde_json::to_string(&self.tools.describe_all()).unwrap_or_else(|_| "[]".to_string());
 
+        let type_line = if project_type_hint.is_empty() {
+            String::new()
+        } else {
+            format!("{project_type_hint}\n")
+        };
+
         format!(
             "You are KRIS, an offline coding assistant running locally in a terminal, \
-             currently working inside the project \"{project_name}\".\n\n\
+             currently working inside the project \"{project_name}\".\n\
+             {type_line}\n\
              You have access to the following tools:\n{tools_json}\n\n\
              To call a tool, respond with ONLY a single, valid JSON object of the form:\n\
              {{\"tool\": \"<tool_name>\", \"args\": {{...}}}}\n\
@@ -65,11 +72,14 @@ impl Agent {
         history: &mut Vec<Message>,
         root: &Path,
         project_name: &str,
+        project_type_hint: &str,
         user_input: &str,
         mut on_tool_call: impl FnMut(&str, &Value, &str),
     ) -> Result<String> {
         if history.is_empty() {
-            history.push(Message::system(self.system_prompt(project_name)));
+            history.push(Message::system(
+                self.system_prompt(project_name, project_type_hint),
+            ));
         }
 
         history.push(Message::user(user_input));

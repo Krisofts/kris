@@ -130,6 +130,7 @@ kris /path/to/your/project
 ```
 kris > workspace          # show current workspace, or `workspace <path>` to switch
 kris > ask fix the bug in src/main.rs
+kris > fix                # build the project and iteratively fix errors until it works
 kris > reset              # clear the conversation history
 ```
 
@@ -138,8 +139,16 @@ inside the current workspace - `ls -la`, `git status`, `cargo build`,
 `npm install`, `python3 script.py`, or anything else Termux has installed
 all just work directly from the KRIS prompt.
 
-`ask` runs an agent loop: the model can call tools (scoped to the detected
-project root) before giving its final answer:
+Both `ask` and `fix` run an agent loop: the model can call tools (scoped to
+the detected project root) before giving its final answer. `fix` is `ask`
+pre-loaded with an instruction to build the project, fix errors one at a
+time, and rebuild until it succeeds (and tests pass) - allowing many more
+tool-call rounds than `ask`'s default, since fixing several errors can take
+a while. The system prompt also gets a short language-specific hint (e.g.
+`cargo check`/`build`/`test` for Rust, `npm install`/`run build`/`test` for
+Node) based on the detected project type.
+
+Available tools:
 
 - `read_file`, `list_directory`, `find_files`, `tree` - browse the project
 - `write_file` - create or overwrite a file
@@ -149,7 +158,9 @@ project root) before giving its final answer:
 - `search_code` - grep file contents by regex across the project
 - `run_command` - run a shell command (e.g. `cargo build`, `cargo test`).
   **Always asks for a y/n confirmation before executing anything** - review
-  the command before approving it.
+  the command before approving it. Answer `a` instead of `y` to approve
+  every command for the rest of that `ask`/`fix` call (useful for `fix`,
+  which may need to build several times in a row).
 
 ## Performance tips (Termux)
 

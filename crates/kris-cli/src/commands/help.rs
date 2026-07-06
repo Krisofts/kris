@@ -24,6 +24,7 @@ impl Command for HelpCommand {
         println!("  version    Show KRIS version");
         println!("  workspace  Show current workspace, or `workspace <path>` to switch");
         println!("  ask        Ask the local coding assistant a question");
+        println!("  fix        Build the project and iteratively fix errors until it works");
         println!("  reset      Reset the assistant conversation");
         println!("  config     Show or change assistant settings");
         println!("  clear      Clear terminal");

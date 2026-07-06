@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::{
     commands::{
         ask::AskCommand, clear::ClearCommand, config::ConfigCommand, exit::ExitCommand,
-        help::HelpCommand, reset::ResetCommand, version::VersionCommand,
+        fix::FixCommand, help::HelpCommand, reset::ResetCommand, version::VersionCommand,
         workspace::WorkspaceCommand,
     },
     context::Context,
@@ -40,6 +40,7 @@ fn build_registry() -> Registry {
     registry.register(ExitCommand);
     registry.register(WorkspaceCommand);
     registry.register(AskCommand);
+    registry.register(FixCommand);
     registry.register(ResetCommand);
     registry.register(ConfigCommand);
 

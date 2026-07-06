@@ -1,3 +1,4 @@
+mod agent_runner;
 mod app;
 mod banner;
 mod command;

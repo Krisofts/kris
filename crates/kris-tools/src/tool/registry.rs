@@ -32,7 +32,7 @@ impl ToolRegistry {
         registry.register(WriteFileTool);
         registry.register(EditFileTool);
         registry.register(SearchCodeTool);
-        registry.register(RunCommandTool);
+        registry.register(RunCommandTool::new());
         registry.register(DeleteFileTool);
         registry.register(MoveFileTool);
 

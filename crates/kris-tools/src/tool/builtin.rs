@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -312,7 +313,17 @@ impl Tool for SearchCodeTool {
     }
 }
 
-pub struct RunCommandTool;
+pub struct RunCommandTool {
+    auto_approve: Cell<bool>,
+}
+
+impl RunCommandTool {
+    pub fn new() -> Self {
+        Self {
+            auto_approve: Cell::new(false),
+        }
+    }
+}
 
 impl Tool for RunCommandTool {
     fn name(&self) -> &'static str {
@@ -343,20 +354,24 @@ impl Tool for RunCommandTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("command".to_string()))?;
 
-        // Wipe any leftover spinner text so the prompt below isn't garbled.
-        print!("\r{}\r", " ".repeat(60));
-        println!("\n┌─ KRIS wants to run a command in {}:", root.display());
-        println!("│  {command}");
-        print!("└─ Run it? [y/N]: ");
-        let _ = io::stdout().flush();
+        if !self.auto_approve.get() {
+            // Wipe any leftover spinner text so the prompt below isn't garbled.
+            print!("\r{}\r", " ".repeat(60));
+            println!("\n┌─ KRIS wants to run a command in {}:", root.display());
+            println!("│  {command}");
+            print!("└─ Run it? [y/N, or a = always for this session]: ");
+            let _ = io::stdout().flush();
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            return Ok("Command not executed (could not read confirmation).".to_string());
-        }
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() {
+                return Ok("Command not executed (could not read confirmation).".to_string());
+            }
 
-        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-            return Ok("Command not executed (user declined).".to_string());
+            match input.trim().to_lowercase().as_str() {
+                "y" | "yes" => {}
+                "a" | "always" => self.auto_approve.set(true),
+                _ => return Ok("Command not executed (user declined).".to_string()),
+            }
         }
 
         let output = std::process::Command::new("sh")

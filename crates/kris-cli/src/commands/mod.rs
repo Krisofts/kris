@@ -2,6 +2,7 @@ pub mod ask;
 pub mod clear;
 pub mod config;
 pub mod exit;
+pub mod fix;
 pub mod help;
 pub mod reset;
 pub mod version;
