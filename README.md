@@ -161,6 +161,12 @@ Other server-related settings: `context_size` (default 4096), `threads`
 `cache_type_k`/`cache_type_v` (default `auto`) - see the Performance tips
 section below for what these do.
 
+`ask` and `fix` no longer require `llama-server` to already be running: if
+it isn't reachable, KRIS automatically runs the same startup logic as
+`serve` first (using `llama_server_path`/`model_path` from config) and only
+then sends the request - so a fresh session just needs `kris > ask ...`,
+not `serve` followed by `ask`.
+
 Anything typed that isn't a built-in command is run as a real shell command
 inside the current workspace - `ls -la`, `git status`, `cargo build`,
 `npm install`, `python3 script.py`, or anything else Termux has installed

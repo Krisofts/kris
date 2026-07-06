@@ -7,6 +7,7 @@ use tokio::time::sleep;
 use kris_agent::{Agent, LlamaClient};
 use kris_tools::tool::ToolRegistry;
 
+use crate::commands::serve;
 use crate::context::Context;
 use crate::style::{bold, dim, red};
 
@@ -21,6 +22,12 @@ pub fn run(context: &mut Context, prompt: &str, min_iterations: u32) {
     };
 
     let settings = context.settings.clone();
+
+    // Don't make the user run `serve` by hand first - if llama-server isn't
+    // reachable, try to bring it up automatically before talking to it.
+    if !serve::check_health(&settings.llama_url) && !serve::ensure_running(&settings) {
+        return;
+    }
 
     let client = LlamaClient::new(settings.llama_url.clone(), settings.model.clone());
     let tools = ToolRegistry::with_defaults();
