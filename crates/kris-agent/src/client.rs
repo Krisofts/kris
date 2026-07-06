@@ -70,22 +70,34 @@ impl LlamaClient {
             stream: false,
         };
 
-        let response = self
-            .http
-            .post(url)
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ChatResponse>()
-            .await?;
+        // A connection failure here usually means llama-server briefly
+        // starved for CPU/RAM (e.g. a heavy `cargo build` run via
+        // run_command) rather than a real crash, so retry a few times with
+        // backoff before giving up - this alone resolves most of those
+        // blips without the user needing to check health/serve manually.
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut attempt = 0;
 
-        response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.content)
-            .ok_or_else(|| anyhow!("llama-server returned an empty response"))
+        loop {
+            attempt += 1;
+
+            match self.http.post(&url).json(&request).send().await {
+                Ok(response) => {
+                    let body = response.error_for_status()?.json::<ChatResponse>().await?;
+
+                    return body
+                        .choices
+                        .into_iter()
+                        .next()
+                        .map(|choice| choice.message.content)
+                        .ok_or_else(|| anyhow!("llama-server returned an empty response"));
+                }
+                Err(err) if err.is_connect() && attempt < MAX_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     /// Checks llama-server's `/health` endpoint with a short timeout, since

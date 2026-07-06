@@ -180,8 +180,15 @@ Available tools:
 
 ## Performance tips (Termux)
 
-CPU-only inference on a phone is the bottleneck, not KRIS itself. Things
-worth trying, roughly in order of impact:
+CPU-only inference on a phone is the bottleneck, not KRIS itself. Running a
+heavy build (`cargo build` via `run_command`) at the same time llama-server
+is holding the model in memory can briefly starve it of CPU/RAM - KRIS
+automatically retries a request a few times with backoff if the connection
+to llama-server drops, which recovers from most of these blips on its own.
+If `ask`/`fix` still reports a connection error after retrying, run
+`health` to confirm, and `serve` to bring it back up if it's really down.
+
+Things worth trying, roughly in order of impact:
 
 - **Use the 1.5B model** (`bash scripts/setup-termux.sh 1.5b`) if the 3B
   model feels too slow — it generates tokens noticeably faster at some
