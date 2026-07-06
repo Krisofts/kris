@@ -30,5 +30,8 @@ impl Command for HelpCommand {
         println!("  pwd        Show current workspace");
         println!("  tree       Show workspace tree");
         println!("  find       Find files by name");
+        println!("  ask        Ask the local coding assistant a question");
+        println!("  reset      Reset the assistant conversation");
+        println!("  config     Show or change assistant settings");
     }
 }

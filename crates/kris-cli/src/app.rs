@@ -1,7 +1,9 @@
 use crate::{
     commands::{
-        cat::CatCommand, clear::ClearCommand, exit::ExitCommand, help::HelpCommand, ls::LsCommand,
-        pwd::PwdCommand, tree::TreeCommand, version::VersionCommand, workspace::WorkspaceCommand,
+        ask::AskCommand, cat::CatCommand, clear::ClearCommand, config::ConfigCommand,
+        exit::ExitCommand, find::FindCommand, help::HelpCommand, ls::LsCommand, pwd::PwdCommand,
+        reset::ResetCommand, tree::TreeCommand, version::VersionCommand,
+        workspace::WorkspaceCommand,
     },
     context::Context,
     registry::Registry,
@@ -25,6 +27,10 @@ impl App {
         registry.register(CatCommand);
         registry.register(PwdCommand);
         registry.register(TreeCommand);
+        registry.register(FindCommand);
+        registry.register(AskCommand);
+        registry.register(ResetCommand);
+        registry.register(ConfigCommand);
 
         Self {
             context: Context::new(),

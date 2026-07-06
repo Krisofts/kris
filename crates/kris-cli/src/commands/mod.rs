@@ -1,9 +1,13 @@
+pub mod ask;
 pub mod cat;
 pub mod clear;
+pub mod config;
 pub mod exit;
+pub mod find;
 pub mod help;
 pub mod ls;
 pub mod pwd;
+pub mod reset;
 pub mod tree;
 pub mod version;
 pub mod workspace;

@@ -1,5 +1,11 @@
 use std::collections::HashMap;
+use std::path::Path;
 
+use serde_json::{json, Value};
+
+use crate::error::ToolError;
+
+use super::builtin::{FindFilesTool, ListDirectoryTool, ReadFileTool, TreeTool, WriteFileTool};
 use super::Tool;
 
 pub struct ToolRegistry {
@@ -11,6 +17,18 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
         }
+    }
+
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+
+        registry.register(ReadFileTool);
+        registry.register(ListDirectoryTool);
+        registry.register(FindFilesTool);
+        registry.register(TreeTool);
+        registry.register(WriteFileTool);
+
+        registry
     }
 
     pub fn register<T>(&mut self, tool: T)
@@ -30,5 +48,30 @@ impl ToolRegistry {
         tools.sort_by(|a, b| a.0.cmp(b.0));
 
         tools
+    }
+
+    pub fn describe_all(&self) -> Vec<Value> {
+        let mut tools = self
+            .tools
+            .values()
+            .map(|tool| {
+                json!({
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "parameters": tool.parameters_schema(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+
+        tools
+    }
+
+    pub fn execute(&self, name: &str, root: &Path, args: &Value) -> Result<String, ToolError> {
+        match self.tools.get(name) {
+            Some(tool) => tool.execute(root, args),
+            None => Err(ToolError::UnknownTool(name.to_string())),
+        }
     }
 }
