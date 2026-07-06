@@ -19,7 +19,10 @@ impl Default for Settings {
             llama_url: "http://127.0.0.1:8080".to_string(),
             model: "qwen2.5-coder-3b-instruct".to_string(),
             temperature: 0.2,
-            max_tokens: 2048,
+            // Kept modest by default: on CPU-only phone hardware, generation
+            // speed is the bottleneck, so a lower cap keeps replies snappy.
+            // Raise it with `config set max_tokens <n>` if answers get cut off.
+            max_tokens: 1024,
             max_tool_iterations: 6,
         }
     }

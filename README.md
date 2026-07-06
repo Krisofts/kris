@@ -136,3 +136,30 @@ kris > reset              # clear the conversation history
 `ask` runs an agent loop: the model can call `read_file`, `list_directory`,
 `find_files`, `tree`, and `write_file` (scoped to the detected project root)
 before giving its final answer.
+
+## Performance tips (Termux)
+
+CPU-only inference on a phone is the bottleneck, not KRIS itself. Things
+worth trying, roughly in order of impact:
+
+- **Use the 1.5B model** (`bash scripts/setup-termux.sh 1.5b`) if the 3B
+  model feels too slow — it generates tokens noticeably faster at some
+  quality cost.
+- **Keep Termux in the foreground** (or run `termux-wake-lock`) while
+  `llama-server` is generating — Android throttles CPU heavily for
+  backgrounded apps, which can make inference dramatically slower.
+- **Tune thread count**: `THREADS=4 bash scripts/setup-termux.sh` (passed
+  as `-t` to `llama-server`). More threads isn't always faster on
+  big.LITTLE phone chips — pinning to just the performance cores can beat
+  using every core. Try a few values and compare.
+- **Lower the context size** if you don't need long conversations:
+  `CTX_SIZE=2048 bash scripts/setup-termux.sh` — less memory and faster
+  prompt processing.
+- **Lock the model in RAM**: `MLOCK=1 bash scripts/setup-termux.sh` (only
+  if you have enough free RAM to spare — it prevents swap-related jitter
+  but can make things worse if memory is already tight).
+- **Cap response length** if answers tend to ramble on: `kris > config set
+  max_tokens 512` (defaults to `1024`).
+
+I haven't been able to benchmark these directly on a phone, so treat them
+as a starting point to experiment from rather than guaranteed wins.

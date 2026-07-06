@@ -7,6 +7,14 @@
 #
 # Safe to re-run: steps that are already done (packages, build, model
 # download, running server) are skipped.
+#
+# Performance tuning (all optional env vars):
+#   THREADS=4       llama-server thread count (default: let it auto-detect;
+#                    on big.LITTLE phone chips, matching only the
+#                    performance cores is often faster than using all of them)
+#   MLOCK=1         pass --mlock to llama-server (locks the model in RAM,
+#                    avoids swap jitter, needs enough free RAM to hold it)
+#   CTX_SIZE=2048   smaller context = less memory + faster prompt processing
 set -euo pipefail
 
 if ! command -v pkg >/dev/null 2>&1; then
@@ -19,6 +27,8 @@ MODEL_SIZE="${1:-${MODEL_SIZE:-3b}}"
 LLAMA_HOST="127.0.0.1"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 CTX_SIZE="${CTX_SIZE:-4096}"
+THREADS="${THREADS:-}"
+MLOCK="${MLOCK:-}"
 
 LLAMA_DIR="$HOME/llama.cpp"
 KRIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -74,8 +84,11 @@ log "Starting llama-server"
 if curl -sf "http://$LLAMA_HOST:$LLAMA_PORT/health" >/dev/null 2>&1; then
   echo "llama-server is already running on port $LLAMA_PORT, skipping."
 else
-  nohup "$LLAMA_DIR/build/bin/llama-server" \
-    -m "$MODEL_PATH" --host "$LLAMA_HOST" --port "$LLAMA_PORT" -c "$CTX_SIZE" \
+  server_args=(-m "$MODEL_PATH" --host "$LLAMA_HOST" --port "$LLAMA_PORT" -c "$CTX_SIZE")
+  [ -n "$THREADS" ] && server_args+=(-t "$THREADS")
+  [ -n "$MLOCK" ] && server_args+=(--mlock)
+
+  nohup "$LLAMA_DIR/build/bin/llama-server" "${server_args[@]}" \
     > "$HOME/llama-server.log" 2>&1 &
   disown
 
@@ -105,7 +118,7 @@ if [ ! -f "$HOME/.kris/config.toml" ]; then
 llama_url = "http://$LLAMA_HOST:$LLAMA_PORT"
 model = "${MODEL_FILE%.gguf}"
 temperature = 0.2
-max_tokens = 2048
+max_tokens = 1024
 max_tool_iterations = 6
 EOF2
 fi

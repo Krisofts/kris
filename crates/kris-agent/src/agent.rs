@@ -34,8 +34,11 @@ impl Agent {
     }
 
     fn system_prompt(&self, project_name: &str) -> String {
-        let tools_json = serde_json::to_string_pretty(&self.tools.describe_all())
-            .unwrap_or_else(|_| "[]".to_string());
+        // Compact (not pretty-printed) to keep the prompt short - every extra
+        // token here is reprocessed on every turn, which matters on
+        // CPU-only, phone-class hardware.
+        let tools_json =
+            serde_json::to_string(&self.tools.describe_all()).unwrap_or_else(|_| "[]".to_string());
 
         format!(
             "You are KRIS, an offline coding assistant running locally in a terminal, \
