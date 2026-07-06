@@ -64,9 +64,13 @@ impl Command for AskCommand {
                     &project.root,
                     &project.name,
                     &prompt,
-                    |tool_name, args: &Value| {
+                    |tool_name, args: &Value, result: &str| {
                         clear_line();
                         println!("→ using tool `{tool_name}` {args}");
+
+                        if let Some(err) = result.strip_prefix("Error: ") {
+                            println!("  ✗ {err}");
+                        }
                     },
                 )
                 .await;
