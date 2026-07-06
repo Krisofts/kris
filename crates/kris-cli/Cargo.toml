@@ -5,6 +5,10 @@ license.workspace = true
 version.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "kris"
+path = "src/main.rs"
+
 [dependencies]
 kris-core = { path = "../kris-core" }
 kris-tools = { path = "../kris-tools" }

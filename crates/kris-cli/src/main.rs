@@ -28,7 +28,7 @@ fn main() {
                     "Warning: could not open project folder \"{}\".",
                     path.display()
                 );
-                println!("Create it, or point KRIS elsewhere: kris-cli <path>");
+                println!("Create it, or point KRIS elsewhere: kris <path>");
             }
 
             app

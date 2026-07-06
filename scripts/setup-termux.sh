@@ -112,5 +112,10 @@ fi
 
 mkdir -p "$HOME/project"
 
+log "Installing the 'kris' command"
+mkdir -p "$PREFIX/bin"
+ln -sf "$KRIS_DIR/target/release/kris" "$PREFIX/bin/kris"
+
 log "All set. Launching KRIS (workspace: $HOME/project)..."
-exec "$KRIS_DIR/target/release/kris-cli"
+echo "From now on, just type 'kris' from anywhere to start it again."
+exec "$KRIS_DIR/target/release/kris"

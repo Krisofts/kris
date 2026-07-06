@@ -10,7 +10,7 @@ running on the same machine — no cloud API involved.
 cargo build --release
 ```
 
-The binary is `target/release/kris-cli`.
+The binary is `target/release/kris`.
 
 ## Running on Termux (Android)
 
@@ -24,12 +24,12 @@ bash scripts/setup-termux.sh 1.5b   # or the smaller 1.5B model, for phones with
 This installs the required packages, builds `llama-server` (with the
 `libandroid-spawn` fix applied), downloads the GGUF model, starts
 `llama-server` in the background, creates `~/project` (KRIS's default
-workspace — put the code you want it to work on there), builds KRIS, and
-drops you into the KRIS REPL. It's safe to re-run — steps that already
-finished (packages, the llama.cpp build, the model download, an
-already-running server) are skipped. The server keeps running in the
-background afterwards, so next time you just need
-`cd ~/kris && ./target/release/kris-cli`.
+workspace — put the code you want it to work on there), builds KRIS,
+symlinks it as `kris` on your `PATH`, and drops you into the KRIS REPL.
+It's safe to re-run — steps that already finished (packages, the
+llama.cpp build, the model download, an already-running server) are
+skipped. The server keeps running in the background afterwards, so next
+time you just need to type `kris` from anywhere.
 
 ### Manual setup (or if the script fails partway)
 
@@ -97,13 +97,15 @@ background afterwards, so next time you just need
    ```
 
 5. Open a new Termux session (swipe from the left edge to add one, so the
-   server keeps running in the first), `cd` into this project, and build
-   and run KRIS there:
+   server keeps running in the first), `cd` into this project, build KRIS,
+   and put it on your `PATH` so you can just type `kris`:
 
    ```
    cd ~/kris
    cargo build --release
-   ./target/release/kris-cli
+   mkdir -p "$PREFIX/bin"
+   ln -sf "$PWD/target/release/kris" "$PREFIX/bin/kris"
+   kris
    ```
 
 6. Point KRIS at the server/model if you changed the defaults:
@@ -122,7 +124,7 @@ workspace. Put the code you want KRIS to work on there, or point it at a
 different folder with an argument:
 
 ```
-./target/release/kris-cli /path/to/your/project
+kris /path/to/your/project
 ```
 
 ```
