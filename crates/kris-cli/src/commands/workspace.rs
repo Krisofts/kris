@@ -84,10 +84,10 @@ fn print_info(context: &Context) {
 /// home directory (matching KRIS's default `$HOME/project` convention),
 /// rather than whatever the process's OS-level cwd happens to be.
 fn resolve_path(input: &str) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
     }
 
     let path = PathBuf::from(input);

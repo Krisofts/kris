@@ -44,14 +44,14 @@ impl Registry {
         }
     }
 
-    pub fn list(&self) -> Vec<(&str, &str)> {
+    pub fn list(&self) -> Vec<(String, String)> {
         let mut commands = self
             .commands
             .values()
-            .map(|command| (command.name(), command.description()))
+            .map(|command| (command.name().to_string(), command.description().to_string()))
             .collect::<Vec<_>>();
 
-        commands.sort_by(|a, b| a.0.cmp(b.0));
+        commands.sort_by(|a, b| a.0.cmp(&b.0));
 
         commands
     }

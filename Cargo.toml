@@ -28,9 +28,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
 
-# CLI
-clap = { version = "4", features = ["derive"] }
-
 # HTTP client (talks to a local llama.cpp `llama-server` instance)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
@@ -41,10 +38,10 @@ ignore = "0.4"
 # Text Processing
 regex = "1"
 
-# Logging
-tracing = "0.1"
-tracing-subscriber = "0.3"
-
-# Utilities
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+[profile.release]
+# Smaller binary for storage-constrained phones. Deliberately not adding
+# lto/codegen-units=1: those trade build-time memory for runtime perf, and
+# this dependency tree has already been observed to OOM the compiler on
+# Termux even in debug builds - not worth risking release builds failing
+# on the same hardware for a marginal runtime gain.
+strip = true

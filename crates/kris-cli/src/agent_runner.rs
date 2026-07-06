@@ -94,13 +94,13 @@ pub fn run(context: &mut Context, prompt: &str, min_iterations: u32) {
 /// Renders a tool call the way Claude Code shows them: `name(primary arg)`
 /// instead of dumping the raw JSON args, so the chat stays readable.
 fn format_tool_call(tool_name: &str, args: &Value) -> String {
-    if tool_name == "move_file" {
-        if let (Some(from), Some(to)) = (
+    if tool_name == "move_file"
+        && let (Some(from), Some(to)) = (
             args.get("from").and_then(Value::as_str),
             args.get("to").and_then(Value::as_str),
-        ) {
-            return format!("{tool_name}({from} → {to})");
-        }
+        )
+    {
+        return format!("{tool_name}({from} → {to})");
     }
 
     let summary = ["command", "path", "pattern", "keyword"]

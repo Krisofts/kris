@@ -317,6 +317,12 @@ pub struct RunCommandTool {
     auto_approve: Cell<bool>,
 }
 
+impl Default for RunCommandTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RunCommandTool {
     pub fn new() -> Self {
         Self {

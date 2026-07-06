@@ -34,7 +34,6 @@ impl App {
 fn build_registry() -> Registry {
     let mut registry = Registry::new();
 
-    registry.register(HelpCommand);
     registry.register(VersionCommand);
     registry.register(ClearCommand);
     registry.register(ExitCommand);
@@ -43,6 +42,9 @@ fn build_registry() -> Registry {
     registry.register(FixCommand);
     registry.register(ResetCommand);
     registry.register(ConfigCommand);
+
+    let commands = registry.list();
+    registry.register(HelpCommand::new(commands));
 
     registry
 }
