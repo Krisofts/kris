@@ -128,10 +128,15 @@ kris /path/to/your/project
 ```
 
 ```
-kris > workspace          # show detected project (Rust/Node/Laravel/...)
+kris > workspace          # show current workspace, or `workspace <path>` to switch
 kris > ask fix the bug in src/main.rs
 kris > reset              # clear the conversation history
 ```
+
+Anything typed that isn't a built-in command is run as a real shell command
+inside the current workspace - `ls -la`, `git status`, `cargo build`,
+`npm install`, `python3 script.py`, or anything else Termux has installed
+all just work directly from the KRIS prompt.
 
 `ask` runs an agent loop: the model can call tools (scoped to the detected
 project root) before giving its final answer:

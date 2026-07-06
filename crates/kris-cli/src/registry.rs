@@ -38,8 +38,7 @@ impl Registry {
                 command_name != "exit"
             }
             None => {
-                println!("Unknown command: {}", command_name);
-                println!("Type 'help' to see available commands.");
+                crate::shell::run(context, input);
                 true
             }
         }

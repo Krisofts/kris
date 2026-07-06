@@ -5,6 +5,7 @@ mod commands;
 mod context;
 mod registry;
 mod repl;
+mod shell;
 
 use std::path::PathBuf;
 
