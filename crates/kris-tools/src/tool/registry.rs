@@ -5,7 +5,10 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 
-use super::builtin::{FindFilesTool, ListDirectoryTool, ReadFileTool, TreeTool, WriteFileTool};
+use super::builtin::{
+    EditFileTool, FindFilesTool, ListDirectoryTool, ReadFileTool, RunCommandTool, SearchCodeTool,
+    TreeTool, WriteFileTool,
+};
 use super::Tool;
 
 pub struct ToolRegistry {
@@ -27,6 +30,9 @@ impl ToolRegistry {
         registry.register(FindFilesTool);
         registry.register(TreeTool);
         registry.register(WriteFileTool);
+        registry.register(EditFileTool);
+        registry.register(SearchCodeTool);
+        registry.register(RunCommandTool);
 
         registry
     }

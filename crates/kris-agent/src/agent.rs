@@ -49,7 +49,9 @@ impl Agent {
              Send exactly one tool call at a time - never more than one JSON object in a \
              single reply. Properly escape any double quotes and newlines inside string \
              values (\\\" and \\n), so the JSON stays valid. Do not add any text before or \
-             after the JSON object when calling a tool.\n\n\
+             after the JSON object when calling a tool. Prefer edit_file over write_file \
+             when changing part of a file that already exists, and use run_command to \
+             build or test code after changing it.\n\n\
              Once you have enough information to answer the user, respond with plain \
              text (no JSON) containing your final answer. Keep answers focused and \
              include code blocks when showing code."

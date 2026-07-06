@@ -1,5 +1,8 @@
+use std::io::{self, Write};
 use std::path::Path;
 
+use ignore::WalkBuilder;
+use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
@@ -163,5 +166,221 @@ impl Tool for WriteFileTool {
         write_file(root.join(path), content)?;
 
         Ok(format!("Wrote {} bytes to {path}", content.len()))
+    }
+}
+
+pub struct EditFileTool;
+
+impl Tool for EditFileTool {
+    fn name(&self) -> &'static str {
+        "edit_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Replace an exact occurrence of old_string with new_string in an existing file. \
+         Prefer this over write_file for small changes to existing files. old_string must \
+         match exactly once, unless replace_all is true."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to the project root" },
+                "old_string": { "type": "string", "description": "Exact text to find, including whitespace" },
+                "new_string": { "type": "string", "description": "Text to replace it with" },
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of requiring exactly one match (default false)" }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("path".to_string()))?;
+
+        let old_string = args
+            .get("old_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("old_string".to_string()))?;
+
+        let new_string = args
+            .get("new_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("new_string".to_string()))?;
+
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let full_path = root.join(path);
+        let content = cat(&full_path)?;
+
+        let occurrences = content.matches(old_string).count();
+
+        if occurrences == 0 {
+            return Err(ToolError::Tool(format!("old_string not found in {path}")));
+        }
+
+        if occurrences > 1 && !replace_all {
+            return Err(ToolError::Tool(format!(
+                "old_string matches {occurrences} times in {path}; make it unique or set replace_all: true"
+            )));
+        }
+
+        let updated = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            content.replacen(old_string, new_string, 1)
+        };
+
+        write_file(&full_path, &updated)?;
+
+        let count = if replace_all { occurrences } else { 1 };
+
+        Ok(format!("Replaced {count} occurrence(s) in {path}"))
+    }
+}
+
+pub struct SearchCodeTool;
+
+impl Tool for SearchCodeTool {
+    fn name(&self) -> &'static str {
+        "search_code"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search file contents for a regex pattern across the project (like grep -rn), \
+         skipping .git and anything ignored by .gitignore. Returns matching \
+         path:line: text, capped to the first 200 matches."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Regex pattern to search for" }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        const MAX_MATCHES: usize = 200;
+
+        let pattern = args
+            .get("pattern")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("pattern".to_string()))?;
+
+        let regex =
+            Regex::new(pattern).map_err(|err| ToolError::Tool(format!("invalid regex: {err}")))?;
+
+        let mut matches = Vec::new();
+
+        'walk: for entry in WalkBuilder::new(root).build().filter_map(Result::ok) {
+            let path = entry.path();
+
+            if !path.is_file() {
+                continue;
+            }
+
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+
+            for (i, line) in content.lines().enumerate() {
+                if regex.is_match(line) {
+                    let rel = path.strip_prefix(root).unwrap_or(path);
+                    matches.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
+
+                    if matches.len() >= MAX_MATCHES {
+                        break 'walk;
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            Ok("No matches found.".to_string())
+        } else {
+            Ok(matches.join("\n"))
+        }
+    }
+}
+
+pub struct RunCommandTool;
+
+impl Tool for RunCommandTool {
+    fn name(&self) -> &'static str {
+        "run_command"
+    }
+
+    fn description(&self) -> &'static str {
+        "Run a shell command inside the project root (e.g. `cargo build`, `cargo test`, \
+         `npm install`). Asks the user for a y/n confirmation before executing anything. \
+         Output is captured and truncated if long."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "The shell command to run, e.g. \"cargo test\"" }
+            },
+            "required": ["command"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        const MAX_OUTPUT: usize = 4000;
+
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("command".to_string()))?;
+
+        // Wipe any leftover spinner text so the prompt below isn't garbled.
+        print!("\r{}\r", " ".repeat(60));
+        println!("\n┌─ KRIS wants to run a command in {}:", root.display());
+        println!("│  {command}");
+        print!("└─ Run it? [y/N]: ");
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return Ok("Command not executed (could not read confirmation).".to_string());
+        }
+
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            return Ok("Command not executed (user declined).".to_string());
+        }
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(root)
+            .output()
+            .map_err(|err| ToolError::Tool(format!("failed to run command: {err}")))?;
+
+        let mut combined = String::new();
+        combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+        if combined.len() > MAX_OUTPUT {
+            combined.truncate(MAX_OUTPUT);
+            combined.push_str("\n...(output truncated)");
+        }
+
+        let status = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Ok(format!("exit code: {status}\n{combined}"))
     }
 }

@@ -133,9 +133,16 @@ kris > ask fix the bug in src/main.rs
 kris > reset              # clear the conversation history
 ```
 
-`ask` runs an agent loop: the model can call `read_file`, `list_directory`,
-`find_files`, `tree`, and `write_file` (scoped to the detected project root)
-before giving its final answer.
+`ask` runs an agent loop: the model can call tools (scoped to the detected
+project root) before giving its final answer:
+
+- `read_file`, `list_directory`, `find_files`, `tree` - browse the project
+- `write_file` - create or overwrite a file
+- `edit_file` - replace an exact snippet inside an existing file
+- `search_code` - grep file contents by regex across the project
+- `run_command` - run a shell command (e.g. `cargo build`, `cargo test`).
+  **Always asks for a y/n confirmation before executing anything** - review
+  the command before approving it.
 
 ## Performance tips (Termux)
 
