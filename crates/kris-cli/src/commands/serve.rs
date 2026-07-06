@@ -92,7 +92,10 @@ impl Command for ServeCommand {
         }
 
         if settings.flash_attn {
-            command.push_str("--flash-attn ");
+            // Explicit value, not a bare flag: recent llama-server builds
+            // parse --flash-attn as taking an on/off/auto argument, and a
+            // bare flag would swallow the next flag's token as its value.
+            command.push_str("--flash-attn on ");
         }
 
         if let Some(cache_type) = &settings.cache_type_k {

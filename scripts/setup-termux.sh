@@ -94,7 +94,7 @@ else
   server_args=(-m "$MODEL_PATH" --host "$LLAMA_HOST" --port "$LLAMA_PORT" -c "$CTX_SIZE")
   [ -n "$THREADS" ] && server_args+=(-t "$THREADS")
   [ -n "$MLOCK" ] && server_args+=(--mlock)
-  [ -n "$FLASH_ATTN" ] && server_args+=(--flash-attn)
+  [ -n "$FLASH_ATTN" ] && server_args+=(--flash-attn on)
   [ -n "$CACHE_TYPE_K" ] && server_args+=(--cache-type-k "$CACHE_TYPE_K")
   [ -n "$CACHE_TYPE_V" ] && server_args+=(--cache-type-v "$CACHE_TYPE_V")
 
