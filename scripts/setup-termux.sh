@@ -15,6 +15,10 @@
 #   MLOCK=1         pass --mlock to llama-server (locks the model in RAM,
 #                    avoids swap jitter, needs enough free RAM to hold it)
 #   CTX_SIZE=2048   smaller context = less memory + faster prompt processing
+#   FLASH_ATTN=1    pass --flash-attn (faster attention, no quality loss;
+#                    needs a reasonably recent llama.cpp build)
+#   CACHE_TYPE_K=q8_0  quantize the KV cache (roughly halves its memory use
+#   CACHE_TYPE_V=q8_0  for a small, usually unnoticeable quality cost)
 set -euo pipefail
 
 if ! command -v pkg >/dev/null 2>&1; then
@@ -29,6 +33,9 @@ LLAMA_PORT="${LLAMA_PORT:-8080}"
 CTX_SIZE="${CTX_SIZE:-4096}"
 THREADS="${THREADS:-}"
 MLOCK="${MLOCK:-}"
+FLASH_ATTN="${FLASH_ATTN:-}"
+CACHE_TYPE_K="${CACHE_TYPE_K:-}"
+CACHE_TYPE_V="${CACHE_TYPE_V:-}"
 
 LLAMA_DIR="$HOME/llama.cpp"
 KRIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -87,6 +94,9 @@ else
   server_args=(-m "$MODEL_PATH" --host "$LLAMA_HOST" --port "$LLAMA_PORT" -c "$CTX_SIZE")
   [ -n "$THREADS" ] && server_args+=(-t "$THREADS")
   [ -n "$MLOCK" ] && server_args+=(--mlock)
+  [ -n "$FLASH_ATTN" ] && server_args+=(--flash-attn)
+  [ -n "$CACHE_TYPE_K" ] && server_args+=(--cache-type-k "$CACHE_TYPE_K")
+  [ -n "$CACHE_TYPE_V" ] && server_args+=(--cache-type-v "$CACHE_TYPE_V")
 
   nohup "$LLAMA_DIR/build/bin/llama-server" "${server_args[@]}" \
     > "$HOME/llama-server.log" 2>&1 &
@@ -124,10 +134,17 @@ llama_server_path = "$LLAMA_DIR/build/bin/llama-server"
 model_path = "$MODEL_PATH"
 context_size = $CTX_SIZE
 mlock = $( [ -n "$MLOCK" ] && echo true || echo false )
+flash_attn = $( [ -n "$FLASH_ATTN" ] && echo true || echo false )
 EOF2
 
   if [ -n "$THREADS" ]; then
     echo "threads = $THREADS" >> "$HOME/.kris/config.toml"
+  fi
+  if [ -n "$CACHE_TYPE_K" ]; then
+    echo "cache_type_k = \"$CACHE_TYPE_K\"" >> "$HOME/.kris/config.toml"
+  fi
+  if [ -n "$CACHE_TYPE_V" ]; then
+    echo "cache_type_v = \"$CACHE_TYPE_V\"" >> "$HOME/.kris/config.toml"
   fi
 fi
 

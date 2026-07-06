@@ -32,6 +32,15 @@ impl Command for ConfigCommand {
                     .unwrap_or_else(|| "auto".to_string())
             );
             println!("mlock                : {}", settings.mlock);
+            println!("flash_attn           : {}", settings.flash_attn);
+            println!(
+                "cache_type_k         : {}",
+                settings.cache_type_k.as_deref().unwrap_or("auto")
+            );
+            println!(
+                "cache_type_v         : {}",
+                settings.cache_type_v.as_deref().unwrap_or("auto")
+            );
             println!();
             println!("Usage: config set <key> <value>");
             return;
@@ -102,6 +111,27 @@ impl Command for ConfigCommand {
                     return;
                 }
             },
+            "flash_attn" => match value.parse() {
+                Ok(parsed) => context.settings.flash_attn = parsed,
+                Err(_) => {
+                    println!("Invalid bool for flash_attn: {value} (use true or false)");
+                    return;
+                }
+            },
+            "cache_type_k" => {
+                context.settings.cache_type_k = if value.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
+            "cache_type_v" => {
+                context.settings.cache_type_v = if value.eq_ignore_ascii_case("auto") {
+                    None
+                } else {
+                    Some(value)
+                }
+            }
             other => {
                 println!("Unknown setting: {other}");
                 return;

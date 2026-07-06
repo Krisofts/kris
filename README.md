@@ -157,7 +157,8 @@ kris > serve
 ```
 
 Other server-related settings: `context_size` (default 4096), `threads`
-(default `auto`), `mlock` (default `false`) - see the Performance tips
+(default `auto`), `mlock` (default `false`), `flash_attn` (default `false`),
+`cache_type_k`/`cache_type_v` (default `auto`) - see the Performance tips
 section below for what these do.
 
 Anything typed that isn't a built-in command is run as a real shell command
@@ -201,6 +202,24 @@ If `ask`/`fix` still reports a connection error after retrying, run
 
 Things worth trying, roughly in order of impact:
 
+- **Quantize the KV cache**: `CACHE_TYPE_K=q8_0 CACHE_TYPE_V=q8_0 bash
+  scripts/setup-termux.sh` (or `kris > config set cache_type_k q8_0` /
+  `cache_type_v q8_0` on an existing setup, then restart `serve`). This is
+  usually the best memory-per-quality trade available: it roughly halves
+  the KV cache's memory footprint (the part of memory that grows with
+  context length and conversation history) for a quality hit that's
+  normally hard to notice - unlike switching to a smaller model, the model
+  weights themselves don't change. The freed-up memory can go toward a
+  larger `context_size` instead, or just toward headroom so `llama-server`
+  doesn't get starved when a build is running at the same time. `q4_0` is
+  more aggressive (roughly a quarter of f16) with a more noticeable quality
+  cost - only reach for it if `q8_0` isn't enough.
+- **Enable flash attention**: `FLASH_ATTN=1 bash scripts/setup-termux.sh`
+  (or `kris > config set flash_attn true`). Speeds up attention computation
+  with no quality loss - it's opt-in rather than the default only because
+  it needs a reasonably recent llama.cpp build; if `serve` fails after
+  turning it on, rebuild llama.cpp from the latest master. Combine this
+  with KV cache quantization above for the best of both.
 - **Use the 1.5B model** (`bash scripts/setup-termux.sh 1.5b`) if the 3B
   model feels too slow — it generates tokens noticeably faster at some
   quality cost.

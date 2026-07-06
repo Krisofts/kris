@@ -19,6 +19,16 @@ pub struct Settings {
     /// Passed as `-t` if set; left to llama-server's own default otherwise.
     pub threads: Option<u32>,
     pub mlock: bool,
+    /// Passed as `--flash-attn` if true. Speeds up attention with no quality
+    /// loss, but the flag is only recognized by reasonably recent llama.cpp
+    /// builds, so it's opt-in rather than default.
+    pub flash_attn: bool,
+    /// Passed as `--cache-type-k`/`--cache-type-v` if set (e.g. "q8_0").
+    /// Quantizing the KV cache roughly halves its memory use for a small,
+    /// usually unnoticeable quality cost - left unset to keep llama-server's
+    /// f16 default otherwise.
+    pub cache_type_k: Option<String>,
+    pub cache_type_v: Option<String>,
 }
 
 impl Default for Settings {
@@ -42,6 +52,9 @@ impl Default for Settings {
             context_size: 4096,
             threads: None,
             mlock: false,
+            flash_attn: false,
+            cache_type_k: None,
+            cache_type_v: None,
         }
     }
 }

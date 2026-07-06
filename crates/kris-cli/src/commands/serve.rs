@@ -91,6 +91,18 @@ impl Command for ServeCommand {
             command.push_str("--mlock ");
         }
 
+        if settings.flash_attn {
+            command.push_str("--flash-attn ");
+        }
+
+        if let Some(cache_type) = &settings.cache_type_k {
+            command.push_str(&format!("--cache-type-k {} ", shell_quote(cache_type)));
+        }
+
+        if let Some(cache_type) = &settings.cache_type_v {
+            command.push_str(&format!("--cache-type-v {} ", shell_quote(cache_type)));
+        }
+
         command.push_str(&format!(
             "> {} 2>&1 &",
             shell_quote(&log_path.display().to_string())
