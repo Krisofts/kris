@@ -14,21 +14,35 @@ The binary is `target/release/kris-cli`.
 
 ## Running on Termux (Android)
 
-1. Install build tools and Rust:
+1. Install build tools and Rust. `libandroid-spawn` is required — without it,
+   building `llama-server` fails with `fatal error: 'spawn.h' file not
+   found`, because Android doesn't ship `posix_spawn` support by default:
 
    ```
    pkg update && pkg upgrade
-   pkg install git cmake clang make rust
+   pkg install git cmake clang make rust libandroid-spawn
    ```
 
-2. Build llama.cpp (provides `llama-server`):
+2. Clone and build llama.cpp **outside** of this repo (e.g. in your home
+   directory — don't nest it inside `kris/`, they're unrelated git repos):
 
    ```
+   cd ~
    git clone https://github.com/ggml-org/llama.cpp
    cd llama.cpp
    cmake -B build -DGGML_LLAMAFILE=OFF
-   cmake --build build --config Release -j $(nproc)
-   cd ..
+   cmake --build build --config Release --target llama-server -j 2
+   ```
+
+   Use a low `-j` (2 or even 1) instead of `-j $(nproc)` — building with too
+   many parallel jobs is a common way to get the compiler OOM-killed on a
+   phone. If the build fails partway with no clear compiler error (the shell
+   just returns to the prompt), that's usually OOM: rerun with `-j 1`.
+
+   Verify it actually built before moving on:
+
+   ```
+   ls -la ~/llama.cpp/build/bin/llama-server
    ```
 
 3. Get shared storage access and download a small GGUF coding model
@@ -36,6 +50,7 @@ The binary is `target/release/kris-cli`.
 
    ```
    termux-setup-storage
+   cd ~
 
    # ~2GB, needs more RAM but better quality
    curl -L -o qwen2.5-coder-3b-instruct-q4_k_m.gguf \
@@ -46,19 +61,28 @@ The binary is `target/release/kris-cli`.
        "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf?download=true"
    ```
 
-4. Start the local inference server (keep this session running), pointing
-   `-m` at whichever `.gguf` you downloaded:
+   Double-check the download actually completed before starting the server —
+   a truncated download still leaves a file behind, just a much smaller one:
 
    ```
-   ./llama.cpp/build/bin/llama-server \
-       -m qwen2.5-coder-3b-instruct-q4_k_m.gguf \
+   ls -la ~/*.gguf
+   ```
+
+4. Start the local inference server (keep this Termux session running),
+   pointing `-m` at whichever `.gguf` you downloaded:
+
+   ```
+   ~/llama.cpp/build/bin/llama-server \
+       -m ~/qwen2.5-coder-3b-instruct-q4_k_m.gguf \
        --host 127.0.0.1 --port 8080 -c 4096
    ```
 
 5. Open a new Termux session (swipe from the left edge to add one, so the
-   server keeps running in the first), then build and run KRIS there:
+   server keeps running in the first), `cd` into this project, and build
+   and run KRIS there:
 
    ```
+   cd ~/kris
    cargo build --release
    ./target/release/kris-cli
    ```
