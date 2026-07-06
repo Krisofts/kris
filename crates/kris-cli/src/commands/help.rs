@@ -22,7 +22,7 @@ impl Command for HelpCommand {
         println!("Available commands:");
         println!("  help       Show available commands");
         println!("  version    Show KRIS version");
-        println!("  workspace  Show current workspace");
+        println!("  workspace  Show current workspace, or `workspace <path>` to switch");
         println!("  ls         List files in workspace");
         println!("  clear      Clear terminal");
         println!("  exit       Exit KRIS");
