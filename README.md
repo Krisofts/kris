@@ -14,6 +14,23 @@ The binary is `target/release/kris-cli`.
 
 ## Running on Termux (Android)
 
+### Quick setup (one command)
+
+```
+bash scripts/setup-termux.sh        # defaults to the 3B model
+bash scripts/setup-termux.sh 1.5b   # or the smaller 1.5B model, for phones with less RAM
+```
+
+This installs the required packages, builds `llama-server` (with the
+`libandroid-spawn` fix applied), downloads the GGUF model, starts
+`llama-server` in the background, builds KRIS, and drops you into the KRIS
+REPL. It's safe to re-run — steps that already finished (packages, the
+llama.cpp build, the model download, an already-running server) are
+skipped. The server keeps running in the background afterwards, so next
+time you just need `cd ~/kris && ./target/release/kris-cli`.
+
+### Manual setup (or if the script fails partway)
+
 1. Install build tools and Rust. `libandroid-spawn` is required — without it,
    building `llama-server` fails with `fatal error: 'spawn.h' file not
    found`, because Android doesn't ship `posix_spawn` support by default:
