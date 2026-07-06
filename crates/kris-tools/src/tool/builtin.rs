@@ -482,6 +482,61 @@ impl Tool for DeleteFileTool {
     }
 }
 
+pub struct DeleteDirectoryTool;
+
+impl Tool for DeleteDirectoryTool {
+    fn name(&self) -> &'static str {
+        "delete_directory"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delete a directory and everything inside it, given a path relative to the project \
+         root. Refuses to delete the project root itself."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory path relative to the project root" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("path".to_string()))?;
+
+        let full_path = root.join(path);
+
+        if !full_path.is_dir() {
+            return Err(ToolError::Tool(format!(
+                "{path} is not a directory (or doesn't exist)"
+            )));
+        }
+
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|err| ToolError::Tool(format!("failed to resolve project root: {err}")))?;
+        let canonical_target = full_path
+            .canonicalize()
+            .map_err(|err| ToolError::Tool(format!("failed to resolve {path}: {err}")))?;
+
+        if canonical_target == canonical_root {
+            return Err(ToolError::Tool(
+                "Refusing to delete the project root itself".to_string(),
+            ));
+        }
+
+        std::fs::remove_dir_all(&full_path)?;
+
+        Ok(format!("Deleted directory {path}"))
+    }
+}
+
 pub struct MoveFileTool;
 
 impl Tool for MoveFileTool {

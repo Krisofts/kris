@@ -195,6 +195,8 @@ Available tools:
 - `edit_file` - replace an exact snippet inside an existing file
 - `create_directory` - create a directory (and missing parents)
 - `delete_file` - delete a single file
+- `delete_directory` - delete a directory and everything inside it (refuses
+  to delete the project root itself)
 - `move_file` - move or rename a file or directory
 - `search_code` - grep file contents by regex across the project
 - `run_command` - run a shell command (e.g. `cargo build`, `cargo test`).
