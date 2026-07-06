@@ -127,8 +127,15 @@ different folder with an argument:
 kris /path/to/your/project
 ```
 
+To switch workspace from inside KRIS without typing a full path, run
+`workspace` on its own - it lists every subfolder of `$HOME` and of
+`$HOME/project` as a numbered menu, and `workspace <number>` switches to
+whichever one you picked.
+
 ```
-kris > workspace          # show current workspace, or `workspace <path>` to switch
+kris > workspace          # show current workspace + a numbered list of switchable folders
+kris > workspace 2        # switch to folder #2 from that list - no path typing needed
+kris > workspace <path>   # or switch by path (~/ and relative-to-$HOME both work)
 kris > model              # list Qwen2.5-Coder sizes and which are downloaded
 kris > health             # check whether llama-server is reachable
 kris > serve              # start llama-server in the background if it isn't running
