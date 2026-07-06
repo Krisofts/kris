@@ -9,16 +9,26 @@ mod repl;
 use std::path::PathBuf;
 
 use app::App;
+use kris_core::home::home_dir;
 
 fn main() {
     banner::print_banner();
 
-    let mut app = match std::env::args().nth(1) {
+    let path = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join("project")));
+
+    let mut app = match path {
         Some(path) => {
-            let app = App::with_path(&PathBuf::from(path.clone()));
+            let app = App::with_path(&path);
 
             if app.context.workspace.is_none() {
-                println!("Warning: could not open project folder \"{path}\".");
+                println!(
+                    "Warning: could not open project folder \"{}\".",
+                    path.display()
+                );
+                println!("Create it, or point KRIS elsewhere: kris-cli <path>");
             }
 
             app

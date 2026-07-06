@@ -27,9 +27,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn config_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-
-        Some(PathBuf::from(home).join(".kris").join("config.toml"))
+        Some(crate::home::home_dir()?.join(".kris").join("config.toml"))
     }
 
     pub fn load() -> Self {
