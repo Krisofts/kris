@@ -115,6 +115,14 @@ time you just need `cd ~/kris && ./target/release/kris-cli`.
 
 ## Usage
 
+By default KRIS detects the project root by walking up from the current
+working directory looking for `Cargo.toml`, `package.json`, or `artisan`.
+To point it at a specific folder instead, pass it as an argument:
+
+```
+./target/release/kris-cli /path/to/your/project
+```
+
 ```
 kris > workspace          # show detected project (Rust/Node/Laravel/...)
 kris > ask fix the bug in src/main.rs
