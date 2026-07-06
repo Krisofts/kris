@@ -384,3 +384,96 @@ impl Tool for RunCommandTool {
         Ok(format!("exit code: {status}\n{combined}"))
     }
 }
+
+pub struct DeleteFileTool;
+
+impl Tool for DeleteFileTool {
+    fn name(&self) -> &'static str {
+        "delete_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delete a single file (not a directory) inside the project, given a path relative \
+         to the project root."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to the project root" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("path".to_string()))?;
+
+        let full_path = root.join(path);
+
+        if !full_path.is_file() {
+            return Err(ToolError::Tool(format!(
+                "{path} is not a file (or doesn't exist)"
+            )));
+        }
+
+        std::fs::remove_file(&full_path)?;
+
+        Ok(format!("Deleted {path}"))
+    }
+}
+
+pub struct MoveFileTool;
+
+impl Tool for MoveFileTool {
+    fn name(&self) -> &'static str {
+        "move_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Move or rename a file or directory inside the project. Both paths are relative \
+         to the project root."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "Current path, relative to the project root" },
+                "to": { "type": "string", "description": "New path, relative to the project root" }
+            },
+            "required": ["from", "to"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        let from = args
+            .get("from")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("from".to_string()))?;
+
+        let to = args
+            .get("to")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("to".to_string()))?;
+
+        let from_path = root.join(from);
+        let to_path = root.join(to);
+
+        if !from_path.exists() {
+            return Err(ToolError::Tool(format!("{from} does not exist")));
+        }
+
+        if let Some(parent) = to_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        std::fs::rename(&from_path, &to_path)?;
+
+        Ok(format!("Moved {from} to {to}"))
+    }
+}

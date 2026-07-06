@@ -144,6 +144,8 @@ project root) before giving its final answer:
 - `read_file`, `list_directory`, `find_files`, `tree` - browse the project
 - `write_file` - create or overwrite a file
 - `edit_file` - replace an exact snippet inside an existing file
+- `delete_file` - delete a single file
+- `move_file` - move or rename a file or directory
 - `search_code` - grep file contents by regex across the project
 - `run_command` - run a shell command (e.g. `cargo build`, `cargo test`).
   **Always asks for a y/n confirmation before executing anything** - review
