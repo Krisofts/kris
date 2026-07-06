@@ -8,6 +8,7 @@ use kris_agent::{Agent, LlamaClient};
 use kris_tools::tool::ToolRegistry;
 
 use crate::context::Context;
+use crate::style::{bold, dim, red};
 
 /// Shared by `ask` and `fix`: builds the agent, runs one turn with a spinner
 /// and tool-call feedback, and prints the result. `min_iterations` lets a
@@ -42,6 +43,8 @@ pub fn run(context: &mut Context, prompt: &str, min_iterations: u32) {
         }
     };
 
+    println!();
+
     let result = runtime.block_on(async {
         let spinner = tokio::spawn(spin());
 
@@ -54,10 +57,10 @@ pub fn run(context: &mut Context, prompt: &str, min_iterations: u32) {
                 prompt,
                 |tool_name, args: &Value, result: &str| {
                     clear_line();
-                    println!("→ using tool `{tool_name}` {args}");
+                    println!("{} {}", dim("●"), bold(&format_tool_call(tool_name, args)));
 
                     if let Some(err) = result.strip_prefix("Error: ") {
-                        println!("  ✗ {err}");
+                        println!("  {} {}", red("✗"), red(err));
                     }
                 },
             )
@@ -70,14 +73,43 @@ pub fn run(context: &mut Context, prompt: &str, min_iterations: u32) {
     });
 
     match result {
-        Ok(answer) => println!("{answer}"),
+        Ok(answer) => {
+            println!();
+            println!("{answer}");
+        }
         Err(err) => {
-            println!("Error talking to the model: {err}");
+            println!();
+            println!("{} {err}", red("Error talking to the model:"));
             println!(
-                "Make sure llama-server is running at {}",
-                context.settings.llama_url
+                "{}",
+                dim(&format!(
+                    "Make sure llama-server is running at {}",
+                    context.settings.llama_url
+                ))
             );
         }
+    }
+}
+
+/// Renders a tool call the way Claude Code shows them: `name(primary arg)`
+/// instead of dumping the raw JSON args, so the chat stays readable.
+fn format_tool_call(tool_name: &str, args: &Value) -> String {
+    if tool_name == "move_file" {
+        if let (Some(from), Some(to)) = (
+            args.get("from").and_then(Value::as_str),
+            args.get("to").and_then(Value::as_str),
+        ) {
+            return format!("{tool_name}({from} → {to})");
+        }
+    }
+
+    let summary = ["command", "path", "pattern", "keyword"]
+        .into_iter()
+        .find_map(|key| args.get(key).and_then(Value::as_str));
+
+    match summary {
+        Some(summary) => format!("{tool_name}({summary})"),
+        None => format!("{tool_name}()"),
     }
 }
 
@@ -91,7 +123,7 @@ async fn spin() {
     let mut i = 0;
 
     loop {
-        print!("\r{} thinking...", FRAMES[i % FRAMES.len()]);
+        print!("\r{}", dim(&format!("{} thinking...", FRAMES[i % FRAMES.len()])));
         let _ = std::io::stdout().flush();
         i += 1;
         sleep(Duration::from_millis(90)).await;

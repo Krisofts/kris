@@ -1,12 +1,21 @@
+use crate::style::{cyan, dim};
+
 pub fn print_banner() {
     println!(
-        r#"
+        "{}",
+        cyan(
+            r#"
 ╔══════════════════════════════╗
 ║          KRIS AI             ║
 ║   Local Coding Assistant     ║
-╚══════════════════════════════╝
-
-Type "help" to begin.
-"#
+╚══════════════════════════════╝"#
+        )
     );
+    println!();
+    println!("Type \"help\" to begin.");
+    println!(
+        "{}",
+        dim("Anything else runs as a shell command in the current workspace.")
+    );
+    println!();
 }

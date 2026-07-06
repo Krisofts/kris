@@ -1,4 +1,4 @@
-use crate::{command::Command, context::Context};
+use crate::{command::Command, context::Context, style::green};
 
 pub struct ConfigCommand;
 
@@ -63,7 +63,7 @@ impl Command for ConfigCommand {
         }
 
         match context.settings.save() {
-            Ok(()) => println!("Saved."),
+            Ok(()) => println!("{}", green("Saved.")),
             Err(err) => println!("Failed to save settings: {err}"),
         }
     }

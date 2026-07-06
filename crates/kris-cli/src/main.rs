@@ -7,11 +7,13 @@ mod context;
 mod registry;
 mod repl;
 mod shell;
+mod style;
 
 use std::path::PathBuf;
 
 use app::App;
 use kris_core::home::home_dir;
+use style::yellow;
 
 fn main() {
     banner::print_banner();
@@ -27,8 +29,11 @@ fn main() {
 
             if app.context.workspace.is_none() {
                 println!(
-                    "Warning: could not open project folder \"{}\".",
-                    path.display()
+                    "{}",
+                    yellow(&format!(
+                        "Warning: could not open project folder \"{}\".",
+                        path.display()
+                    ))
                 );
                 println!("Create it, or point KRIS elsewhere: kris <path>");
             }

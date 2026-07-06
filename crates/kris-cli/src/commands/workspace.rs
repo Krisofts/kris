@@ -4,7 +4,11 @@ use kris_core::home::home_dir;
 use kris_core::project::ProjectType;
 use kris_core::workspace::Workspace;
 
-use crate::{command::Command, context::Context};
+use crate::{
+    command::Command,
+    context::Context,
+    style::{green, yellow},
+};
 
 pub struct WorkspaceCommand;
 
@@ -27,16 +31,25 @@ impl Command for WorkspaceCommand {
 
         match Workspace::open(&path) {
             Some(project) => {
-                println!("Switched workspace to {}", project.root.display());
+                println!(
+                    "{}",
+                    green(&format!("Switched workspace to {}", project.root.display()))
+                );
                 context.workspace = Some(project);
 
                 if !context.history.is_empty() {
                     context.history.clear();
-                    println!("(conversation history reset)");
+                    println!("{}", yellow("(conversation history reset)"));
                 }
             }
             None => {
-                println!("Could not open project folder \"{}\".", path.display());
+                println!(
+                    "{}",
+                    yellow(&format!(
+                        "Could not open project folder \"{}\".",
+                        path.display()
+                    ))
+                );
             }
         }
     }
