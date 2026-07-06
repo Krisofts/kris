@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 
 use super::builtin::{
-    DeleteFileTool, EditFileTool, FindFilesTool, ListDirectoryTool, MoveFileTool, ReadFileTool,
-    RunCommandTool, SearchCodeTool, TreeTool, WriteFileTool,
+    CreateDirectoryTool, DeleteFileTool, EditFileTool, FindFilesTool, ListDirectoryTool,
+    MoveFileTool, ReadFileTool, RunCommandTool, SearchCodeTool, TreeTool, WriteFileTool,
 };
 use super::Tool;
 
@@ -35,6 +35,7 @@ impl ToolRegistry {
         registry.register(RunCommandTool::new());
         registry.register(DeleteFileTool);
         registry.register(MoveFileTool);
+        registry.register(CreateDirectoryTool);
 
         registry
     }

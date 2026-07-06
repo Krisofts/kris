@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
+use kris_tools::error::ToolError;
 use kris_tools::tool::ToolRegistry;
 
 use crate::client::LlamaClient;
@@ -94,10 +95,24 @@ impl Agent {
 
             match parse_tool_call(&response) {
                 Some((tool_name, args)) => {
-                    let result = self
-                        .tools
-                        .execute(&tool_name, root, &args)
-                        .unwrap_or_else(|err| format!("Error: {err}"));
+                    let result = match self.tools.execute(&tool_name, root, &args) {
+                        Ok(output) => output,
+                        Err(ToolError::UnknownTool(name)) => {
+                            let available = self
+                                .tools
+                                .list()
+                                .iter()
+                                .map(|(name, _)| *name)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+
+                            format!(
+                                "Error: there is no tool called \"{name}\". Available \
+                                 tools: {available}. Use exactly one of these names."
+                            )
+                        }
+                        Err(err) => format!("Error: {err}"),
+                    };
 
                     on_tool_call(&tool_name, &args, &result);
 

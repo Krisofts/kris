@@ -400,6 +400,40 @@ impl Tool for RunCommandTool {
     }
 }
 
+pub struct CreateDirectoryTool;
+
+impl Tool for CreateDirectoryTool {
+    fn name(&self) -> &'static str {
+        "create_directory"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create a directory, including any missing parent directories, given a path \
+         relative to the project root."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory path relative to the project root" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("path".to_string()))?;
+
+        std::fs::create_dir_all(root.join(path))?;
+
+        Ok(format!("Created directory {path}"))
+    }
+}
+
 pub struct DeleteFileTool;
 
 impl Tool for DeleteFileTool {
