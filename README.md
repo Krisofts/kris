@@ -31,18 +31,23 @@ The binary is `target/release/kris-cli`.
    cd ..
    ```
 
-3. Get shared storage access and download a small GGUF coding model, e.g.
-   Qwen2.5-Coder 1.5B or 3B Instruct (search
-   "Qwen2.5-Coder-3B-Instruct-GGUF" on Hugging Face, grab a `Q4_K_M`
-   quantization to keep RAM usage down on-device):
+3. Get shared storage access and download a small GGUF coding model
+   (`Q4_K_M` quantization keeps RAM usage down on-device):
 
    ```
    termux-setup-storage
+
+   # ~2GB, needs more RAM but better quality
    curl -L -o qwen2.5-coder-3b-instruct-q4_k_m.gguf \
-       "<huggingface-resolve-url-of-the-Q4_K_M-file>"
+       "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf?download=true"
+
+   # or ~1GB, for phones with limited RAM
+   curl -L -o qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
+       "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf?download=true"
    ```
 
-4. Start the local inference server (keep this session running):
+4. Start the local inference server (keep this session running), pointing
+   `-m` at whichever `.gguf` you downloaded:
 
    ```
    ./llama.cpp/build/bin/llama-server \
