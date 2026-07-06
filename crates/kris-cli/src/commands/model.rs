@@ -17,7 +17,7 @@ struct ModelPreset {
 // `static`, not `const`: presets are looked up by a runtime index, and a
 // `const` array would be re-materialized (as a temporary) at each use site
 // rather than living at one fixed 'static address.
-static PRESETS: [ModelPreset; 3] = [
+static PRESETS: [ModelPreset; 4] = [
     ModelPreset {
         label: "Qwen2.5-Coder-1.5B-Instruct (smallest, fastest)",
         repo: "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
@@ -33,6 +33,13 @@ static PRESETS: [ModelPreset; 3] = [
         repo: "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
         file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
     },
+    ModelPreset {
+        label: "Qwen3-Coder-30B-A3B-Instruct (MoE, newer gen, ~18.6GB - \
+                needs far more RAM than a typical phone has free; PC/laptop \
+                or a high-RAM device only)",
+        repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        file: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+    },
 ];
 
 pub struct ModelCommand;
@@ -43,7 +50,7 @@ impl Command for ModelCommand {
     }
 
     fn description(&self) -> &'static str {
-        "Show or switch between Qwen2.5-Coder model sizes (model <1|2|3>)"
+        "Show or switch between offline coding models (model <1|2|3|4>)"
     }
 
     fn execute(&self, context: &mut Context, args: &[&str]) {
@@ -53,7 +60,7 @@ impl Command for ModelCommand {
         }
 
         let Some(preset) = resolve_preset(args[0]) else {
-            println!("Usage: model <1|2|3> (or 1.5b/3b/7b)");
+            println!("Usage: model <1|2|3|4> (or 1.5b/3b/7b/30b)");
             return;
         };
 
@@ -107,7 +114,7 @@ fn print_menu(context: &Context) {
     }
 
     println!();
-    println!("Usage: model <1|2|3>");
+    println!("Usage: model <1|2|3|4>");
 }
 
 fn preset_path(preset: &ModelPreset) -> PathBuf {
@@ -121,6 +128,7 @@ fn resolve_preset(arg: &str) -> Option<&'static ModelPreset> {
         "1" | "1.5b" => Some(&PRESETS[0]),
         "2" | "3b" => Some(&PRESETS[1]),
         "3" | "7b" => Some(&PRESETS[2]),
+        "4" | "30b" => Some(&PRESETS[3]),
         _ => None,
     }
 }

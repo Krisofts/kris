@@ -136,7 +136,7 @@ picked.
 kris > workspace          # show current workspace + a numbered list of switchable folders
 kris > workspace 2        # switch to folder #2 from that list - no path typing needed
 kris > workspace <path>   # or switch by path (~/ and relative-to-$HOME both work)
-kris > model              # list Qwen2.5-Coder sizes and which are downloaded
+kris > model              # list available offline models and which are downloaded
 kris > health             # check whether llama-server is reachable
 kris > serve              # start llama-server in the background if it isn't running
 kris > ask fix the bug in src/main.rs
@@ -144,15 +144,25 @@ kris > fix                # build the project and iteratively fix errors until i
 kris > reset              # clear the conversation history
 ```
 
-`model <1|2|3>` switches between Qwen2.5-Coder-1.5B/3B/7B-Instruct - it
-only updates `model`/`model_path` in the config (downloading the `.gguf`
-first if needed, with the exact `curl` command printed for you). Since
-llama-server can't swap models without restarting, stop it (Ctrl-C in its
-session, or `pkill -f llama-server`) and run `serve` again afterwards.
-There's no dedicated small "coder" fine-tune newer than Qwen2.5-Coder as of
-this writing - the flagship Qwen3-Coder releases are all large
-mixture-of-experts models (30B+ total parameters) that don't fit on a
-phone, so Qwen2.5-Coder remains the pick for on-device use.
+`model <1|2|3|4>` switches between:
+
+1. Qwen2.5-Coder-1.5B-Instruct
+2. Qwen2.5-Coder-3B-Instruct
+3. Qwen2.5-Coder-7B-Instruct
+4. Qwen3-Coder-30B-A3B-Instruct (MoE, newer generation, ~18.6GB download -
+   the "30B" is total parameters across all experts, not what's active per
+   token, but llama.cpp still needs to hold the whole thing in RAM/mmap it,
+   so this is realistically a PC/laptop/high-RAM-device option, not a
+   typical phone)
+
+`model` only updates `model`/`model_path` in the config (downloading the
+`.gguf` first if needed, with the exact `curl` command printed for you).
+Since llama-server can't swap models without restarting, stop it (Ctrl-C
+in its session, or `pkill -f llama-server`) and run `serve` again
+afterwards. For on-device/phone use, Qwen2.5-Coder (1-3) remains the pick -
+there's no dedicated small "coder" fine-tune newer than that as of this
+writing; the rest of the Qwen3-Coder lineup is exclusively large
+mixture-of-experts models.
 
 `serve` needs `llama_server_path` and `model_path` configured (the setup
 script does this for you automatically; set them manually otherwise):
