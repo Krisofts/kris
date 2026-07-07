@@ -1,0 +1,37 @@
+[package]
+name = "kris"
+version = "0.2.0"
+edition = "2021"
+description = "Offline coding assistant CLI for Termux, backed by llama.cpp and Qwen"
+license = "MIT"
+
+[lib]
+name = "kris"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kris"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+similar = "2"
+rustyline = "14"
+regex = "1"
+ignore = "0.4"
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+# Termux/phone-class CPUs: smaller, slightly slower-to-build binary beats a
+# long LTO pass on every release build, but we still want stripped size down.
+opt-level = 2
+strip = true

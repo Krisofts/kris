@@ -1,0 +1,71 @@
+use similar::{ChangeTag, TextDiff};
+
+use crate::style::{dim, green, red};
+
+/// Cap how many diff lines get printed for a single edit, so a full-file
+/// rewrite doesn't flood a phone-sized terminal - the tool result already
+/// tells the model exactly what changed, this is purely for the human.
+const MAX_DIFF_LINES: usize = 60;
+
+/// Renders a colorized unified diff between `old` and `new` content for a
+/// given display path. Always called before a file write/edit is applied,
+/// so the user sees every change KRIS makes, even though it auto-applies.
+pub fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
+    let diff = TextDiff::from_lines(old, new);
+
+    let mut out = String::new();
+    out.push_str(&dim(&format!("--- {path}\n")));
+    out.push_str(&dim(&format!("+++ {path}\n")));
+
+    let mut printed = 0usize;
+    let mut truncated = false;
+
+    'outer: for group in diff.grouped_ops(3) {
+        for op in group {
+            for change in diff.iter_changes(&op) {
+                if printed >= MAX_DIFF_LINES {
+                    truncated = true;
+                    break 'outer;
+                }
+
+                let line = change.to_string_lossy();
+                let line = line.strip_suffix('\n').unwrap_or(&line);
+
+                match change.tag() {
+                    ChangeTag::Delete => out.push_str(&red(&format!("-{line}\n"))),
+                    ChangeTag::Insert => out.push_str(&green(&format!("+{line}\n"))),
+                    ChangeTag::Equal => out.push_str(&dim(&format!(" {line}\n"))),
+                }
+
+                printed += 1;
+            }
+        }
+    }
+
+    if truncated {
+        out.push_str(&dim("... diff truncated ...\n"));
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shows_additions_and_removals() {
+        let out = render_unified_diff("a.rs", "line1\nline2\n", "line1\nline2 changed\n");
+        assert!(out.contains("-line2"));
+        assert!(out.contains("+line2 changed"));
+    }
+
+    #[test]
+    fn truncates_very_long_diffs() {
+        let old: String = (0..200).map(|i| format!("old{i}\n")).collect();
+        let new: String = (0..200).map(|i| format!("new{i}\n")).collect();
+
+        let out = render_unified_diff("big.rs", &old, &new);
+        assert!(out.contains("truncated"));
+    }
+}

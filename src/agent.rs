@@ -1,0 +1,339 @@
+use std::path::Path;
+
+use anyhow::Result;
+use serde_json::{json, Value};
+
+use crate::client::LlamaClient;
+use crate::message::{FunctionCall, Message, Role, ToolCall};
+use crate::style::yellow;
+use crate::tools::{ToolError, ToolRegistry};
+
+/// Groups the three pieces of per-workspace context `run` needs, mainly to
+/// keep its argument count reasonable rather than because they're a
+/// reusable unit elsewhere.
+pub struct Project<'a> {
+    pub root: &'a Path,
+    pub name: &'a str,
+    pub type_hint: &'a str,
+}
+
+pub struct Agent {
+    client: LlamaClient,
+    tools: ToolRegistry,
+    temperature: f32,
+    max_tokens: u32,
+    context_size: u32,
+}
+
+impl Agent {
+    pub fn new(
+        client: LlamaClient,
+        tools: ToolRegistry,
+        temperature: f32,
+        max_tokens: u32,
+        context_size: u32,
+    ) -> Self {
+        Self {
+            client,
+            tools,
+            temperature,
+            max_tokens,
+            context_size,
+        }
+    }
+
+    fn system_prompt(&self, project_name: &str, project_type_hint: &str) -> String {
+        // Tool schemas travel in the request's `tools` field now (native
+        // tool-calling via llama-server --jinja), not spelled out as JSON
+        // prose here - keeps this prompt, and its reprocessing cost on
+        // every turn, small.
+        let type_line = if project_type_hint.is_empty() {
+            String::new()
+        } else {
+            format!(" {project_type_hint}")
+        };
+
+        format!(
+            "You are KRIS, an offline coding assistant running locally in a terminal, \
+             currently working inside the project \"{project_name}\".{type_line} Only use \
+             a tool when the user's request actually requires inspecting or changing this \
+             project - for general questions, explanations, or chit-chat, answer directly \
+             in plain text instead. Call one tool at a time and wait for its result before \
+             deciding the next step. Prefer edit_file over write_file for changes to a file \
+             that already exists, and use run_command to build or test after changing code. \
+             Once you have enough information, give your final answer as plain text."
+        )
+    }
+
+    /// Runs one user turn to completion, calling tools as needed, streaming
+    /// assistant text live via `on_delta`, and returns the final
+    /// natural-language answer.
+    pub async fn run(
+        &self,
+        history: &mut Vec<Message>,
+        project: Project<'_>,
+        user_input: &str,
+        max_iterations: u32,
+        mut on_delta: impl FnMut(&str),
+        mut on_tool_call: impl FnMut(&str, &Value, &str),
+    ) -> Result<String> {
+        let root = project.root;
+
+        if history.is_empty() {
+            history.push(Message::system(
+                self.system_prompt(project.name, project.type_hint),
+            ));
+        }
+
+        // Recorded so a request failure (llama-server unreachable mid-turn)
+        // can roll the whole turn back out of history instead of leaving a
+        // dangling user message a caller's retry would otherwise duplicate.
+        let turn_start = history.len();
+        history.push(Message::user(user_input));
+
+        let tool_schemas = self.tools.describe_all();
+
+        for _ in 0..max_iterations {
+            self.enforce_context_budget(history, &mut on_delta).await;
+
+            let outcome = match self
+                .client
+                .chat_stream(
+                    history,
+                    Some(&tool_schemas),
+                    self.temperature,
+                    self.max_tokens,
+                    &mut on_delta,
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    history.truncate(turn_start);
+                    return Err(err);
+                }
+            };
+
+            let tool_calls = if outcome.tool_calls.is_empty() {
+                outcome
+                    .content
+                    .as_deref()
+                    .and_then(parse_tool_call_from_text)
+                    .map(|(name, args)| {
+                        vec![ToolCall {
+                            id: "call_fallback_0".to_string(),
+                            kind: "function".to_string(),
+                            function: FunctionCall {
+                                name,
+                                arguments: args.to_string(),
+                            },
+                        }]
+                    })
+                    .unwrap_or_default()
+            } else {
+                outcome.tool_calls
+            };
+
+            if tool_calls.is_empty() {
+                let answer = outcome.content.unwrap_or_default();
+                history.push(Message::assistant_text(answer.clone()));
+                return Ok(answer);
+            }
+
+            history.push(Message::assistant_tool_calls(
+                outcome.content.clone(),
+                tool_calls.clone(),
+            ));
+
+            for call in &tool_calls {
+                let args = match call.parsed_arguments() {
+                    Ok(args) => args,
+                    Err(err) => {
+                        let msg = format!("Error: invalid JSON arguments: {err}");
+                        on_tool_call(&call.function.name, &json!({}), &msg);
+                        history.push(Message::tool_result(call.id.clone(), msg));
+                        continue;
+                    }
+                };
+
+                let result = match self.tools.execute(&call.function.name, root, &args) {
+                    Ok(output) => output,
+                    Err(ToolError::UnknownTool(name)) => {
+                        let available = self.tools.names().join(", ");
+                        format!(
+                            "Error: there is no tool called \"{name}\". Available tools: \
+                             {available}. Use exactly one of these names."
+                        )
+                    }
+                    Err(err) => format!("Error: {err}"),
+                };
+
+                on_tool_call(&call.function.name, &args, &result);
+                history.push(Message::tool_result(call.id.clone(), result));
+            }
+        }
+
+        Ok("Reached the maximum number of tool calls without a final answer.".to_string())
+    }
+
+    /// Estimates the prompt size with a cheap chars/4 heuristic first, and
+    /// only pays for a real `/tokenize` round trip when that heuristic
+    /// suggests we're getting close to `context_size` - then drops the
+    /// oldest whole turns (a turn = a user message through to just before
+    /// the next one) until back under budget, always keeping the current,
+    /// unanswered turn.
+    async fn enforce_context_budget(
+        &self,
+        history: &mut Vec<Message>,
+        on_delta: &mut impl FnMut(&str),
+    ) {
+        let soft_limit = (self.context_size as f64 * 0.9) as usize;
+        let heuristic = heuristic_tokens(history);
+
+        if heuristic < soft_limit * 3 / 4 {
+            return;
+        }
+
+        let joined = joined_text(history);
+        let exact = self.client.tokenize(&joined).await.unwrap_or(heuristic);
+
+        if exact <= soft_limit {
+            return;
+        }
+
+        let mut dropped_turns = 0;
+
+        // Always keep at least the most recent turn (the last user message
+        // onward) so the current request never gets erased out from under
+        // itself. Recompute turn boundaries after each drop rather than
+        // reusing stale indices, since draining shifts everything after it.
+        loop {
+            let turn_starts: Vec<usize> = history
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == Role::User)
+                .map(|(i, _)| i)
+                .collect();
+
+            if turn_starts.len() <= 1 || heuristic_tokens(history) <= soft_limit {
+                break;
+            }
+
+            let start = if history[0].role == Role::System {
+                1
+            } else {
+                0
+            };
+            let next_turn_start = turn_starts[1];
+
+            history.drain(start..next_turn_start);
+            dropped_turns += 1;
+        }
+
+        if dropped_turns > 0 {
+            let notice = format!(
+                "\n{}\n",
+                yellow("(older conversation history trimmed to stay within the context window)")
+            );
+            on_delta(&notice);
+        }
+    }
+}
+
+fn heuristic_tokens(history: &[Message]) -> usize {
+    history
+        .iter()
+        .map(|m| {
+            let content_len = m.content.as_deref().map(str::len).unwrap_or(0);
+            let calls_len: usize = m
+                .tool_calls
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|c| c.function.name.len() + c.function.arguments.len())
+                .sum();
+            (content_len + calls_len) / 4
+        })
+        .sum()
+}
+
+fn joined_text(history: &[Message]) -> String {
+    history
+        .iter()
+        .filter_map(|m| m.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Defensive fallback: if the server ever returns a tool call as plain
+/// content instead of the structured `tool_calls` field (e.g. --jinja
+/// wasn't enabled, or an older llama-server build), scan for a single
+/// balanced `{...}` JSON object shaped like `{"tool": ..., "args": {...}}`
+/// so the turn still works instead of showing raw JSON as the answer.
+fn parse_tool_call_from_text(text: &str) -> Option<(String, Value)> {
+    let json_str = extract_first_json_object(text)?;
+    let value: Value = serde_json::from_str(&json_str).ok()?;
+    let tool = value.get("tool")?.as_str()?.to_string();
+    let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
+    Some((tool, args))
+}
+
+fn extract_first_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(text[start..end].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_tool_call_from_leaked_plain_text() {
+        let text = "{\"tool\": \"read_file\", \"args\": {\"path\": \"a.rs\"}}";
+        let (name, args) = parse_tool_call_from_text(text).unwrap();
+        assert_eq!(name, "read_file");
+        assert_eq!(args["path"], "a.rs");
+    }
+
+    #[test]
+    fn ignores_plain_prose_without_json() {
+        assert!(parse_tool_call_from_text("Here's the answer: it's 42.").is_none());
+    }
+
+    #[test]
+    fn heuristic_tokens_counts_content_and_tool_calls() {
+        let history = vec![Message::user("hello world")];
+        assert_eq!(heuristic_tokens(&history), "hello world".len() / 4);
+    }
+}

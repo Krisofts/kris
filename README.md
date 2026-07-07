@@ -1,0 +1,182 @@
+# KRIS
+
+A local coding-assistant CLI written in Rust. It runs entirely offline by
+talking to a `llama-server` (llama.cpp's OpenAI-compatible HTTP server,
+started with `--jinja` for native tool-calling) running on the same
+machine — no cloud API involved. Built primarily for running comfortably on
+a phone under Termux with a small Qwen2.5-Coder model, but works on any
+Linux/macOS box with llama.cpp installed.
+
+## What it does
+
+- Streams the model's response token-by-token as it's generated, instead
+  of waiting silently for a full reply (the slow part on a phone CPU).
+- Uses llama.cpp's native, grammar-constrained tool-calling (via
+  `--jinja`) rather than asking the model to hand-format JSON in plain
+  text, so tool calls are reliable.
+- Shows a colorized diff for every file it writes, edits, deletes, or
+  moves — nothing changes on disk invisibly.
+- Reuses llama-server's KV cache across turns (`cache_prompt`) so it isn't
+  reprocessing the whole conversation from scratch every message.
+- Tracks context usage via llama-server's `/tokenize` endpoint and trims
+  the oldest turns before overflowing the context window, instead of
+  erroring out mid-conversation.
+- Self-heals: if llama-server was killed while KRIS was idle, it's
+  restarted automatically on the next request.
+
+## Build
+
+```
+cargo build --release
+```
+
+The binary is `target/release/kris`.
+
+## Running on Termux (Android)
+
+### Quick setup (one command)
+
+```
+bash scripts/setup-termux.sh        # defaults to the 3B model
+bash scripts/setup-termux.sh 1.5b   # smaller model, for phones with less RAM
+bash scripts/setup-termux.sh 7b     # bigger/slower, for phones with plenty of RAM
+```
+
+This installs the required packages, builds `llama-server` (with the
+`libandroid-spawn` fix applied, and `--jinja` support so tool-calling
+works), downloads the GGUF model, starts `llama-server` in the background,
+creates `~/project` (KRIS's default workspace — put the code you want it
+to work on there), builds KRIS, symlinks it as `kris` on your `PATH`, and
+drops you into the KRIS REPL. It's safe to re-run — steps that already
+finished are skipped. The server keeps running in the background
+afterwards, so next time you just type `kris` from anywhere.
+
+### Manual setup (or if the script fails partway)
+
+1. Install build tools and Rust. `libandroid-spawn` is required — without
+   it, building `llama-server` fails with `fatal error: 'spawn.h' file not
+   found`, because Android doesn't ship `posix_spawn` support by default:
+
+   ```
+   pkg update && pkg upgrade
+   pkg install git cmake clang make rust libandroid-spawn
+   ```
+
+2. Clone and build llama.cpp **outside** of this repo (e.g. in your home
+   directory — don't nest it inside `kris/`, they're unrelated git repos):
+
+   ```
+   cd ~
+   git clone https://github.com/ggml-org/llama.cpp
+   cd llama.cpp
+   cmake -B build -DGGML_LLAMAFILE=OFF
+   cmake --build build --config Release --target llama-server -j 2
+   ```
+
+   Use a low `-j` (2 or even 1) instead of `-j $(nproc)` — building with
+   too many parallel jobs is a common way to get the compiler OOM-killed on
+   a phone. If the build fails partway with no clear compiler error, rerun
+   with `-j 1`.
+
+   Verify it actually built before moving on:
+
+   ```
+   ls -la ~/llama.cpp/build/bin/llama-server
+   ```
+
+3. Get shared storage access and download a small GGUF coding model
+   (`Q4_K_M` quantization keeps RAM usage down on-device):
+
+   ```
+   termux-setup-storage
+   cd ~
+   curl -L -o qwen2.5-coder-3b-instruct-q4_k_m.gguf \
+       "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf?download=true"
+   ```
+
+   Double-check the download actually completed before starting the
+   server — a truncated download still leaves a file behind, just a much
+   smaller one:
+
+   ```
+   ls -la ~/*.gguf
+   ```
+
+4. Start the local inference server (keep this Termux session running),
+   pointing `-m` at whichever `.gguf` you downloaded. `--jinja` is
+   required — without it, KRIS falls back to a much less reliable
+   plain-text tool-calling mode:
+
+   ```
+   ~/llama.cpp/build/bin/llama-server \
+       -m ~/qwen2.5-coder-3b-instruct-q4_k_m.gguf \
+       --host 127.0.0.1 --port 8080 -c 8192 --jinja
+   ```
+
+5. Open a new Termux session (swipe from the left edge to add one, so the
+   server keeps running in the first), `cd` into this project, and build:
+
+   ```
+   cargo build --release
+   mkdir -p ~/.config/kris
+   cat > ~/.config/kris/config.toml <<'EOF'
+   model_path = "/data/data/com.termux/files/home/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+   llama_server_path = "/data/data/com.termux/files/home/llama.cpp/build/bin/llama-server"
+   llama_url = "http://127.0.0.1:8080"
+   context_size = 8192
+   temperature = 0.2
+   max_tokens = 4096
+   mlock = false
+   flash_attn = true
+   cache_type_k = "q8_0"
+   cache_type_v = "q8_0"
+   workspace = "/data/data/com.termux/files/home/project"
+   EOF
+   mkdir -p ~/project
+   ./target/release/kris
+   ```
+
+## Running on a normal Linux/macOS machine
+
+Same idea, minus the Termux-specific packages: build llama.cpp's
+`llama-server` normally (`cmake -B build && cmake --build build --target
+llama-server`), start it with `--jinja`, then `cargo build --release` and
+run `target/release/kris` — it defaults to `~/.config/kris/config.toml`
+and prompts you to set `model_path` if it isn't configured yet.
+
+## Using KRIS
+
+```
+kris                    # interactive REPL in the configured workspace
+kris "explain main.rs"  # one-shot: ask, print the answer, exit
+```
+
+Inside the REPL:
+
+| Command | Does |
+|---|---|
+| *(anything else)* | ask KRIS about the current project |
+| `fix [notes]` | build and iteratively fix errors until it's clean |
+| `health` | check whether llama-server is reachable |
+| `serve` | start llama-server in the background if it isn't running |
+| `model [preset]` | show/switch the Qwen2.5-Coder model (`1.5b`/`3b`/`7b`) |
+| `workspace [path]` | show/switch the project KRIS is working in |
+| `config [set key value]` | show or change settings (saved to `config.toml`) |
+| `clear` | clear conversation history and the screen |
+| `!<command>` | run a raw shell command directly, bypassing the model |
+| `help` | show the command list |
+| `exit` / `quit` | leave KRIS |
+
+KRIS can read, search, write, and edit files; run shell commands (with a
+y/n confirmation); inspect git state (read-only); and outline large files
+without reading them in full. File writes/edits/deletes always print a
+diff before applying so you can see exactly what changed.
+
+## Verifying changes to KRIS itself
+
+`cargo build`, `cargo clippy --all-targets`, and `cargo test` all run
+without needing llama.cpp or a model — the streaming/tool-call parser,
+diff renderer, and filesystem tools all have unit and mock-server tests.
+Exercising a real conversation end-to-end (`kris "..."` actually talking
+to a model) needs a real `llama-server` + GGUF model, which only exists on
+an actual Termux/Linux install with the setup above completed.
