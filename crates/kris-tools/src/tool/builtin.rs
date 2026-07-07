@@ -1,6 +1,10 @@
 use std::cell::Cell;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
 use regex::Regex;
@@ -339,7 +343,10 @@ impl Tool for RunCommandTool {
     fn description(&self) -> &'static str {
         "Run a shell command inside the project root (e.g. `cargo build`, `cargo test`, \
          `npm install`). Asks the user for a y/n confirmation before executing anything. \
-         Output is captured and truncated if long."
+         Output is captured and truncated if long. Killed after 2 minutes if it hasn't \
+         finished - for a process that should keep running (a dev server), background \
+         it yourself instead, e.g. `tmux new-session -d -s preview 'npm run dev'`, which \
+         returns immediately."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -380,30 +387,79 @@ impl Tool for RunCommandTool {
             }
         }
 
-        let output = std::process::Command::new("sh")
+        const TIMEOUT: Duration = Duration::from_secs(120);
+
+        let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg(command)
             .current_dir(root)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|err| ToolError::Tool(format!("failed to run command: {err}")))?;
 
-        let mut combined = String::new();
-        combined.push_str(&String::from_utf8_lossy(&output.stdout));
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        // Drain stdout/stderr on their own threads while polling try_wait()
+        // below - otherwise a command with enough output to fill the pipe
+        // buffer would deadlock (it blocks writing, we'd block waiting).
+        let stdout_rx = spawn_reader(child.stdout.take());
+        let stderr_rx = spawn_reader(child.stderr.take());
+
+        let start = Instant::now();
+        let mut timed_out = false;
+
+        let status_code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) => {
+                    if start.elapsed() > TIMEOUT {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        timed_out = true;
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(150));
+                }
+                Err(_) => break None,
+            }
+        };
+
+        let mut combined = stdout_rx.recv().unwrap_or_default();
+        combined.push_str(&stderr_rx.recv().unwrap_or_default());
 
         if combined.len() > MAX_OUTPUT {
             combined.truncate(MAX_OUTPUT);
             combined.push_str("\n...(output truncated)");
         }
 
-        let status = output
-            .status
-            .code()
+        if timed_out {
+            combined.push_str("\n(killed after 120s timeout)");
+        }
+
+        let status = status_code
             .map(|code| code.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         Ok(format!("exit code: {status}\n{combined}"))
     }
+}
+
+fn spawn_reader<R>(pipe: Option<R>) -> mpsc::Receiver<String>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+
+    rx
 }
 
 pub struct CreateDirectoryTool;
@@ -585,5 +641,142 @@ impl Tool for MoveFileTool {
         std::fs::rename(&from_path, &to_path)?;
 
         Ok(format!("Moved {from} to {to}"))
+    }
+}
+
+pub struct GitTool;
+
+impl Tool for GitTool {
+    fn name(&self) -> &'static str {
+        "git"
+    }
+
+    fn description(&self) -> &'static str {
+        "Run a read-only git inspection command (status, diff, log, show, or branch) \
+         inside the project. Never modifies anything, so unlike run_command this needs \
+         no confirmation - for commits, pushes, resets, etc. use run_command instead."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "subcommand": { "type": "string", "description": "One of: status, diff, log, show, branch" },
+                "args": { "type": "string", "description": "Extra arguments, e.g. a file path for diff, or a commit hash for show" }
+            },
+            "required": ["subcommand"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        const MAX_OUTPUT: usize = 4000;
+        const ALLOWED: [&str; 5] = ["status", "diff", "log", "show", "branch"];
+
+        let subcommand = args
+            .get("subcommand")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("subcommand".to_string()))?;
+
+        if !ALLOWED.contains(&subcommand) {
+            return Err(ToolError::InvalidArgs(format!(
+                "subcommand must be one of: {}",
+                ALLOWED.join(", ")
+            )));
+        }
+
+        let extra = args.get("args").and_then(Value::as_str).unwrap_or("");
+
+        let mut command = std::process::Command::new("git");
+        command.arg(subcommand).current_dir(root);
+
+        match subcommand {
+            "log" => {
+                command.args(["--oneline", "-n", "20"]);
+            }
+            "diff" => {
+                command.arg("--no-color");
+            }
+            "status" => {
+                command.arg("--short");
+            }
+            _ => {}
+        }
+
+        // Naive whitespace split: fine for the simple path/hash/branch-name
+        // arguments this tool is meant for.
+        for token in extra.split_whitespace() {
+            command.arg(token);
+        }
+
+        let output = command
+            .output()
+            .map_err(|err| ToolError::Tool(format!("failed to run git: {err}")))?;
+
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+        if combined.len() > MAX_OUTPUT {
+            combined.truncate(MAX_OUTPUT);
+            combined.push_str("\n...(output truncated)");
+        }
+
+        if combined.trim().is_empty() {
+            combined = "(no output)".to_string();
+        }
+
+        Ok(combined)
+    }
+}
+
+pub struct OutlineFileTool;
+
+impl Tool for OutlineFileTool {
+    fn name(&self) -> &'static str {
+        "outline_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Show a quick outline of a file's top-level functions/classes/structs/types (by \
+         simple pattern matching, not full parsing) without reading the whole file. \
+         Useful for orienting in a large file before deciding what to read_file or \
+         edit_file."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to the project root" }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("path".to_string()))?;
+
+        let content = cat(root.join(path))?;
+
+        let regex = Regex::new(
+            r"^\s*(pub(\s*\([^)]*\))?\s+)?(export\s+(default\s+)?)?(async\s+)?(fn|struct|enum|trait|impl|class|interface|def|function)\s+\w",
+        )
+        .map_err(|err| ToolError::Tool(format!("invalid outline regex: {err}")))?;
+
+        let lines: Vec<String> = content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| regex.is_match(line))
+            .map(|(i, line)| format!("{}: {}", i + 1, line.trim()))
+            .collect();
+
+        if lines.is_empty() {
+            Ok("No recognizable top-level definitions found (or unsupported language)."
+                .to_string())
+        } else {
+            Ok(lines.join("\n"))
+        }
     }
 }

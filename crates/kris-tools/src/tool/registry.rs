@@ -7,8 +7,8 @@ use crate::error::ToolError;
 
 use super::builtin::{
     CreateDirectoryTool, DeleteDirectoryTool, DeleteFileTool, EditFileTool, FindFilesTool,
-    ListDirectoryTool, MoveFileTool, ReadFileTool, RunCommandTool, SearchCodeTool, TreeTool,
-    WriteFileTool,
+    GitTool, ListDirectoryTool, MoveFileTool, OutlineFileTool, ReadFileTool, RunCommandTool,
+    SearchCodeTool, TreeTool, WriteFileTool,
 };
 use super::Tool;
 
@@ -44,6 +44,8 @@ impl ToolRegistry {
         registry.register(DeleteDirectoryTool);
         registry.register(MoveFileTool);
         registry.register(CreateDirectoryTool);
+        registry.register(GitTool);
+        registry.register(OutlineFileTool);
 
         registry
     }

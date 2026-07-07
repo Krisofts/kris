@@ -209,11 +209,19 @@ Available tools:
   to delete the project root itself)
 - `move_file` - move or rename a file or directory
 - `search_code` - grep file contents by regex across the project
+- `outline_file` - quick list of a file's top-level functions/classes/structs
+  (simple pattern matching, not a full parser) without reading the whole
+  file - handy for orienting in a large file first
+- `git` - read-only `status`/`diff`/`log`/`show`/`branch`. Never modifies
+  anything, so it runs without a confirmation prompt
 - `run_command` - run a shell command (e.g. `cargo build`, `cargo test`).
   **Always asks for a y/n confirmation before executing anything** - review
   the command before approving it. Answer `a` instead of `y` to approve
   every command for the rest of that `ask`/`fix` call (useful for `fix`,
-  which may need to build several times in a row).
+  which may need to build several times in a row). Killed after 2 minutes
+  if it hasn't finished - background long-running processes yourself
+  (e.g. `tmux new-session -d -s preview 'npm run dev'`) instead of relying
+  on this tool for them.
 
 ## Performance tips (Termux)
 

@@ -110,7 +110,7 @@ fn format_tool_call(tool_name: &str, args: &Value) -> String {
         return format!("{tool_name}({from} → {to})");
     }
 
-    let summary = ["command", "path", "pattern", "keyword"]
+    let summary = ["command", "path", "pattern", "keyword", "subcommand"]
         .into_iter()
         .find_map(|key| args.get(key).and_then(Value::as_str));
 
