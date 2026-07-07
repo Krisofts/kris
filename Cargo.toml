@@ -1,47 +1,37 @@
-[workspace]
-resolver = "2"
-
-members = [
-    "crates/kris-cli",
-    "crates/kris-agent",
-    "crates/kris-tools",
-    "crates/kris-core",
-]
-
-[workspace.package]
-edition = "2024"
-version = "0.1.0"
+[package]
+name = "kris"
+version = "0.2.0"
+edition = "2021"
+description = "Offline coding assistant CLI for Termux, backed by llama.cpp and Qwen"
 license = "MIT"
-authors = ["Elvano Inferno"]
 
-[workspace.dependencies]
+[lib]
+name = "kris"
+path = "src/lib.rs"
 
-# Error Handling
-anyhow = "1"
-thiserror = "2"
+[[bin]]
+name = "kris"
+path = "src/main.rs"
 
-# Async Runtime
-tokio = { version = "1", features = ["full"] }
-
-# Serialization
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
-
-# HTTP client (talks to a local llama.cpp `llama-server` instance)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# Filesystem
-walkdir = "2"
-ignore = "0.4"
-
-# Text Processing
+anyhow = "1"
+thiserror = "1"
+similar = "2"
+rustyline = "14"
 regex = "1"
+ignore = "0.4"
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
-# Smaller binary for storage-constrained phones. Deliberately not adding
-# lto/codegen-units=1: those trade build-time memory for runtime perf, and
-# this dependency tree has already been observed to OOM the compiler on
-# Termux even in debug builds - not worth risking release builds failing
-# on the same hardware for a marginal runtime gain.
+# Termux/phone-class CPUs: smaller, slightly slower-to-build binary beats a
+# long LTO pass on every release build, but we still want stripped size down.
+opt-level = 2
 strip = true
