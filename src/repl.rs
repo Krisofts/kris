@@ -3,14 +3,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::Value;
 
-use crate::agent::{Agent, Project};
+use crate::agent::{heuristic_tokens, Agent, Project};
 use crate::config::Settings;
 use crate::message::Message;
 use crate::server;
@@ -516,6 +516,9 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
     let spinner_waiting = waiting.clone();
     let spinner = tokio::spawn(spin(spinner_waiting));
 
+    let history_len_before = session.history.len();
+    let started = Instant::now();
+
     let result = agent
         .run(
             &mut session.history,
@@ -537,9 +540,15 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 if waiting.swap(false, Ordering::SeqCst) {
                     clear_line();
                 }
-                println!("{} {}", dim("*"), bold(&format_tool_call(tool_name, args)));
-                if let Some(err) = result.strip_prefix("Error: ") {
-                    println!("  {} {}", red("x"), red(err));
+                println!("{} {}", cyan("●"), bold(&format_tool_call(tool_name, args)));
+
+                let summary = result.lines().next().unwrap_or("").trim();
+                if !summary.is_empty() {
+                    let is_error = result.starts_with("Error: ");
+                    let truncated: String = summary.chars().take(100).collect();
+                    let ellipsis = if summary.chars().count() > 100 { "…" } else { "" };
+                    let line = format!("  ⎿ {truncated}{ellipsis}");
+                    println!("{}", if is_error { red(&line) } else { dim(&line) });
                 }
             },
         )
@@ -549,14 +558,37 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
     clear_line();
 
     match result {
-        Ok(answer) => {
+        // `answer` isn't reprinted here - agent.run() has already streamed
+        // it in full via the `on_delta` callback above (live as tokens
+        // arrived, or flushed in one piece for a held-back/synthetic
+        // message), so doing it again would just duplicate the output.
+        Ok(_answer) => {
+            let elapsed = started.elapsed();
+            let tokens = heuristic_tokens(&session.history[history_len_before..]);
             println!();
-            if !answer.is_empty() {
-                println!("{answer}");
-            }
+            println!(
+                "{}",
+                dim(&format!("{} · {}", format_elapsed(elapsed), format_tokens(tokens)))
+            );
             Ok(())
         }
         Err(err) => Err(err),
+    }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_secs() >= 1 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        format!("{}ms", elapsed.as_millis())
+    }
+}
+
+fn format_tokens(tokens: usize) -> String {
+    if tokens >= 1000 {
+        format!("~{:.1}k tokens", tokens as f64 / 1000.0)
+    } else {
+        format!("~{tokens} tokens")
     }
 }
 

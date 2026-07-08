@@ -176,6 +176,7 @@ impl Agent {
                      was declined or failed, with nothing else changed. Ask again with more \
                      detail, or approve the action if you do want it to run."
                     .to_string();
+                on_delta(&notice);
                 history.push(Message::assistant_text(notice.clone()));
                 return Ok(notice);
             }
@@ -214,7 +215,9 @@ impl Agent {
             }
         }
 
-        Ok("Reached the maximum number of tool calls without a final answer.".to_string())
+        let notice = "Reached the maximum number of tool calls without a final answer.".to_string();
+        on_delta(&notice);
+        Ok(notice)
     }
 
     /// Estimates the prompt size with a cheap chars/4 heuristic first, and
@@ -281,7 +284,10 @@ impl Agent {
     }
 }
 
-fn heuristic_tokens(history: &[Message]) -> usize {
+/// Rough chars/4 token estimate for a slice of messages - exposed so
+/// callers (the REPL's post-turn token/time footer) can estimate a
+/// specific turn's size without a real `/tokenize` round trip.
+pub fn heuristic_tokens(history: &[Message]) -> usize {
     history
         .iter()
         .map(|m| {

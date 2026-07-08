@@ -1,24 +1,29 @@
 use similar::{ChangeTag, TextDiff};
 
-use crate::style::{dim, green, red};
+use crate::style::{bold, dim, green, red};
 
 /// Cap how many diff lines get printed for a single edit, so a full-file
 /// rewrite doesn't flood a phone-sized terminal - the tool result already
 /// tells the model exactly what changed, this is purely for the human.
 const MAX_DIFF_LINES: usize = 60;
 
-/// Renders a colorized unified diff between `old` and `new` content for a
-/// given display path. Always called before a file write/edit is applied,
-/// so the user sees every change KRIS makes, even though it auto-applies.
+/// Renders a colorized diff between `old` and `new` content for a given
+/// display path, with a per-line number gutter and a trailing
+/// "N addition(s), M removal(s)" summary - Claude Code's diff view rather
+/// than a raw `--- /+++` unified diff. Always called before a file
+/// write/edit is applied, so the user sees every change KRIS makes, even
+/// though it auto-applies.
 pub fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
     let diff = TextDiff::from_lines(old, new);
 
     let mut out = String::new();
-    out.push_str(&dim(&format!("--- {path}\n")));
-    out.push_str(&dim(&format!("+++ {path}\n")));
+    out.push_str(&bold(path));
+    out.push('\n');
 
     let mut printed = 0usize;
     let mut truncated = false;
+    let mut additions = 0usize;
+    let mut removals = 0usize;
 
     'outer: for group in diff.grouped_ops(3) {
         for op in group {
@@ -31,10 +36,23 @@ pub fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
                 let line = change.to_string_lossy();
                 let line = line.strip_suffix('\n').unwrap_or(&line);
 
+                let lineno = match change.tag() {
+                    ChangeTag::Delete => change.old_index(),
+                    _ => change.new_index(),
+                }
+                .map(|i| (i + 1).to_string())
+                .unwrap_or_default();
+
                 match change.tag() {
-                    ChangeTag::Delete => out.push_str(&red(&format!("-{line}\n"))),
-                    ChangeTag::Insert => out.push_str(&green(&format!("+{line}\n"))),
-                    ChangeTag::Equal => out.push_str(&dim(&format!(" {line}\n"))),
+                    ChangeTag::Delete => {
+                        removals += 1;
+                        out.push_str(&red(&format!("{lineno:>5} -{line}\n")));
+                    }
+                    ChangeTag::Insert => {
+                        additions += 1;
+                        out.push_str(&green(&format!("{lineno:>5} +{line}\n")));
+                    }
+                    ChangeTag::Equal => out.push_str(&dim(&format!("{lineno:>5}  {line}\n"))),
                 }
 
                 printed += 1;
@@ -45,6 +63,10 @@ pub fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
     if truncated {
         out.push_str(&dim("... diff truncated ...\n"));
     }
+
+    out.push_str(&dim(&format!(
+        "{additions} addition(s), {removals} removal(s)\n"
+    )));
 
     out
 }

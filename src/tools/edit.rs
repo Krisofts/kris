@@ -21,7 +21,7 @@ fn confirm(auto_approve: &Cell<bool>) -> bool {
         return true;
     }
 
-    print!("Apply this change? [y/N, or a = always for this session]: ");
+    print!("└─ Apply this change? [y/N, or a = always for this session]: ");
     let _ = io::stdout().flush();
 
     let mut input = String::new();
