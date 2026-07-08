@@ -112,10 +112,8 @@ impl Tool for GitCommitTool {
     }
 
     fn description(&self) -> &'static str {
-        "Stages and commits changes to git with a message. Shows `git status --short` and \
-         asks for a y/N confirmation before committing. Only use when the user explicitly \
-         asks for a commit - never as an automatic side effect of another task. Use the \
-         read-only git tool first if you're not sure what has actually changed."
+        "Stages and commits changes to git with a message, after a y/N confirmation. Only \
+         use when the user explicitly asks for a commit."
     }
 
     fn parameters_schema(&self) -> Value {
