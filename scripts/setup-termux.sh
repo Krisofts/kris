@@ -145,7 +145,7 @@ temperature = 0.2
 max_tokens = 4096
 mlock = $( [ -n "$MLOCK" ] && echo true || echo false )
 flash_attn = $( [ "$FLASH_ATTN" = "1" ] && echo true || echo false )
-workspace = "$HOME/project"
+workspace = "$HOME/workspace"
 EOF2
 
 if [ -n "$THREADS" ]; then
@@ -158,12 +158,12 @@ if [ -n "$CACHE_TYPE_V" ]; then
   echo "cache_type_v = \"$CACHE_TYPE_V\"" >> "$CONFIG_DIR/config.toml"
 fi
 
-mkdir -p "$HOME/project"
+mkdir -p "$HOME/workspace"
 
 log "Installing the 'kris' command"
 mkdir -p "$PREFIX/bin"
 ln -sf "$KRIS_DIR/target/release/kris" "$PREFIX/bin/kris"
 
-log "All set. Launching KRIS (workspace: $HOME/project)..."
+log "All set. Launching KRIS (workspace: $HOME/workspace)..."
 echo "From now on, just type 'kris' from anywhere to start it again."
 exec "$KRIS_DIR/target/release/kris"

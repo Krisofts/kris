@@ -28,6 +28,10 @@ const MODEL_PRESETS: &[(&str, &str)] = &[
 
 struct Session {
     settings: Settings,
+    /// Resolved working directory: `workspace/active_project` if
+    /// `active_project` names a real subfolder, otherwise `workspace`
+    /// itself (e.g. so a brand-new project can be scaffolded into it
+    /// before anything has been picked).
     root: PathBuf,
     project_name: String,
     project_type_hint: String,
@@ -36,7 +40,7 @@ struct Session {
 
 impl Session {
     fn new(settings: Settings) -> Self {
-        let root = PathBuf::from(&settings.workspace);
+        let root = resolve_root(&settings.workspace, &settings.active_project);
         let (project_name, project_type_hint) = project_hint(&root);
 
         Self {
@@ -48,13 +52,41 @@ impl Session {
         }
     }
 
-    fn switch_workspace(&mut self, path: &Path) {
-        self.root = path.to_path_buf();
+    /// True once `active_project` names a subfolder of `workspace` that
+    /// actually exists - false for a fresh install, or right after
+    /// switching to a workspace folder that hasn't had a project picked
+    /// yet.
+    fn has_active_project(&self) -> bool {
+        !self.settings.active_project.is_empty()
+            && PathBuf::from(&self.settings.workspace)
+                .join(&self.settings.active_project)
+                .is_dir()
+    }
+
+    fn refresh_root(&mut self) {
+        self.root = resolve_root(&self.settings.workspace, &self.settings.active_project);
         let (name, hint) = project_hint(&self.root);
         self.project_name = name;
         self.project_type_hint = hint;
         self.history.clear();
-        self.settings.workspace = self.root.display().to_string();
+    }
+
+    /// Switches which folder acts as the workspace (the parent holding
+    /// every project) - distinct from `switch_project`, which picks a
+    /// project inside the current workspace. Clears `active_project`
+    /// since it almost certainly doesn't exist under the new workspace.
+    fn switch_workspace(&mut self, path: &Path) {
+        self.settings.workspace = path.display().to_string();
+        self.settings.active_project.clear();
+        self.refresh_root();
+    }
+
+    /// Switches the active project to `name`, a subfolder of the current
+    /// workspace - the caller is expected to have already checked it
+    /// exists.
+    fn switch_project(&mut self, name: &str) {
+        self.settings.active_project = name.to_string();
+        self.refresh_root();
     }
 
     fn agent(&self) -> Agent {
@@ -66,6 +98,19 @@ impl Session {
             self.settings.context_size,
         )
     }
+}
+
+fn resolve_root(workspace: &str, active_project: &str) -> PathBuf {
+    let workspace = PathBuf::from(workspace);
+
+    if !active_project.is_empty() {
+        let candidate = workspace.join(active_project);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+
+    workspace
 }
 
 /// Guesses a one-line project-type hint from marker files, so the system
@@ -151,8 +196,13 @@ fn print_banner(session: &Session) {
     println!(
         "{}",
         dim(&format!(
-            "workspace: {}  |  model: {}",
-            session.root.display(),
+            "workspace: {}  |  project: {}  |  model: {}",
+            session.settings.workspace,
+            if session.has_active_project() {
+                session.project_name.clone()
+            } else {
+                "(belum ada project)".to_string()
+            },
             if session.settings.model_path.is_empty() {
                 "(not configured)".to_string()
             } else {
@@ -161,6 +211,12 @@ fn print_banner(session: &Session) {
         ))
     );
     println!("{}", dim("Type your request, or `help` for commands."));
+    if !session.has_active_project() {
+        println!(
+            "{}",
+            dim("Belum ada project - `project` untuk lihat daftar, atau langsung minta KRIS membuatkan satu.")
+        );
+    }
     println!();
 }
 
@@ -296,15 +352,22 @@ fn handle_model(session: &mut Session, arg: &str) {
     }
 }
 
+/// Switches which folder acts as the workspace - the parent that holds
+/// every project - as opposed to `project <name>`, which picks a project
+/// inside it. Creates the folder if it doesn't exist yet, since it's
+/// just a container.
 fn handle_workspace(session: &mut Session, arg: &str) {
     if arg.is_empty() {
-        println!("Current workspace: {}", session.root.display());
+        println!("Current workspace: {}", session.settings.workspace);
         return;
     }
 
     let path = PathBuf::from(shellexpand_home(arg));
-    if !path.is_dir() {
-        println!("{}", red(&format!("{} is not a directory", path.display())));
+    if let Err(err) = fs::create_dir_all(&path) {
+        println!(
+            "{}",
+            red(&format!("Could not create {}: {err}", path.display()))
+        );
         return;
     }
 
@@ -314,37 +377,38 @@ fn handle_workspace(session: &mut Session, arg: &str) {
     }
     println!(
         "{}",
-        green(&format!("Switched workspace to {}", session.root.display()))
+        green(&format!("Switched workspace to {}", path.display()))
     );
+    if !session.has_active_project() {
+        println!("{}", dim("Belum ada project - `project` untuk lihat daftar."));
+    }
 }
 
 /// Lists (with no argument) or switches to (`project <name>`) a project
-/// living directly under `projects_root`, as opposed to `workspace
-/// <path>`, which takes an arbitrary path anywhere. Switching also
-/// persists as the new `workspace`, so it's what KRIS opens next time
-/// too - "picking a project" and "setting the default project" are the
-/// same action here.
+/// living directly under the workspace folder, as opposed to `workspace
+/// <path>`, which changes the workspace folder itself. Switching also
+/// persists as the new `active_project`, so it's what KRIS opens next
+/// time too - "picking a project" and "setting the default" are the same
+/// action here.
 fn handle_project(session: &mut Session, arg: &str) {
-    let projects_root = PathBuf::from(shellexpand_home(&session.settings.projects_root));
+    let workspace = PathBuf::from(&session.settings.workspace);
+    fs::create_dir_all(&workspace).ok();
 
     if arg.is_empty() {
-        list_projects(session, &projects_root);
+        list_projects(session, &workspace);
         return;
     }
 
-    let path = projects_root.join(arg);
+    let path = workspace.join(arg);
     if !path.is_dir() {
         println!(
             "{}",
-            red(&format!(
-                "No project \"{arg}\" in {}",
-                projects_root.display()
-            ))
+            red(&format!("No project \"{arg}\" in {}", workspace.display()))
         );
         return;
     }
 
-    session.switch_workspace(&path);
+    session.switch_project(arg);
     if let Err(err) = session.settings.save() {
         println!("{}", red(&format!("Failed to save config: {err}")));
     }
@@ -357,13 +421,13 @@ fn handle_project(session: &mut Session, arg: &str) {
     );
 }
 
-fn list_projects(session: &Session, projects_root: &Path) {
-    let entries = match fs::read_dir(projects_root) {
+fn list_projects(session: &Session, workspace: &Path) {
+    let entries = match fs::read_dir(workspace) {
         Ok(entries) => entries,
         Err(err) => {
             println!(
                 "{}",
-                red(&format!("Could not list {}: {err}", projects_root.display()))
+                red(&format!("Could not list {}: {err}", workspace.display()))
             );
             return;
         }
@@ -380,21 +444,25 @@ fn list_projects(session: &Session, projects_root: &Path) {
     if names.is_empty() {
         println!(
             "{}",
-            dim(&format!("No projects found in {}", projects_root.display()))
+            yellow(&format!("Belum ada project di {}.", workspace.display()))
+        );
+        println!(
+            "{}",
+            dim("Minta KRIS membuatkan satu, atau taruh folder project di sana lalu jalankan `project <nama>`.")
         );
         return;
     }
 
-    println!("Projects in {}:", projects_root.display());
+    println!("Projects in {}:", workspace.display());
     for name in &names {
-        let marker = if projects_root.join(name) == session.root {
+        let marker = if session.settings.active_project == *name {
             "* "
         } else {
             "  "
         };
         println!("{marker}{name}");
     }
-    println!("{}", dim("Usage: project <name>  (or `config set projects_root <path>` to look elsewhere)"));
+    println!("{}", dim("Usage: project <name>"));
 }
 
 fn shellexpand_home(path: &str) -> String {
@@ -440,8 +508,8 @@ fn print_help() {
     println!("  health                check whether llama-server is reachable");
     println!("  serve                 start llama-server in the background if needed");
     println!("  model [preset]        show/switch the Qwen2.5-Coder model (1.5b/3b/7b)");
-    println!("  workspace [path]      show/switch the project KRIS is working in (any path)");
-    println!("  project [name]        list/switch to a project under projects_root - also becomes the new default");
+    println!("  workspace [path]      show/switch the folder that holds every project");
+    println!("  project [name]        list projects in the workspace / switch to one - also becomes the new default");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
     println!("  clear                 clear conversation history and the screen");
     println!("  !<command>            run a raw shell command directly");
