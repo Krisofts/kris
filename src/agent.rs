@@ -68,8 +68,11 @@ impl Agent {
              venv plus `pip install` for Python, `go mod init <name>` for Go - it sets up \
              the correct structure, manifest, and (for cargo/npm) version control in one \
              step. Fall back to create_directory/write_file only for a language or structure \
-             that has no such generator. Once you have enough information, give your final \
-             answer as plain text."
+             that has no such generator. A shell command or built-in (echo, cat, ls, mkdir, \
+             touch, grep, and so on) is never a tool by itself - there is no tool with that \
+             name, so call run_command with it as the \"command\" argument instead, e.g. \
+             run_command(\"echo hello\"), not a tool named \"echo\". Once you have enough \
+             information, give your final answer as plain text."
         )
     }
 
