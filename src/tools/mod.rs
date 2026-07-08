@@ -8,9 +8,21 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 use thiserror::Error;
+
+/// Set to true immediately before any tool blocks on a stdin y/N
+/// confirmation prompt, and back to false right after. The REPL's
+/// "thinking..." spinner runs on its own tokio task and checks this so it
+/// stops overwriting (and hiding) the prompt while KRIS is genuinely
+/// waiting on the user rather than the model - without this, a
+/// confirmation box can get silently clobbered by the next spinner frame
+/// a moment after it's printed, making KRIS look stuck in an infinite
+/// "thinking..." loop when it's actually just waiting for a y/N that was
+/// never seen.
+pub static AWAITING_CONFIRMATION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Error)]
 pub enum ToolError {

@@ -3,13 +3,14 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use serde_json::{json, Value};
 
 use crate::diff::render_unified_diff;
 use crate::style::cyan;
 
-use super::{Tool, ToolError};
+use super::{Tool, ToolError, AWAITING_CONFIRMATION};
 
 /// Asks the user to approve a filesystem-mutating tool call before it runs,
 /// showing the diff/summary the caller already printed. Shared across all
@@ -21,11 +22,17 @@ fn confirm(auto_approve: &Cell<bool>) -> bool {
         return true;
     }
 
+    AWAITING_CONFIRMATION.store(true, Ordering::SeqCst);
+
     print!("└─ Apply this change? [y/N, or a = always for this session]: ");
     let _ = io::stdout().flush();
 
     let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
+    let read = io::stdin().read_line(&mut input);
+
+    AWAITING_CONFIRMATION.store(false, Ordering::SeqCst);
+
+    if read.is_err() {
         return false;
     }
 

@@ -15,7 +15,7 @@ use crate::config::Settings;
 use crate::message::Message;
 use crate::server;
 use crate::style::{bold, cyan, dim, green, red, yellow};
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION};
 
 const DEFAULT_MAX_ITERATIONS: u32 = 10;
 const FIX_MIN_ITERATIONS: u32 = 24;
@@ -622,9 +622,15 @@ async fn spin(waiting: Arc<AtomicBool>) {
     let mut i = 0;
 
     while waiting.load(Ordering::SeqCst) {
-        print!("\r{} {}", dim(FRAMES[i % FRAMES.len()]), dim("thinking..."));
-        let _ = std::io::stdout().flush();
-        i += 1;
+        // A tool is blocked on a y/N confirmation right now - stay quiet
+        // instead of redrawing over that prompt every 90ms, which would
+        // hide it and make KRIS look stuck "thinking" forever while it's
+        // actually just waiting on the user.
+        if !AWAITING_CONFIRMATION.load(Ordering::SeqCst) {
+            print!("\r{} {}", dim(FRAMES[i % FRAMES.len()]), dim("thinking..."));
+            let _ = std::io::stdout().flush();
+            i += 1;
+        }
         tokio::time::sleep(Duration::from_millis(90)).await;
     }
 }
