@@ -61,7 +61,15 @@ impl Agent {
              in plain text instead. Call one tool at a time and wait for its result before \
              deciding the next step. Prefer edit_file over write_file for changes to a file \
              that already exists, and use run_command to build or test after changing code. \
-             Once you have enough information, give your final answer as plain text."
+             When asked to start a brand-new project, use the language's own scaffolding \
+             command via run_command instead of manually creating directories and files one \
+             by one - e.g. `cargo new <name>` for Rust, `npm init -y` (or a framework's own \
+             generator) for JavaScript/TypeScript, `django-admin startproject <name>` or a \
+             venv plus `pip install` for Python, `go mod init <name>` for Go - it sets up \
+             the correct structure, manifest, and (for cargo/npm) version control in one \
+             step. Fall back to create_directory/write_file only for a language or structure \
+             that has no such generator. Once you have enough information, give your final \
+             answer as plain text."
         )
     }
 
