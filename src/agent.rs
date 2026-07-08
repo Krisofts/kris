@@ -93,6 +93,13 @@ impl Agent {
 
         let tool_schemas = self.tools.describe_all();
 
+        // Tracks the previous iteration's tool call(s) so an identical
+        // repeat (the model proposing the exact same call again right
+        // after it was declined or errored, with nothing about the
+        // situation having changed) stops the turn instead of looping
+        // through the rest of `max_iterations` asking the same thing.
+        let mut previous_call_signature: Option<String> = None;
+
         for _ in 0..max_iterations {
             self.enforce_context_budget(history, &mut on_delta).await;
 
@@ -113,6 +120,8 @@ impl Agent {
                     return Err(err);
                 }
             };
+
+            let held_back = outcome.held_back;
 
             let tool_calls = if outcome.tool_calls.is_empty() {
                 outcome
@@ -135,10 +144,34 @@ impl Agent {
             };
 
             if tool_calls.is_empty() {
+                // Nothing resolved to a tool call after all, so whatever
+                // was held back from live streaming (it looked like it
+                // might be a leaked call) was actually just part of the
+                // answer - show it now before returning.
+                if let Some(held_back) = held_back {
+                    on_delta(&held_back);
+                }
+
                 let answer = outcome.content.unwrap_or_default();
                 history.push(Message::assistant_text(answer.clone()));
                 return Ok(answer);
             }
+
+            let signature = tool_calls
+                .iter()
+                .map(|call| format!("{}:{}", call.function.name, call.function.arguments))
+                .collect::<Vec<_>>()
+                .join("|");
+
+            if previous_call_signature.as_deref() == Some(signature.as_str()) {
+                let notice = "Stopped: the same tool call was proposed again right after it \
+                     was declined or failed, with nothing else changed. Ask again with more \
+                     detail, or approve the action if you do want it to run."
+                    .to_string();
+                history.push(Message::assistant_text(notice.clone()));
+                return Ok(notice);
+            }
+            previous_call_signature = Some(signature);
 
             history.push(Message::assistant_tool_calls(
                 outcome.content.clone(),

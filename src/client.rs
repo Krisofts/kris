@@ -44,6 +44,23 @@ struct ChatRequest<'a> {
 pub struct StreamOutcome {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Content that looked like it might be a leaked tool call (started
+    /// with `{`, `` ` `` as in a ```` ```json ```` fence, or `<` as in
+    /// `<tool_call>`) and so was held back from `on_delta` instead of
+    /// streamed live. The caller should print this itself if it turns
+    /// out not to actually resolve to a tool call - that way a real
+    /// leaked call never flashes raw JSON on screen, while a plain-text
+    /// answer that just happens to start the same way still gets shown
+    /// once it's clear it isn't one.
+    pub held_back: Option<String>,
+}
+
+/// Whether content deltas are being streamed live via `on_delta`, held
+/// back pending a decision, or still too short to tell which.
+enum StreamMode {
+    Deciding(String),
+    Live,
+    HeldBack(String),
 }
 
 impl LlamaClient {
@@ -110,6 +127,7 @@ impl LlamaClient {
         let mut accumulator = ToolCallAccumulator::default();
         let mut content = String::new();
         let mut got_any_content = false;
+        let mut mode = StreamMode::Deciding(String::new());
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.context("reading stream chunk from llama-server")?;
@@ -128,9 +146,32 @@ impl LlamaClient {
                 for choice in parsed.choices {
                     if let Some(text) = choice.delta.content {
                         if !text.is_empty() {
-                            on_delta(&text);
                             content.push_str(&text);
                             got_any_content = true;
+
+                            mode = match mode {
+                                StreamMode::Live => {
+                                    on_delta(&text);
+                                    StreamMode::Live
+                                }
+                                StreamMode::HeldBack(mut buf) => {
+                                    buf.push_str(&text);
+                                    StreamMode::HeldBack(buf)
+                                }
+                                StreamMode::Deciding(mut buf) => {
+                                    buf.push_str(&text);
+                                    match buf.trim_start().chars().next() {
+                                        None => StreamMode::Deciding(buf),
+                                        Some('{') | Some('`') | Some('<') => {
+                                            StreamMode::HeldBack(buf)
+                                        }
+                                        Some(_) => {
+                                            on_delta(&buf);
+                                            StreamMode::Live
+                                        }
+                                    }
+                                }
+                            };
                         }
                     }
 
@@ -143,9 +184,24 @@ impl LlamaClient {
             }
         }
 
+        let held_back = match mode {
+            StreamMode::HeldBack(buf) => Some(buf),
+            StreamMode::Deciding(buf) => {
+                // Stream ended before enough arrived to decide (e.g. all
+                // whitespace, or a very short reply) - nothing suspicious
+                // was ever detected, so just flush it as normal content.
+                if !buf.is_empty() {
+                    on_delta(&buf);
+                }
+                None
+            }
+            StreamMode::Live => None,
+        };
+
         Ok(StreamOutcome {
             content: if got_any_content { Some(content) } else { None },
             tool_calls: accumulator.finish(),
+            held_back,
         })
     }
 
