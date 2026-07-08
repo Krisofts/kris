@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::agent::{heuristic_tokens, Agent, Project};
 use crate::config::Settings;
 use crate::message::Message;
+use crate::picker;
 use crate::server;
 use crate::style::{bold, cyan, dim, green, red, yellow};
 use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION};
@@ -363,10 +364,12 @@ fn handle_model(session: &mut Session, arg: &str) {
 /// Switches which folder acts as the workspace - the parent that holds
 /// every project - as opposed to `project <name>`, which picks a project
 /// inside it. Creates the folder if it doesn't exist yet, since it's
-/// just a container.
+/// just a container. With no argument, launches the interactive project
+/// picker for the (possibly just-created) workspace folder.
 fn handle_workspace(session: &mut Session, arg: &str) {
     if arg.is_empty() {
         println!("Current workspace: {}", session.settings.workspace);
+        interactive_pick_project(session);
         return;
     }
 
@@ -392,18 +395,19 @@ fn handle_workspace(session: &mut Session, arg: &str) {
     }
 }
 
-/// Lists (with no argument) or switches to (`project <name>`) a project
-/// living directly under the workspace folder, as opposed to `workspace
-/// <path>`, which changes the workspace folder itself. Switching also
-/// persists as the new `active_project`, so it's what KRIS opens next
-/// time too - "picking a project" and "setting the default" are the same
-/// action here.
+/// With no argument, launches the interactive picker over projects
+/// living directly under the workspace folder. `project <name>` skips
+/// the picker and switches straight to that project, as opposed to
+/// `workspace <path>`, which changes the workspace folder itself.
+/// Switching (either way) persists as the new `active_project`, so it's
+/// what KRIS opens next time too - "picking a project" and "setting the
+/// default" are the same action here.
 fn handle_project(session: &mut Session, arg: &str) {
     let workspace = PathBuf::from(&session.settings.workspace);
     fs::create_dir_all(&workspace).ok();
 
     if arg.is_empty() {
-        list_projects(session, &workspace);
+        interactive_pick_project(session);
         return;
     }
 
@@ -416,38 +420,16 @@ fn handle_project(session: &mut Session, arg: &str) {
         return;
     }
 
-    session.switch_project(arg);
-    if let Err(err) = session.settings.save() {
-        println!("{}", red(&format!("Failed to save config: {err}")));
-    }
-    println!(
-        "{}",
-        green(&format!(
-            "Switched to project {arg} ({})",
-            session.root.display()
-        ))
-    );
+    apply_project_switch(session, arg);
 }
 
-fn list_projects(session: &Session, workspace: &Path) {
-    let entries = match fs::read_dir(workspace) {
-        Ok(entries) => entries,
-        Err(err) => {
-            println!(
-                "{}",
-                red(&format!("Could not list {}: {err}", workspace.display()))
-            );
-            return;
-        }
-    };
-
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| !name.starts_with('.'))
-        .collect();
-    names.sort();
+/// Shows the arrow-key project picker over the current workspace folder
+/// and applies whatever the user chooses. Falls back to a plain numbered-
+/// free text listing if an interactive picker isn't possible at all (no
+/// real TTY) rather than doing nothing.
+fn interactive_pick_project(session: &mut Session) {
+    let workspace = PathBuf::from(&session.settings.workspace);
+    let names = list_project_names(&workspace);
 
     if names.is_empty() {
         println!(
@@ -461,16 +443,59 @@ fn list_projects(session: &Session, workspace: &Path) {
         return;
     }
 
-    println!("Projects in {}:", workspace.display());
-    for name in &names {
-        let marker = if session.settings.active_project == *name {
-            "* "
-        } else {
-            "  "
-        };
-        println!("{marker}{name}");
+    let active_index = names
+        .iter()
+        .position(|name| *name == session.settings.active_project);
+    let prompt = format!(
+        "Pilih project di {} (\u{2191}/\u{2193} pilih, Enter konfirmasi, Esc batal):",
+        workspace.display()
+    );
+
+    match picker::pick(&prompt, &names, active_index) {
+        picker::PickOutcome::Chosen(name) => apply_project_switch(session, &name),
+        picker::PickOutcome::Cancelled => {}
+        picker::PickOutcome::Unavailable => {
+            println!("Projects in {}:", workspace.display());
+            for name in &names {
+                let marker = if session.settings.active_project == *name {
+                    "* "
+                } else {
+                    "  "
+                };
+                println!("{marker}{name}");
+            }
+            println!("{}", dim("Usage: project <name>"));
+        }
     }
-    println!("{}", dim("Usage: project <name>"));
+}
+
+fn list_project_names(workspace: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(workspace) else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+    names
+}
+
+fn apply_project_switch(session: &mut Session, name: &str) {
+    session.switch_project(name);
+    if let Err(err) = session.settings.save() {
+        println!("{}", red(&format!("Failed to save config: {err}")));
+    }
+    println!(
+        "{}",
+        green(&format!(
+            "Switched to project {name} ({})",
+            session.root.display()
+        ))
+    );
 }
 
 fn shellexpand_home(path: &str) -> String {
@@ -516,8 +541,8 @@ fn print_help() {
     println!("  health                check whether llama-server is reachable");
     println!("  serve                 start llama-server in the background if needed");
     println!("  model [preset]        show/switch the Qwen2.5-Coder model (1.5b/3b/7b)");
-    println!("  workspace [path]      show/switch the folder that holds every project");
-    println!("  project [name]        list projects in the workspace / switch to one - also becomes the new default");
+    println!("  workspace [path]      show workspace / pick a project with arrow keys, or switch to a different workspace folder");
+    println!("  project [name]        pick a project with arrow keys, or switch straight to <name> - also becomes the new default");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
     println!("  clear                 clear conversation history and the screen");
     println!("  !<command>            run a raw shell command directly");
