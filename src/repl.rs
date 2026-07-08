@@ -143,6 +143,7 @@ fn project_hint(root: &Path) -> (String, String) {
 }
 
 pub async fn run_once(settings: Settings, prompt: &str) -> Result<()> {
+    print_sanity_warnings(&settings);
     let mut session = Session::new(settings);
 
     std::fs::create_dir_all(&session.root).ok();
@@ -157,6 +158,7 @@ pub async fn run_once(settings: Settings, prompt: &str) -> Result<()> {
 }
 
 pub async fn run_interactive(settings: Settings) -> Result<()> {
+    print_sanity_warnings(&settings);
     let mut session = Session::new(settings);
     std::fs::create_dir_all(&session.root).ok();
 
@@ -189,6 +191,12 @@ pub async fn run_interactive(settings: Settings) -> Result<()> {
 
     println!("{}", dim("Goodbye."));
     Ok(())
+}
+
+fn print_sanity_warnings(settings: &Settings) {
+    for warning in settings.sanity_warnings() {
+        println!("{}", yellow(&format!("Warning: {warning}")));
+    }
 }
 
 fn print_banner(session: &Session) {

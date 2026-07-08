@@ -71,7 +71,14 @@ impl Agent {
              that has no such generator. A shell command or built-in (echo, cat, ls, mkdir, \
              touch, grep, and so on) is never a tool by itself - there is no tool with that \
              name, so call run_command with it as the \"command\" argument instead, e.g. \
-             run_command(\"echo hello\"), not a tool named \"echo\". Once you have enough \
+             run_command(\"echo hello\"), not a tool named \"echo\". After making code \
+             changes, verify them by building and/or running tests via run_command (e.g. \
+             `cargo build`/`cargo test`, `npm test`, `pytest`, `go build`) before giving your \
+             final answer, whenever the project has such a command - don't declare something \
+             done without checking it still builds. Only commit to git when the user \
+             explicitly asks for it, never as an automatic side effect of another task; use \
+             the git_commit tool for that with a short, clear message, and the read-only git \
+             tool first if you need to check what actually changed. Once you have enough \
              information, give your final answer as plain text."
         )
     }

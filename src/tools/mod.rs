@@ -81,6 +81,7 @@ impl ToolRegistry {
         registry.register(edit::CreateDirectoryTool::new(auto_approve));
         registry.register(run_command::RunCommandTool::new(bypass_permissions));
         registry.register(git::GitTool);
+        registry.register(git::GitCommitTool::new(bypass_permissions));
         registry.register(outline::OutlineFileTool);
 
         registry

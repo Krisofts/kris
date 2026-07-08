@@ -105,21 +105,49 @@ impl Settings {
             "model_path" => self.model_path = value.to_string(),
             "llama_server_path" => self.llama_server_path = value.to_string(),
             "llama_url" => self.llama_url = value.to_string(),
-            "context_size" => self.context_size = value.parse().context("expected an integer")?,
-            "temperature" => self.temperature = value.parse().context("expected a number")?,
-            "max_tokens" => self.max_tokens = value.parse().context("expected an integer")?,
-            "threads" => self.threads = Some(value.parse().context("expected an integer")?),
+            "context_size" => {
+                let parsed: u32 = value.parse().context("expected an integer")?;
+                if parsed == 0 {
+                    anyhow::bail!("context_size must be greater than 0");
+                }
+                self.context_size = parsed;
+            }
+            "temperature" => {
+                let parsed: f32 = value.parse().context("expected a number")?;
+                if !(0.0..=2.0).contains(&parsed) {
+                    anyhow::bail!("temperature must be between 0.0 and 2.0");
+                }
+                self.temperature = parsed;
+            }
+            "max_tokens" => {
+                let parsed: u32 = value.parse().context("expected an integer")?;
+                if parsed == 0 {
+                    anyhow::bail!("max_tokens must be greater than 0");
+                }
+                self.max_tokens = parsed;
+            }
+            "threads" => {
+                let parsed: u32 = value.parse().context("expected an integer")?;
+                if parsed == 0 {
+                    anyhow::bail!("threads must be greater than 0 (unset it instead to use the default)");
+                }
+                self.threads = Some(parsed);
+            }
             "mlock" => self.mlock = value.parse().context("expected true or false")?,
             "flash_attn" => self.flash_attn = value.parse().context("expected true or false")?,
             "cache_type_k" => self.cache_type_k = Some(value.to_string()),
             "cache_type_v" => self.cache_type_v = Some(value.to_string()),
             "workspace" => self.workspace = value.to_string(),
             "active_project" => self.active_project = value.to_string(),
-            // Legacy alias: pre-rename config files used "projects_root"
-            // for what "workspace" means now (the parent folder holding
-            // every project) - accepted rather than rejected so an old
-            // config.toml keeps loading instead of erroring out.
-            "projects_root" => self.workspace = value.to_string(),
+            // Legacy key from before this file's fields were renamed -
+            // silently ignored (not rejected, so an old config.toml still
+            // loads) rather than mapped onto `workspace`. It used to
+            // default to the whole home directory for anyone who hadn't
+            // customized it, which is far too broad to adopt as the new
+            // workspace root; the old `workspace` key (the single active
+            // project's own directory) usually already sits inside the
+            // right parent folder and is a much safer value to keep.
+            "projects_root" => {}
             "bypass_permissions" => {
                 self.bypass_permissions = value.parse().context("expected true or false")?
             }
@@ -131,6 +159,24 @@ impl Settings {
 
     pub fn describe(&self) -> String {
         toml_render(self)
+    }
+
+    /// Soft warnings about combinations that parse fine individually but
+    /// don't make sense together - printed at startup, not enforced,
+    /// since llama-server would otherwise just fail confusingly deep
+    /// into a request instead of up front.
+    pub fn sanity_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.max_tokens >= self.context_size {
+            warnings.push(format!(
+                "max_tokens ({}) is >= context_size ({}) - there'd be no room left for the \
+                 conversation itself. Consider lowering max_tokens or raising context_size.",
+                self.max_tokens, self.context_size
+            ));
+        }
+
+        warnings
     }
 }
 
@@ -214,6 +260,20 @@ mod tests {
         assert_eq!(parsed.model_path, "/data/model.gguf");
         assert_eq!(parsed.context_size, 4096);
         assert_eq!(parsed.threads, Some(4));
+    }
+
+    #[test]
+    fn legacy_projects_root_key_does_not_overwrite_workspace() {
+        // Simulates an old config.toml: "workspace" was the single active
+        // project's own directory (a sane value to keep as the new
+        // "parent folder" meaning too, since it usually already contains
+        // whatever project the user had), while "projects_root" was a
+        // separate, often-untouched field defaulting to the whole home
+        // directory - far too broad to inherit as the new workspace root.
+        let raw = "workspace = \"/home/user/project\"\nprojects_root = \"/home/user\"\n";
+        let parsed = toml_parse(raw).unwrap();
+
+        assert_eq!(parsed.workspace, "/home/user/project");
     }
 
     #[test]
