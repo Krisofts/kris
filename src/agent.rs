@@ -267,15 +267,60 @@ fn joined_text(history: &[Message]) -> String {
 
 /// Defensive fallback: if the server ever returns a tool call as plain
 /// content instead of the structured `tool_calls` field (e.g. --jinja
-/// wasn't enabled, or an older llama-server build), scan for a single
-/// balanced `{...}` JSON object shaped like `{"tool": ..., "args": {...}}`
-/// so the turn still works instead of showing raw JSON as the answer.
+/// wasn't enabled, an older llama-server build, or this model's chat
+/// template just isn't getting server-side tool-call parsing), scan for a
+/// single balanced `{...}` JSON object describing a call and pull out a
+/// (name, args) pair. Different model families spell this differently -
+/// KRIS's own `{"tool": ..., "args": {...}}`, and the OpenAI/Hermes-style
+/// `{"name": ..., "arguments": {...}}` that Qwen models leak (often
+/// wrapped in `<tool_call>...</tool_call>` tags) plus its nested
+/// `{"function": {"name": ..., "arguments": {...}}}` variant - are all
+/// tried so a leaked call still actually runs instead of just being
+/// printed as if it were the final answer.
 fn parse_tool_call_from_text(text: &str) -> Option<(String, Value)> {
     let json_str = extract_first_json_object(text)?;
     let value: Value = serde_json::from_str(&json_str).ok()?;
-    let tool = value.get("tool")?.as_str()?.to_string();
-    let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
-    Some((tool, args))
+    extract_tool_call(&value)
+}
+
+fn extract_tool_call(value: &Value) -> Option<(String, Value)> {
+    if let Some(function) = value.get("function") {
+        if let Some(result) = extract_tool_call(function) {
+            return Some(result);
+        }
+    }
+
+    let name_key = ["tool", "name", "tool_name"]
+        .into_iter()
+        .find(|key| value.get(*key).and_then(Value::as_str).is_some())?;
+
+    let args_key = ["args", "arguments", "parameters", "input"]
+        .into_iter()
+        .find(|key| value.get(*key).is_some());
+
+    // A bare "name" field with no sibling arguments key is common enough
+    // in ordinary JSON (a person record, a config example) that treating
+    // it alone as an attempted tool call would misfire too often - only
+    // the more distinctive "tool"/"tool_name" keys are trusted on their
+    // own.
+    if args_key.is_none() && name_key == "name" {
+        return None;
+    }
+
+    let name = value.get(name_key)?.as_str()?.to_string();
+    let args = args_key
+        .and_then(|key| value.get(key))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    // Arguments sometimes arrive as a JSON-encoded string rather than a
+    // nested object, matching how OpenAI's wire format represents them.
+    let args = match args {
+        Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
+        other => other,
+    };
+
+    Some((name, args))
 }
 
 fn extract_first_json_object(text: &str) -> Option<String> {
@@ -329,6 +374,37 @@ mod tests {
     #[test]
     fn ignores_plain_prose_without_json() {
         assert!(parse_tool_call_from_text("Here's the answer: it's 42.").is_none());
+    }
+
+    #[test]
+    fn extracts_hermes_style_tool_call_wrapped_in_tags() {
+        let text = "<tool_call>\n\
+             {\"name\": \"create_directory\", \"arguments\": {\"path\": \"myproj\"}}\n\
+             </tool_call>";
+        let (name, args) = parse_tool_call_from_text(text).unwrap();
+        assert_eq!(name, "create_directory");
+        assert_eq!(args["path"], "myproj");
+    }
+
+    #[test]
+    fn extracts_nested_openai_style_function_call() {
+        let text = "{\"function\": {\"name\": \"run_command\", \"arguments\": {\"command\": \"cargo new myproj\"}}}";
+        let (name, args) = parse_tool_call_from_text(text).unwrap();
+        assert_eq!(name, "run_command");
+        assert_eq!(args["command"], "cargo new myproj");
+    }
+
+    #[test]
+    fn parses_stringified_arguments() {
+        let text = "{\"name\": \"write_file\", \"arguments\": \"{\\\"path\\\": \\\"a.rs\\\", \\\"content\\\": \\\"fn main() {}\\\"}\"}";
+        let (name, args) = parse_tool_call_from_text(text).unwrap();
+        assert_eq!(name, "write_file");
+        assert_eq!(args["path"], "a.rs");
+    }
+
+    #[test]
+    fn ignores_bare_name_field_without_arguments() {
+        assert!(parse_tool_call_from_text("{\"name\": \"John\", \"age\": 30}").is_none());
     }
 
     #[test]
