@@ -30,6 +30,13 @@ struct ChatRequest<'a> {
     cache_prompt: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
+    /// Sent explicitly (rather than left to llama-server's own default)
+    /// because some chat-template builds bias heavily toward always
+    /// emitting a tool call once `tools` is present unless `tool_choice`
+    /// says otherwise - "auto" is what actually lets the model answer in
+    /// plain text when no tool is warranted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a str>,
 }
 
 /// Final, fully-accumulated result of a streamed chat turn.
@@ -80,6 +87,7 @@ impl LlamaClient {
             stream: true,
             cache_prompt: true,
             tools,
+            tool_choice: tools.map(|_| "auto"),
         };
 
         const MAX_ATTEMPTS: u32 = 4;

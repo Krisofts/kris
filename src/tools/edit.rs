@@ -1,5 +1,8 @@
+use std::cell::Cell;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
+use std::rc::Rc;
 
 use serde_json::{json, Value};
 
@@ -8,7 +11,43 @@ use crate::style::cyan;
 
 use super::{Tool, ToolError};
 
-pub struct WriteFileTool;
+/// Asks the user to approve a filesystem-mutating tool call before it runs,
+/// showing the diff/summary the caller already printed. Shared across all
+/// edit tools via one `Rc<Cell<bool>>` so choosing "always" once covers
+/// writes, edits, deletes, and moves for the rest of the session, not just
+/// the specific tool that happened to ask first.
+fn confirm(auto_approve: &Cell<bool>) -> bool {
+    if auto_approve.get() {
+        return true;
+    }
+
+    print!("Apply this change? [y/N, or a = always for this session]: ");
+    let _ = io::stdout().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "a" | "always" => {
+            auto_approve.set(true);
+            true
+        }
+        _ => false,
+    }
+}
+
+pub struct WriteFileTool {
+    auto_approve: Rc<Cell<bool>>,
+}
+
+impl WriteFileTool {
+    pub fn new(auto_approve: Rc<Cell<bool>>) -> Self {
+        Self { auto_approve }
+    }
+}
 
 impl Tool for WriteFileTool {
     fn name(&self) -> &'static str {
@@ -47,6 +86,10 @@ impl Tool for WriteFileTool {
 
         println!("{}", render_unified_diff(path, &old, content));
 
+        if !confirm(&self.auto_approve) {
+            return Ok(format!("{path} not written (user declined)."));
+        }
+
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -56,7 +99,15 @@ impl Tool for WriteFileTool {
     }
 }
 
-pub struct EditFileTool;
+pub struct EditFileTool {
+    auto_approve: Rc<Cell<bool>>,
+}
+
+impl EditFileTool {
+    pub fn new(auto_approve: Rc<Cell<bool>>) -> Self {
+        Self { auto_approve }
+    }
+}
 
 impl Tool for EditFileTool {
     fn name(&self) -> &'static str {
@@ -122,6 +173,10 @@ impl Tool for EditFileTool {
 
         println!("{}", render_unified_diff(path, &content, &updated));
 
+        if !confirm(&self.auto_approve) {
+            return Ok(format!("{path} not edited (user declined)."));
+        }
+
         fs::write(&full_path, &updated)?;
 
         let count = if replace_all { occurrences } else { 1 };
@@ -129,7 +184,15 @@ impl Tool for EditFileTool {
     }
 }
 
-pub struct DeleteFileTool;
+pub struct DeleteFileTool {
+    auto_approve: Rc<Cell<bool>>,
+}
+
+impl DeleteFileTool {
+    pub fn new(auto_approve: Rc<Cell<bool>>) -> Self {
+        Self { auto_approve }
+    }
+}
 
 impl Tool for DeleteFileTool {
     fn name(&self) -> &'static str {
@@ -167,13 +230,25 @@ impl Tool for DeleteFileTool {
         let old = fs::read_to_string(&full_path).unwrap_or_default();
         println!("{}", render_unified_diff(path, &old, ""));
 
+        if !confirm(&self.auto_approve) {
+            return Ok(format!("{path} not deleted (user declined)."));
+        }
+
         fs::remove_file(&full_path)?;
 
         Ok(format!("Deleted {path}"))
     }
 }
 
-pub struct DeleteDirectoryTool;
+pub struct DeleteDirectoryTool {
+    auto_approve: Rc<Cell<bool>>,
+}
+
+impl DeleteDirectoryTool {
+    pub fn new(auto_approve: Rc<Cell<bool>>) -> Self {
+        Self { auto_approve }
+    }
+}
 
 impl Tool for DeleteDirectoryTool {
     fn name(&self) -> &'static str {
@@ -232,6 +307,10 @@ impl Tool for DeleteDirectoryTool {
             println!("  - {entry}");
         }
 
+        if !confirm(&self.auto_approve) {
+            return Ok(format!("{path} not deleted (user declined)."));
+        }
+
         fs::remove_dir_all(&full_path)?;
 
         Ok(format!(
@@ -256,7 +335,15 @@ fn walk_files(dir: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-pub struct MoveFileTool;
+pub struct MoveFileTool {
+    auto_approve: Rc<Cell<bool>>,
+}
+
+impl MoveFileTool {
+    pub fn new(auto_approve: Rc<Cell<bool>>) -> Self {
+        Self { auto_approve }
+    }
+}
 
 impl Tool for MoveFileTool {
     fn name(&self) -> &'static str {
@@ -298,6 +385,10 @@ impl Tool for MoveFileTool {
 
         println!("{}", cyan(&format!("Moving {from} -> {to}")));
 
+        if !confirm(&self.auto_approve) {
+            return Ok(format!("{from} not moved (user declined)."));
+        }
+
         if let Some(parent) = to_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -307,7 +398,15 @@ impl Tool for MoveFileTool {
     }
 }
 
-pub struct CreateDirectoryTool;
+pub struct CreateDirectoryTool {
+    auto_approve: Rc<Cell<bool>>,
+}
+
+impl CreateDirectoryTool {
+    pub fn new(auto_approve: Rc<Cell<bool>>) -> Self {
+        Self { auto_approve }
+    }
+}
 
 impl Tool for CreateDirectoryTool {
     fn name(&self) -> &'static str {
@@ -335,6 +434,12 @@ impl Tool for CreateDirectoryTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArgs("path".to_string()))?;
 
+        println!("{}", cyan(&format!("Create directory {path}")));
+
+        if !confirm(&self.auto_approve) {
+            return Ok(format!("{path} not created (user declined)."));
+        }
+
         fs::create_dir_all(root.join(path))?;
 
         Ok(format!("Created directory {path}"))
@@ -345,12 +450,16 @@ impl Tool for CreateDirectoryTool {
 mod tests {
     use super::*;
 
+    fn approved() -> Rc<Cell<bool>> {
+        Rc::new(Cell::new(true))
+    }
+
     #[test]
     fn edit_file_requires_unique_match() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("f.txt"), "x\nx\n").unwrap();
 
-        let tool = EditFileTool;
+        let tool = EditFileTool::new(approved());
         let err = tool
             .execute(
                 dir.path(),
@@ -365,7 +474,7 @@ mod tests {
     fn write_file_creates_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
 
-        let tool = WriteFileTool;
+        let tool = WriteFileTool::new(approved());
         tool.execute(
             dir.path(),
             &json!({ "path": "nested/dir/f.txt", "content": "hi" }),
@@ -382,7 +491,7 @@ mod tests {
     fn delete_directory_refuses_project_root() {
         let dir = tempfile::tempdir().unwrap();
 
-        let tool = DeleteDirectoryTool;
+        let tool = DeleteDirectoryTool::new(approved());
         let err = tool
             .execute(dir.path(), &json!({ "path": "." }))
             .unwrap_err();

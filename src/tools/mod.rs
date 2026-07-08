@@ -4,8 +4,10 @@ mod git;
 mod outline;
 mod run_command;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -45,17 +47,22 @@ impl ToolRegistry {
             tools: HashMap::new(),
         };
 
+        // Shared so approving one filesystem change with "always" covers
+        // writes, edits, deletes, and moves for the rest of the session,
+        // rather than needing a separate "always" per tool.
+        let auto_approve = Rc::new(Cell::new(false));
+
         registry.register(fs::ReadFileTool);
         registry.register(fs::ListDirectoryTool);
         registry.register(fs::TreeTool);
         registry.register(fs::FindFilesTool);
         registry.register(fs::SearchCodeTool);
-        registry.register(edit::WriteFileTool);
-        registry.register(edit::EditFileTool);
-        registry.register(edit::DeleteFileTool);
-        registry.register(edit::DeleteDirectoryTool);
-        registry.register(edit::MoveFileTool);
-        registry.register(edit::CreateDirectoryTool);
+        registry.register(edit::WriteFileTool::new(auto_approve.clone()));
+        registry.register(edit::EditFileTool::new(auto_approve.clone()));
+        registry.register(edit::DeleteFileTool::new(auto_approve.clone()));
+        registry.register(edit::DeleteDirectoryTool::new(auto_approve.clone()));
+        registry.register(edit::MoveFileTool::new(auto_approve.clone()));
+        registry.register(edit::CreateDirectoryTool::new(auto_approve));
         registry.register(run_command::RunCommandTool::new());
         registry.register(git::GitTool);
         registry.register(outline::OutlineFileTool);
