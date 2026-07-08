@@ -23,6 +23,16 @@ pub struct Settings {
     pub cache_type_k: Option<String>,
     pub cache_type_v: Option<String>,
     pub workspace: String,
+    /// Parent folder the `project` command lists/picks from - separate
+    /// from `workspace`, which is the currently active project's own
+    /// directory (a subfolder of this one, typically).
+    pub projects_root: String,
+    /// When true, every tool that would normally ask for a y/N
+    /// confirmation (filesystem edits, run_command) executes immediately
+    /// instead - equivalent to having answered "always" at the start of
+    /// every session. Off by default since it removes the only safety
+    /// net against a model acting on the project unsupervised.
+    pub bypass_permissions: bool,
 }
 
 impl Default for Settings {
@@ -45,6 +55,8 @@ impl Default for Settings {
             cache_type_k: Some("q8_0".to_string()),
             cache_type_v: Some("q8_0".to_string()),
             workspace: home.join("project").display().to_string(),
+            projects_root: home.display().to_string(),
+            bypass_permissions: false,
         }
     }
 }
@@ -98,6 +110,10 @@ impl Settings {
             "cache_type_k" => self.cache_type_k = Some(value.to_string()),
             "cache_type_v" => self.cache_type_v = Some(value.to_string()),
             "workspace" => self.workspace = value.to_string(),
+            "projects_root" => self.projects_root = value.to_string(),
+            "bypass_permissions" => {
+                self.bypass_permissions = value.parse().context("expected true or false")?
+            }
             other => anyhow::bail!("unknown config key \"{other}\""),
         }
 
@@ -136,6 +152,11 @@ fn toml_render(settings: &Settings) -> String {
         out.push_str(&format!("cache_type_v = {v:?}\n"));
     }
     out.push_str(&format!("workspace = {:?}\n", settings.workspace));
+    out.push_str(&format!("projects_root = {:?}\n", settings.projects_root));
+    out.push_str(&format!(
+        "bypass_permissions = {}\n",
+        settings.bypass_permissions
+    ));
     out
 }
 

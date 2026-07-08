@@ -37,12 +37,16 @@ pub struct ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        Self::with_defaults()
+        Self::with_defaults(false)
     }
 }
 
 impl ToolRegistry {
-    pub fn with_defaults() -> Self {
+    /// `bypass_permissions` seeds every tool's confirmation gate as
+    /// already-approved (as if "always" had been answered up front),
+    /// for `config set bypass_permissions true` / the `--yes`-style
+    /// unattended use case - off means every gate starts fresh and asks.
+    pub fn with_defaults(bypass_permissions: bool) -> Self {
         let mut registry = Self {
             tools: HashMap::new(),
         };
@@ -50,7 +54,7 @@ impl ToolRegistry {
         // Shared so approving one filesystem change with "always" covers
         // writes, edits, deletes, and moves for the rest of the session,
         // rather than needing a separate "always" per tool.
-        let auto_approve = Rc::new(Cell::new(false));
+        let auto_approve = Rc::new(Cell::new(bypass_permissions));
 
         registry.register(fs::ReadFileTool);
         registry.register(fs::ListDirectoryTool);
@@ -63,7 +67,7 @@ impl ToolRegistry {
         registry.register(edit::DeleteDirectoryTool::new(auto_approve.clone()));
         registry.register(edit::MoveFileTool::new(auto_approve.clone()));
         registry.register(edit::CreateDirectoryTool::new(auto_approve));
-        registry.register(run_command::RunCommandTool::new());
+        registry.register(run_command::RunCommandTool::new(bypass_permissions));
         registry.register(git::GitTool);
         registry.register(outline::OutlineFileTool);
 
@@ -121,7 +125,7 @@ mod tests {
 
     #[test]
     fn describe_all_uses_openai_function_shape() {
-        let registry = ToolRegistry::with_defaults();
+        let registry = ToolRegistry::with_defaults(false);
         let described = registry.describe_all();
 
         assert!(!described.is_empty());
@@ -134,7 +138,7 @@ mod tests {
 
     #[test]
     fn execute_reports_unknown_tool() {
-        let registry = ToolRegistry::with_defaults();
+        let registry = ToolRegistry::with_defaults(false);
         let err = registry
             .execute("does_not_exist", Path::new("."), &json!({}))
             .unwrap_err();

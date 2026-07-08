@@ -18,9 +18,9 @@ pub struct RunCommandTool {
 }
 
 impl RunCommandTool {
-    pub fn new() -> Self {
+    pub fn new(auto_approve: bool) -> Self {
         Self {
-            auto_approve: Cell::new(false),
+            auto_approve: Cell::new(auto_approve),
         }
     }
 }

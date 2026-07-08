@@ -137,7 +137,7 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
     std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
 
     let client = LlamaClient::new(base_url, "test-model".to_string());
-    let agent = Agent::new(client, ToolRegistry::with_defaults(), 0.2, 512, 8192);
+    let agent = Agent::new(client, ToolRegistry::with_defaults(false), 0.2, 512, 8192);
 
     let mut history: Vec<Message> = Vec::new();
     let mut tool_calls_seen: Vec<(String, String)> = Vec::new();

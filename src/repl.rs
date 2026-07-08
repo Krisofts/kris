@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,7 +60,7 @@ impl Session {
     fn agent(&self) -> Agent {
         Agent::new(
             server::client_for(&self.settings),
-            ToolRegistry::with_defaults(),
+            ToolRegistry::with_defaults(self.settings.bypass_permissions),
             self.settings.temperature,
             self.settings.max_tokens,
             self.settings.context_size,
@@ -208,6 +209,7 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
         }
         "model" => handle_model(session, rest),
         "workspace" => handle_workspace(session, rest),
+        "project" => handle_project(session, rest),
         "config" => handle_config(session, rest),
         "fix" => {
             let prompt = format!(
@@ -316,6 +318,85 @@ fn handle_workspace(session: &mut Session, arg: &str) {
     );
 }
 
+/// Lists (with no argument) or switches to (`project <name>`) a project
+/// living directly under `projects_root`, as opposed to `workspace
+/// <path>`, which takes an arbitrary path anywhere. Switching also
+/// persists as the new `workspace`, so it's what KRIS opens next time
+/// too - "picking a project" and "setting the default project" are the
+/// same action here.
+fn handle_project(session: &mut Session, arg: &str) {
+    let projects_root = PathBuf::from(shellexpand_home(&session.settings.projects_root));
+
+    if arg.is_empty() {
+        list_projects(session, &projects_root);
+        return;
+    }
+
+    let path = projects_root.join(arg);
+    if !path.is_dir() {
+        println!(
+            "{}",
+            red(&format!(
+                "No project \"{arg}\" in {}",
+                projects_root.display()
+            ))
+        );
+        return;
+    }
+
+    session.switch_workspace(&path);
+    if let Err(err) = session.settings.save() {
+        println!("{}", red(&format!("Failed to save config: {err}")));
+    }
+    println!(
+        "{}",
+        green(&format!(
+            "Switched to project {arg} ({})",
+            session.root.display()
+        ))
+    );
+}
+
+fn list_projects(session: &Session, projects_root: &Path) {
+    let entries = match fs::read_dir(projects_root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            println!(
+                "{}",
+                red(&format!("Could not list {}: {err}", projects_root.display()))
+            );
+            return;
+        }
+    };
+
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    names.sort();
+
+    if names.is_empty() {
+        println!(
+            "{}",
+            dim(&format!("No projects found in {}", projects_root.display()))
+        );
+        return;
+    }
+
+    println!("Projects in {}:", projects_root.display());
+    for name in &names {
+        let marker = if projects_root.join(name) == session.root {
+            "* "
+        } else {
+            "  "
+        };
+        println!("{marker}{name}");
+    }
+    println!("{}", dim("Usage: project <name>  (or `config set projects_root <path>` to look elsewhere)"));
+}
+
 fn shellexpand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -359,7 +440,8 @@ fn print_help() {
     println!("  health                check whether llama-server is reachable");
     println!("  serve                 start llama-server in the background if needed");
     println!("  model [preset]        show/switch the Qwen2.5-Coder model (1.5b/3b/7b)");
-    println!("  workspace [path]      show/switch the project KRIS is working in");
+    println!("  workspace [path]      show/switch the project KRIS is working in (any path)");
+    println!("  project [name]        list/switch to a project under projects_root - also becomes the new default");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
     println!("  clear                 clear conversation history and the screen");
     println!("  !<command>            run a raw shell command directly");
