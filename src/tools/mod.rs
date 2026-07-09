@@ -124,11 +124,65 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Same tool list as `describe_all`, but with each parameter schema
+    /// sanitized down to the subset a remote OpenAI-compatible provider
+    /// (Gemini) accepts. Gemini's function-calling validates the schema
+    /// strictly and rejects the whole request on keywords it doesn't know
+    /// (`additionalProperties`, `$schema`, `default`, …), so those are
+    /// stripped here. KRIS's built-in tools already use a clean subset, so
+    /// this is mostly a guard for any future tool - but a single unknown
+    /// keyword would otherwise 400 the entire turn.
+    pub fn describe_all_gemini(&self) -> Vec<Value> {
+        let mut schemas = self.describe_all();
+        for entry in &mut schemas {
+            if let Some(parameters) = entry.pointer_mut("/function/parameters") {
+                sanitize_gemini_schema(parameters);
+            }
+        }
+        schemas
+    }
+
     pub fn execute(&self, name: &str, root: &Path, args: &Value) -> Result<String, ToolError> {
         match self.tools.get(name) {
             Some(tool) => tool.execute(root, args),
             None => Err(ToolError::UnknownTool(name.to_string())),
         }
+    }
+}
+
+/// Recursively strips JSON Schema keywords that Gemini's function-calling
+/// schema validator rejects, so a schema written for the fuller subset
+/// llama.cpp accepts still passes there. Only removes keys; the structural
+/// `type`/`properties`/`required`/`items`/`enum`/`description` that Gemini
+/// does support are left untouched.
+fn sanitize_gemini_schema(value: &mut Value) {
+    const UNSUPPORTED: &[&str] = &[
+        "additionalProperties",
+        "$schema",
+        "$id",
+        "$ref",
+        "definitions",
+        "title",
+        "default",
+        "examples",
+        "const",
+    ];
+
+    match value {
+        Value::Object(map) => {
+            for key in UNSUPPORTED {
+                map.remove(*key);
+            }
+            for child in map.values_mut() {
+                sanitize_gemini_schema(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_gemini_schema(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -146,6 +200,68 @@ mod tests {
             assert_eq!(entry["type"], "function");
             assert!(entry["function"]["name"].is_string());
             assert!(entry["function"]["parameters"].is_object());
+        }
+    }
+
+    #[test]
+    fn gemini_schemas_keep_openai_shape_and_stay_clean() {
+        let registry = ToolRegistry::with_defaults(false);
+        let described = registry.describe_all_gemini();
+
+        assert!(!described.is_empty());
+        for entry in &described {
+            assert_eq!(entry["type"], "function");
+            assert!(entry["function"]["name"].is_string());
+            let params = &entry["function"]["parameters"];
+            assert_eq!(params["type"], "object");
+            // Nothing Gemini would reject should survive anywhere in the schema.
+            assert!(!schema_contains_key(params, "additionalProperties"));
+            assert!(!schema_contains_key(params, "default"));
+            assert!(!schema_contains_key(params, "$schema"));
+        }
+    }
+
+    #[test]
+    fn sanitizer_strips_unsupported_keywords_recursively() {
+        let mut schema = json!({
+            "type": "object",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string", "default": "x", "title": "Path" },
+                "opts": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "n": { "type": "integer", "const": 3 }
+                    }
+                }
+            },
+            "required": ["path"]
+        });
+
+        sanitize_gemini_schema(&mut schema);
+
+        // Supported structure is preserved...
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(schema["required"][0], "path");
+        // ...unsupported keywords are gone at every depth.
+        assert!(!schema_contains_key(&schema, "additionalProperties"));
+        assert!(!schema_contains_key(&schema, "$schema"));
+        assert!(!schema_contains_key(&schema, "default"));
+        assert!(!schema_contains_key(&schema, "title"));
+        assert!(!schema_contains_key(&schema, "const"));
+    }
+
+    /// True if `key` appears anywhere in the (possibly nested) schema.
+    fn schema_contains_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key(key) || map.values().any(|v| schema_contains_key(v, key))
+            }
+            Value::Array(items) => items.iter().any(|v| schema_contains_key(v, key)),
+            _ => false,
         }
     }
 

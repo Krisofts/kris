@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::client::ModelClient;
+use crate::client::{Backend, ModelClient};
 use crate::message::{FunctionCall, Message, Role, ToolCall};
 use crate::style::yellow;
 use crate::tools::{ToolError, ToolRegistry};
@@ -99,7 +99,12 @@ impl Agent {
         let turn_start = history.len();
         history.push(Message::user(user_input));
 
-        let tool_schemas = self.tools.describe_all();
+        // A remote provider (Gemini) validates tool schemas strictly, so
+        // hand it the sanitized subset; llama-server takes the full schema.
+        let tool_schemas = match self.client.backend() {
+            Backend::OpenAiCompat => self.tools.describe_all_gemini(),
+            Backend::Llama => self.tools.describe_all(),
+        };
 
         // Tracks the previous iteration's tool call(s) so an identical
         // repeat (the model proposing the exact same call again right

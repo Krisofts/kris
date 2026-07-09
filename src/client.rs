@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::message::{FunctionCall, Message, ToolCall};
@@ -129,6 +129,13 @@ impl ModelClient {
             backend,
             api_key,
         }
+    }
+
+    /// Which backend this client talks to - lets the agent pick the right
+    /// tool-schema flavour (llama-server takes full JSON Schema; a remote
+    /// provider needs it sanitized to the subset it accepts).
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// The chat-completions URL for this backend. llama-server mounts the
@@ -370,6 +377,11 @@ struct ChunkDelta {
 
 #[derive(Deserialize)]
 struct ToolCallDelta {
+    /// Defaulted because Gemini's OpenAI-compatible endpoint omits `index`
+    /// when there's a single tool call; without the default the whole chunk
+    /// would fail to parse and the tool call would be silently dropped. A
+    /// lone call at index 0 is exactly what we want in that case anyway.
+    #[serde(default)]
     index: usize,
     #[serde(default)]
     id: Option<String>,
@@ -381,8 +393,36 @@ struct ToolCallDelta {
 struct FunctionDelta {
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
+    /// The OpenAI wire format sends `arguments` as a JSON-encoded *string*
+    /// (often fragmented across deltas), but Gemini's compatibility layer
+    /// sometimes sends it as an already-parsed JSON *object*. Accept either:
+    /// a string is taken as-is (and concatenated by the accumulator), an
+    /// object is re-serialized to its JSON text. Without this, an object
+    /// payload would fail to deserialize and the tool call would vanish.
+    #[serde(default, deserialize_with = "deserialize_arguments")]
     arguments: Option<String>,
+}
+
+/// Deserializes a tool-call `arguments` field that may arrive as either a
+/// JSON string (OpenAI/llama.cpp) or a JSON object (Gemini), normalizing
+/// both to a string.
+fn deserialize_arguments<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrJson {
+        Str(String),
+        Other(Value),
+    }
+
+    Ok(
+        Option::<StringOrJson>::deserialize(deserializer)?.map(|value| match value {
+            StringOrJson::Str(s) => s,
+            StringOrJson::Other(v) => v.to_string(),
+        }),
+    )
 }
 
 /// Accumulates streamed `tool_calls` deltas, which arrive as fragments
@@ -561,6 +601,30 @@ mod tests {
         assert_eq!(calls[0].id, "call_abc");
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].function.arguments, "{\"path\":\"a.rs\"}");
+    }
+
+    #[test]
+    fn parses_gemini_style_tool_call_with_object_args_and_no_index() {
+        // Gemini's OpenAI-compat layer can send `arguments` as an object
+        // (not the OpenAI-standard JSON string) and omit `index` for a lone
+        // call. Both must still parse and yield the tool call.
+        let json = r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_x","function":{"name":"read_file","arguments":{"path":"a.rs"}}}]}}]}"#;
+        let chunk: ChatChunk = serde_json::from_str(json).unwrap();
+
+        let mut acc = ToolCallAccumulator::default();
+        for choice in chunk.choices {
+            if let Some(deltas) = choice.delta.tool_calls {
+                for delta in deltas {
+                    acc.apply(delta);
+                }
+            }
+        }
+
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let parsed: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(parsed["path"], "a.rs");
     }
 
     #[test]
