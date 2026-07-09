@@ -32,6 +32,39 @@ pub async fn ensure_running(settings: &Settings) -> bool {
         return true;
     }
 
+    let Some((host, port)) = parse_host_port(&settings.llama_url) else {
+        println!(
+            "{}",
+            red(&format!(
+                "Could not parse host/port from llama_url: {}",
+                settings.llama_url
+            ))
+        );
+        return false;
+    };
+
+    // A slow/overloaded llama-server can miss the health check's short
+    // timeout even though it's genuinely still running - checking
+    // whether anything is bound to the port at all (a raw TCP connect,
+    // which succeeds once the OS accepts it into the listen backlog,
+    // without needing the application itself to respond) avoids
+    // launching a second instance on top of it. That second instance
+    // would try to load another multi-GB model into memory before even
+    // discovering the port is taken - exactly the kind of compounding
+    // memory pressure that turns "briefly slow" into the whole phone
+    // swapping itself into the ground.
+    if port_is_open(&host, &port).await {
+        println!(
+            "{}",
+            yellow(&format!(
+                "Something is already listening on {} (a busy llama-server, most likely) - \
+                 waiting instead of starting a second one...",
+                settings.llama_url
+            ))
+        );
+        return wait_for_health(settings).await;
+    }
+
     if settings.model_path.is_empty() {
         println!("{}", red("No model_path configured."));
         println!("Set it: config set model_path /path/to/model.gguf");
@@ -57,17 +90,6 @@ pub async fn ensure_running(settings: &Settings) -> bool {
         println!("Set it: config set llama_server_path /path/to/llama-server");
         return false;
     }
-
-    let Some((host, port)) = parse_host_port(&settings.llama_url) else {
-        println!(
-            "{}",
-            red(&format!(
-                "Could not parse host/port from llama_url: {}",
-                settings.llama_url
-            ))
-        );
-        return false;
-    };
 
     let log_path = dirs::home_dir()
         .map(|home| home.join("llama-server.log"))
@@ -122,6 +144,14 @@ pub async fn ensure_running(settings: &Settings) -> bool {
         return false;
     }
 
+    wait_for_health(settings).await
+}
+
+/// Polls `/health` every 2s for up to a minute, printing dots while
+/// waiting. Shared by "just launched it" and "something's already on
+/// the port, hopefully it's just busy" - the two situations that end
+/// with the same "wait and see" step.
+async fn wait_for_health(settings: &Settings) -> bool {
     print!("Waiting for llama-server to become ready");
     let _ = std::io::stdout().flush();
 
@@ -144,11 +174,24 @@ pub async fn ensure_running(settings: &Settings) -> bool {
     println!(
         "{}",
         yellow(&format!(
-            "llama-server didn't respond within 60s - check {}",
-            log_path.display()
+            "llama-server still hasn't responded after 60s - it may just be very busy \
+             (check ~/llama-server.log for what it's doing) rather than actually down."
         ))
     );
     false
+}
+
+/// A raw TCP connect, succeeding as soon as the OS accepts it into the
+/// listen backlog - unlike an HTTP health check, this doesn't need the
+/// application itself to be responsive, so it's a reliable "is anything
+/// bound here at all" signal even while llama-server is too CPU/memory-
+/// starved to answer requests.
+async fn port_is_open(host: &str, port: &str) -> bool {
+    let addr = format!("{host}:{port}");
+    tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(&addr))
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false)
 }
 
 fn parse_host_port(url: &str) -> Option<(String, String)> {
