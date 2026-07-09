@@ -2,16 +2,32 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::client::LlamaClient;
-use crate::config::Settings;
+use crate::client::{Backend, ModelClient};
+use crate::config::{Provider, Settings};
 use crate::style::{dim, green, red, yellow};
 
-pub fn client_for(settings: &Settings) -> LlamaClient {
-    LlamaClient::new(settings.llama_url.clone(), String::new())
+pub fn client_for(settings: &Settings) -> ModelClient {
+    match settings.provider {
+        Provider::Local => {
+            ModelClient::new(settings.llama_url.clone(), String::new(), Backend::Llama, None)
+        }
+        Provider::Gemini => ModelClient::new(
+            settings.gemini_url.clone(),
+            settings.gemini_model.clone(),
+            Backend::OpenAiCompat,
+            settings.resolved_api_key(),
+        ),
+    }
 }
 
 pub async fn check_health(settings: &Settings) -> bool {
-    client_for(settings).health().await
+    match settings.provider {
+        Provider::Local => client_for(settings).health().await,
+        // The online provider has no cheap unauthenticated health endpoint;
+        // treat "an API key is configured" as ready and let the first real
+        // request surface any auth or network problem.
+        Provider::Gemini => settings.resolved_api_key().is_some(),
+    }
 }
 
 /// Starts llama-server if it isn't already reachable, and waits (up to 60s)
@@ -21,6 +37,13 @@ pub async fn check_health(settings: &Settings) -> bool {
 /// killed the background process while KRIS was idle self-heals instead of
 /// just erroring out.
 pub async fn ensure_running(settings: &Settings) -> bool {
+    // Online mode has no local process to launch or wait on - readiness is
+    // just "is there an API key?". The rest of this function is entirely
+    // about managing a local llama-server.
+    if settings.provider == Provider::Gemini {
+        return ensure_online_ready(settings);
+    }
+
     if check_health(settings).await {
         println!(
             "{}",
@@ -145,6 +168,28 @@ pub async fn ensure_running(settings: &Settings) -> bool {
     }
 
     wait_for_health(settings).await
+}
+
+/// Online-mode counterpart to `ensure_running`: there's nothing to start,
+/// so this just checks a key is present and reports which model requests
+/// will go to.
+fn ensure_online_ready(settings: &Settings) -> bool {
+    if settings.resolved_api_key().is_none() {
+        println!("{}", red("Online mode selected but no API key is set."));
+        println!(
+            "Set it: export GEMINI_API_KEY=...  (or `config set gemini_api_key <key>`)"
+        );
+        return false;
+    }
+
+    println!(
+        "{}",
+        green(&format!(
+            "Online mode: {} via {}",
+            settings.gemini_model, settings.gemini_url
+        ))
+    );
+    true
 }
 
 /// Polls `/health` every 2s for up to a minute, printing dots while

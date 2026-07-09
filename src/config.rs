@@ -4,6 +4,35 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Which backend serves the model: a local `llama-server` (fully offline)
+/// or an online, OpenAI-compatible API (Gemini's compatibility endpoint).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Local,
+    Gemini,
+}
+
+impl Provider {
+    fn as_str(self) -> &'static str {
+        match self {
+            Provider::Local => "local",
+            Provider::Gemini => "gemini",
+        }
+    }
+
+    /// Accepts the internal names plus the friendlier "offline"/"online"
+    /// aliases the `mode` command speaks, so `config set provider online`
+    /// and `mode online` land on the same value.
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" | "offline" | "llama" => Some(Provider::Local),
+            "gemini" | "online" => Some(Provider::Gemini),
+            _ => None,
+        }
+    }
+}
+
 /// Persisted at `~/.config/kris/config.toml`. Every field has a sane
 /// default so a first run with no config file at all still works, as long
 /// as `model_path` gets set (via `config set model_path ...` or by
@@ -11,6 +40,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Selects offline (`local` llama-server) vs online (`gemini`) at
+    /// runtime, so the same install can switch between the two without
+    /// re-editing anything but this one value.
+    pub provider: Provider,
     pub model_path: String,
     pub llama_server_path: String,
     pub llama_url: String,
@@ -22,6 +55,20 @@ pub struct Settings {
     pub flash_attn: bool,
     pub cache_type_k: Option<String>,
     pub cache_type_v: Option<String>,
+    /// OpenAI-compatible base URL for the online provider (Gemini's compat
+    /// endpoint by default). The client appends `/chat/completions`.
+    pub gemini_url: String,
+    /// Model id sent in online requests, e.g. `gemini-2.5-flash`.
+    pub gemini_model: String,
+    /// API key for the online provider. Left empty by default: the
+    /// `GEMINI_API_KEY` environment variable is preferred and checked
+    /// first, so the key need not be written to disk in plain text at all.
+    pub gemini_api_key: String,
+    /// Context-window budget used for history trimming in online mode,
+    /// kept separate from `context_size` (which doubles as llama-server's
+    /// `-c` allocation) so a large online window doesn't make the local
+    /// server try to reserve gigabytes of KV cache.
+    pub gemini_context_size: u32,
     /// Parent folder holding every project - what the `project` command
     /// lists and picks from. Every project lives as a direct subfolder of
     /// this one; there is no separate single-project directory anymore.
@@ -44,6 +91,7 @@ impl Default for Settings {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
         Self {
+            provider: Provider::Local,
             model_path: String::new(),
             llama_server_path: home
                 .join("llama.cpp/build/bin/llama-server")
@@ -64,6 +112,10 @@ impl Default for Settings {
             flash_attn: true,
             cache_type_k: Some("q8_0".to_string()),
             cache_type_v: Some("q8_0".to_string()),
+            gemini_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            gemini_model: "gemini-2.5-flash".to_string(),
+            gemini_api_key: String::new(),
+            gemini_context_size: 128_000,
             workspace: home.join("workspace").display().to_string(),
             active_project: String::new(),
             bypass_permissions: false,
@@ -108,6 +160,21 @@ impl Settings {
     /// reflection so unknown keys give a clear error.
     pub fn set_field(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
+            "provider" => {
+                self.provider = Provider::parse(value).with_context(|| {
+                    format!("expected local/offline or gemini/online, got \"{value}\"")
+                })?;
+            }
+            "gemini_url" => self.gemini_url = value.to_string(),
+            "gemini_model" => self.gemini_model = value.to_string(),
+            "gemini_api_key" => self.gemini_api_key = value.to_string(),
+            "gemini_context_size" => {
+                let parsed: u32 = value.parse().context("expected an integer")?;
+                if parsed == 0 {
+                    anyhow::bail!("gemini_context_size must be greater than 0");
+                }
+                self.gemini_context_size = parsed;
+            }
             "model_path" => self.model_path = value.to_string(),
             "llama_server_path" => self.llama_server_path = value.to_string(),
             "llama_url" => self.llama_url = value.to_string(),
@@ -164,7 +231,32 @@ impl Settings {
     }
 
     pub fn describe(&self) -> String {
-        toml_render(self)
+        // Redacted so `config` doesn't print the API key to the terminal;
+        // `save` still writes the real value via toml_render directly.
+        toml_render_inner(self, true)
+    }
+
+    /// Resolves the online API key, preferring the `GEMINI_API_KEY`
+    /// environment variable over the persisted config value so the key
+    /// need never be written to disk.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+            if !key.trim().is_empty() {
+                return Some(key);
+            }
+        }
+        let key = self.gemini_api_key.trim();
+        (!key.is_empty()).then(|| key.to_string())
+    }
+
+    /// Context-window budget the history-trimmer should respect for the
+    /// active provider - the online window is tracked separately from the
+    /// local llama-server allocation.
+    pub fn effective_context_size(&self) -> u32 {
+        match self.provider {
+            Provider::Local => self.context_size,
+            Provider::Gemini => self.gemini_context_size,
+        }
     }
 
     /// Soft warnings about combinations that parse fine individually but
@@ -174,12 +266,22 @@ impl Settings {
     pub fn sanity_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
-        if self.max_tokens >= self.context_size {
+        if self.max_tokens >= self.effective_context_size() {
             warnings.push(format!(
-                "max_tokens ({}) is >= context_size ({}) - there'd be no room left for the \
-                 conversation itself. Consider lowering max_tokens or raising context_size.",
-                self.max_tokens, self.context_size
+                "max_tokens ({}) is >= the context window ({}) - there'd be no room left for \
+                 the conversation itself. Consider lowering max_tokens or raising the context \
+                 size.",
+                self.max_tokens,
+                self.effective_context_size()
             ));
+        }
+
+        if self.provider == Provider::Gemini && self.resolved_api_key().is_none() {
+            warnings.push(
+                "online mode (provider = gemini) is selected but no API key is set - export \
+                 GEMINI_API_KEY, or run `config set gemini_api_key <key>`."
+                    .to_string(),
+            );
         }
 
         warnings
@@ -191,7 +293,12 @@ impl Settings {
 /// doesn't need a full `toml` dependency just to persist a dozen scalar
 /// fields (keeps the dependency tree, and thus Termux build time, down).
 fn toml_render(settings: &Settings) -> String {
+    toml_render_inner(settings, false)
+}
+
+fn toml_render_inner(settings: &Settings, redact: bool) -> String {
     let mut out = String::new();
+    out.push_str(&format!("provider = {:?}\n", settings.provider.as_str()));
     out.push_str(&format!("model_path = {:?}\n", settings.model_path));
     out.push_str(&format!(
         "llama_server_path = {:?}\n",
@@ -212,6 +319,18 @@ fn toml_render(settings: &Settings) -> String {
     if let Some(v) = &settings.cache_type_v {
         out.push_str(&format!("cache_type_v = {v:?}\n"));
     }
+    out.push_str(&format!("gemini_url = {:?}\n", settings.gemini_url));
+    out.push_str(&format!("gemini_model = {:?}\n", settings.gemini_model));
+    let api_key = if redact && !settings.gemini_api_key.is_empty() {
+        "***".to_string()
+    } else {
+        settings.gemini_api_key.clone()
+    };
+    out.push_str(&format!("gemini_api_key = {api_key:?}\n"));
+    out.push_str(&format!(
+        "gemini_context_size = {}\n",
+        settings.gemini_context_size
+    ));
     out.push_str(&format!("workspace = {:?}\n", settings.workspace));
     out.push_str(&format!("active_project = {:?}\n", settings.active_project));
     out.push_str(&format!(
@@ -286,5 +405,62 @@ mod tests {
     fn set_field_rejects_unknown_key() {
         let mut settings = Settings::default();
         assert!(settings.set_field("does_not_exist", "x").is_err());
+    }
+
+    #[test]
+    fn provider_accepts_friendly_aliases() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.provider, Provider::Local);
+
+        settings.set_field("provider", "online").unwrap();
+        assert_eq!(settings.provider, Provider::Gemini);
+        settings.set_field("provider", "offline").unwrap();
+        assert_eq!(settings.provider, Provider::Local);
+        settings.set_field("provider", "gemini").unwrap();
+        assert_eq!(settings.provider, Provider::Gemini);
+
+        assert!(settings.set_field("provider", "nonsense").is_err());
+    }
+
+    #[test]
+    fn provider_and_online_fields_round_trip() {
+        let settings = Settings {
+            provider: Provider::Gemini,
+            gemini_model: "gemini-2.5-pro".to_string(),
+            gemini_context_size: 200_000,
+            ..Settings::default()
+        };
+
+        let parsed = toml_parse(&toml_render(&settings)).unwrap();
+        assert_eq!(parsed.provider, Provider::Gemini);
+        assert_eq!(parsed.gemini_model, "gemini-2.5-pro");
+        assert_eq!(parsed.gemini_context_size, 200_000);
+    }
+
+    #[test]
+    fn effective_context_size_follows_provider() {
+        let mut settings = Settings {
+            context_size: 8192,
+            gemini_context_size: 128_000,
+            ..Settings::default()
+        };
+        assert_eq!(settings.effective_context_size(), 8192);
+        settings.provider = Provider::Gemini;
+        assert_eq!(settings.effective_context_size(), 128_000);
+    }
+
+    #[test]
+    fn describe_redacts_api_key_but_save_keeps_it() {
+        let settings = Settings {
+            gemini_api_key: "secret-key-value".to_string(),
+            ..Settings::default()
+        };
+
+        let shown = settings.describe();
+        assert!(shown.contains("gemini_api_key = \"***\""));
+        assert!(!shown.contains("secret-key-value"));
+
+        // The on-disk form (what save writes) must keep the real value.
+        assert!(toml_render(&settings).contains("secret-key-value"));
     }
 }

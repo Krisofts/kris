@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use kris::agent::{Agent, Project};
-use kris::client::LlamaClient;
+use kris::client::{Backend, ModelClient};
 use kris::message::Message;
 use kris::tools::ToolRegistry;
 
@@ -136,7 +136,7 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
 
-    let client = LlamaClient::new(base_url, "test-model".to_string());
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
     let agent = Agent::new(client, ToolRegistry::with_defaults(false), 0.2, 512, 8192);
 
     let mut history: Vec<Message> = Vec::new();

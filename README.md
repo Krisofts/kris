@@ -1,11 +1,18 @@
 # KRIS
 
-A local coding-assistant CLI written in Rust. It runs entirely offline by
-talking to a `llama-server` (llama.cpp's OpenAI-compatible HTTP server,
+A coding-assistant CLI written in Rust. By default it runs entirely offline
+by talking to a `llama-server` (llama.cpp's OpenAI-compatible HTTP server,
 started with `--jinja` for native tool-calling) running on the same
 machine — no cloud API involved. Built primarily for running comfortably on
 a phone under Termux with a small Qwen2.5-Coder model, but works on any
 Linux/macOS box with llama.cpp installed.
+
+It can also run **online**, sending the same conversation to a cloud model
+through Google's Gemini API instead — useful when you want a stronger model
+than the phone can host, or when you don't have llama.cpp set up. Either way
+the tools (file edits, `run_command`, git, …) still run locally on your
+machine; only the model's "thinking" moves to the cloud. Switch at any time
+with `mode offline` / `mode online`.
 
 ## What it does
 
@@ -18,9 +25,10 @@ Linux/macOS box with llama.cpp installed.
   moves — nothing changes on disk invisibly.
 - Reuses llama-server's KV cache across turns (`cache_prompt`) so it isn't
   reprocessing the whole conversation from scratch every message.
-- Tracks context usage via llama-server's `/tokenize` endpoint and trims
-  the oldest turns before overflowing the context window, instead of
-  erroring out mid-conversation.
+- Tracks context usage from the exact prompt-token count llama-server
+  reports on each reply (falling back to its `/tokenize` endpoint) and
+  trims the oldest turns before overflowing the context window, instead of
+  erroring out mid-conversation — without a spare round trip per turn.
 - Self-heals: if llama-server was killed while KRIS was idle, it's
   restarted automatically on the next request.
 
@@ -31,6 +39,39 @@ cargo build --release
 ```
 
 The binary is `target/release/kris`.
+
+## Online mode (Gemini)
+
+KRIS can talk to Google's Gemini models through their OpenAI-compatible API
+instead of a local llama-server. Get an API key from Google AI Studio, then:
+
+```
+export GEMINI_API_KEY=your-key-here     # preferred: never written to disk
+```
+
+In the REPL:
+
+```
+mode online          # switch to Gemini (offline is the default)
+mode offline         # switch back to local llama.cpp
+```
+
+Configuration (all optional, saved to `config.toml`):
+
+| Key                   | Default                            | Meaning                                   |
+| --------------------- | ---------------------------------- | ----------------------------------------- |
+| `provider`            | `local`                            | `local` (offline) or `gemini` (online)    |
+| `gemini_model`        | `gemini-2.5-flash`                 | model id used online                      |
+| `gemini_api_key`      | *(empty)*                          | fallback if `GEMINI_API_KEY` isn't set    |
+| `gemini_context_size` | `128000`                           | history-trim budget in online mode        |
+| `gemini_url`          | Gemini's `/v1beta/openai` endpoint | OpenAI-compatible base URL                 |
+
+Set any of these with e.g. `config set gemini_model gemini-2.5-pro`. The
+`GEMINI_API_KEY` environment variable takes precedence over the stored
+`gemini_api_key`, so you can keep the key out of `config.toml` entirely; when
+shown via the `config` command the stored key is masked. Because `gemini_url`
+is just an OpenAI-compatible base URL, other compatible providers can work by
+pointing it (and `gemini_model`/`GEMINI_API_KEY`) elsewhere.
 
 ## Running on Termux (Android)
 

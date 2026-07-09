@@ -11,7 +11,7 @@ use rustyline::DefaultEditor;
 use serde_json::Value;
 
 use crate::agent::{heuristic_tokens, Agent, Project};
-use crate::config::Settings;
+use crate::config::{Provider, Settings};
 use crate::message::Message;
 use crate::picker;
 use crate::server;
@@ -96,7 +96,7 @@ impl Session {
             ToolRegistry::with_defaults(self.settings.bypass_permissions),
             self.settings.temperature,
             self.settings.max_tokens,
-            self.settings.context_size,
+            self.settings.effective_context_size(),
         )
     }
 }
@@ -201,22 +201,18 @@ fn print_sanity_warnings(settings: &Settings) {
 }
 
 fn print_banner(session: &Session) {
-    println!("{}", bold("KRIS - offline coding assistant"));
+    println!("{}", bold("KRIS - local & online coding assistant"));
+    let (mode, model) = describe_mode(&session.settings);
     println!(
         "{}",
         dim(&format!(
-            "workspace: {}  |  project: {}  |  model: {}",
+            "workspace: {}  |  project: {}  |  {mode}: {model}",
             session.settings.workspace,
             if session.has_active_project() {
                 session.project_name.clone()
             } else {
                 "(belum ada project)".to_string()
             },
-            if session.settings.model_path.is_empty() {
-                "(not configured)".to_string()
-            } else {
-                session.settings.model_path.clone()
-            }
         ))
     );
     println!("{}", dim("Type your request, or `help` for commands."));
@@ -272,6 +268,7 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
         "serve" => {
             server::ensure_running(&session.settings).await;
         }
+        "mode" => handle_mode(session, rest),
         "model" => handle_model(session, rest),
         "workspace" => handle_workspace(session, rest),
         "project" => handle_project(session, rest),
@@ -309,6 +306,76 @@ fn run_raw_shell(session: &Session, command: &str) {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
         Err(err) => println!("{}", red(&format!("failed to run command: {err}"))),
+    }
+}
+
+/// Returns a `(mode_label, model_label)` pair describing the active
+/// provider, for the banner and the `mode` command.
+fn describe_mode(settings: &Settings) -> (&'static str, String) {
+    match settings.provider {
+        Provider::Local => (
+            "offline",
+            if settings.model_path.is_empty() {
+                "(not configured)".to_string()
+            } else {
+                settings.model_path.clone()
+            },
+        ),
+        Provider::Gemini => ("online", settings.gemini_model.clone()),
+    }
+}
+
+/// Switches between offline (local llama-server) and online (Gemini) at
+/// runtime. Clears the conversation, since the two backends don't share a
+/// KV cache and a history built against one model is best restarted on the
+/// other. Accepts `offline`/`local` and `online`/`gemini`.
+fn handle_mode(session: &mut Session, arg: &str) {
+    if arg.is_empty() {
+        let (mode, model) = describe_mode(&session.settings);
+        println!("Current mode: {mode} ({model})");
+        println!("Usage: mode offline    use the local llama.cpp server");
+        println!("       mode online     use the Gemini API");
+        return;
+    }
+
+    if let Err(err) = session.settings.set_field("provider", arg) {
+        println!("{}", red(&format!("{err}")));
+        return;
+    }
+
+    session.history.clear();
+    if let Err(err) = session.settings.save() {
+        println!("{}", red(&format!("Failed to save config: {err}")));
+        return;
+    }
+
+    match session.settings.provider {
+        Provider::Local => {
+            println!("{}", green("Switched to offline mode (local llama.cpp)."));
+            if session.settings.model_path.is_empty() {
+                println!(
+                    "{}",
+                    dim("No model_path set yet - pick one with `model 3b` or `config set model_path <gguf>`.")
+                );
+            } else {
+                println!("{}", dim("Run `serve` to start llama-server if it isn't up."));
+            }
+        }
+        Provider::Gemini => {
+            println!(
+                "{}",
+                green(&format!(
+                    "Switched to online mode ({} via Gemini).",
+                    session.settings.gemini_model
+                ))
+            );
+            if session.settings.resolved_api_key().is_none() {
+                println!(
+                    "{}",
+                    yellow("No API key set - export GEMINI_API_KEY, or `config set gemini_api_key <key>`.")
+                );
+            }
+        }
     }
 }
 
@@ -538,9 +605,10 @@ fn print_help() {
     println!("Commands:");
     println!("  <anything else>       ask KRIS about this project");
     println!("  fix [notes]           build and iteratively fix errors until it's clean");
-    println!("  health                check whether llama-server is reachable");
-    println!("  serve                 start llama-server in the background if needed");
-    println!("  model [preset]        show/switch the Qwen2.5-Coder model (1.5b/3b/7b)");
+    println!("  mode [offline|online] show/switch between local llama.cpp and the Gemini API");
+    println!("  health                check whether the active backend is reachable");
+    println!("  serve                 start llama-server in the background if needed (offline mode)");
+    println!("  model [preset]        show/switch the local Qwen2.5-Coder model (1.5b/3b/7b)");
     println!("  workspace [path]      show workspace / pick a project with arrow keys, or switch to a different workspace folder");
     println!("  project [name]        pick a project with arrow keys, or switch straight to <name> - also becomes the new default");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
@@ -572,7 +640,10 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
     // returning its error, so retrying with the exact same prompt here is
     // safe - it won't leave a duplicated or dangling user message behind.
     if let Err(err) = run_turn(session, prompt, max_iterations).await {
-        if looks_like_connection_error(&err) {
+        // Restarting only makes sense for the local server; an online
+        // provider that drops a connection is a network/API issue a restart
+        // can't fix, so fall straight through to reporting it.
+        if looks_like_connection_error(&err) && session.settings.provider == Provider::Local {
             println!();
             println!(
                 "{}",
@@ -598,13 +669,17 @@ fn looks_like_connection_error(err: &anyhow::Error) -> bool {
 fn print_turn_error(session: &Session, err: &anyhow::Error) {
     println!();
     println!("{} {err}", red("Error talking to the model:"));
-    println!(
-        "{}",
-        dim(&format!(
+    let hint = match session.settings.provider {
+        Provider::Local => format!(
             "Make sure llama-server is running at {}",
             session.settings.llama_url
-        ))
-    );
+        ),
+        Provider::Gemini => format!(
+            "Check your network connection and that GEMINI_API_KEY is valid (model {} at {}).",
+            session.settings.gemini_model, session.settings.gemini_url
+        ),
+    };
+    println!("{}", dim(&hint));
 }
 
 async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> Result<()> {

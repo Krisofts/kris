@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::client::LlamaClient;
+use crate::client::ModelClient;
 use crate::message::{FunctionCall, Message, Role, ToolCall};
 use crate::style::yellow;
 use crate::tools::{ToolError, ToolRegistry};
@@ -18,7 +18,7 @@ pub struct Project<'a> {
 }
 
 pub struct Agent {
-    client: LlamaClient,
+    client: ModelClient,
     tools: ToolRegistry,
     temperature: f32,
     max_tokens: u32,
@@ -27,7 +27,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(
-        client: LlamaClient,
+        client: ModelClient,
         tools: ToolRegistry,
         temperature: f32,
         max_tokens: u32,
@@ -108,9 +108,18 @@ impl Agent {
         // through the rest of `max_iterations` asking the same thing.
         let mut previous_call_signature: Option<String> = None;
 
-        for _ in 0..max_iterations {
-            self.enforce_context_budget(history, &mut on_delta).await;
+        // Last exact prompt-token count llama-server reported, paired with
+        // the history length it was measured at, so the budget check can
+        // extrapolate the current size (that count plus a heuristic estimate
+        // of whatever's been appended since) instead of paying for a fresh
+        // `/tokenize` round trip every iteration.
+        let mut measured: Option<(usize, u32)> = None;
 
+        for _ in 0..max_iterations {
+            self.enforce_context_budget(history, &mut measured, &mut on_delta)
+                .await;
+
+            let sent_len = history.len();
             let outcome = match self
                 .client
                 .chat_stream(
@@ -128,6 +137,10 @@ impl Agent {
                     return Err(err);
                 }
             };
+
+            if let Some(prompt_tokens) = outcome.prompt_tokens {
+                measured = Some((sent_len, prompt_tokens));
+            }
 
             let held_back = outcome.held_back;
 
@@ -220,28 +233,41 @@ impl Agent {
         Ok(notice)
     }
 
-    /// Estimates the prompt size with a cheap chars/4 heuristic first, and
-    /// only pays for a real `/tokenize` round trip when that heuristic
-    /// suggests we're getting close to `context_size` - then drops the
-    /// oldest whole turns (a turn = a user message through to just before
-    /// the next one) until back under budget, always keeping the current,
-    /// unanswered turn.
+    /// Decides whether the prompt is close enough to `context_size` to need
+    /// trimming, then drops the oldest whole turns (a turn = a user message
+    /// through to just before the next one) until back under budget, always
+    /// keeping the current, unanswered turn.
+    ///
+    /// The size estimate is cheap: when llama-server has already reported an
+    /// exact `prompt_tokens` for an earlier request this turn (`measured`),
+    /// it extrapolates from that plus a chars/4 heuristic for whatever's
+    /// been appended since - no network round trip. Only before the first
+    /// such report (or right after a trim invalidates it) does it fall back
+    /// to the old path: a chars/4 gate, then a real `/tokenize` call.
     async fn enforce_context_budget(
         &self,
         history: &mut Vec<Message>,
+        measured: &mut Option<(usize, u32)>,
         on_delta: &mut impl FnMut(&str),
     ) {
         let soft_limit = (self.context_size as f64 * 0.9) as usize;
-        let heuristic = heuristic_tokens(history);
 
-        if heuristic < soft_limit * 3 / 4 {
-            return;
-        }
+        let estimate = match *measured {
+            Some((len, prompt_tokens)) => {
+                let len = len.min(history.len());
+                prompt_tokens as usize + heuristic_tokens(&history[len..])
+            }
+            None => {
+                let heuristic = heuristic_tokens(history);
+                if heuristic < soft_limit * 3 / 4 {
+                    return;
+                }
+                let joined = joined_text(history);
+                self.client.tokenize(&joined).await.unwrap_or(heuristic)
+            }
+        };
 
-        let joined = joined_text(history);
-        let exact = self.client.tokenize(&joined).await.unwrap_or(heuristic);
-
-        if exact <= soft_limit {
+        if estimate <= soft_limit {
             return;
         }
 
@@ -275,6 +301,11 @@ impl Agent {
         }
 
         if dropped_turns > 0 {
+            // Draining from the front shifted every index, so the cached
+            // (len, prompt_tokens) pair no longer lines up with `history` -
+            // drop it and let the next request re-measure from scratch.
+            *measured = None;
+
             let notice = format!(
                 "\n{}\n",
                 yellow("(older conversation history trimmed to stay within the context window)")

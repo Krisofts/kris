@@ -7,14 +7,29 @@ use serde_json::Value;
 
 use crate::message::{FunctionCall, Message, ToolCall};
 
-/// Talks to a locally running `llama-server` (llama.cpp's OpenAI-compatible
-/// HTTP server, started with `--jinja` so it renders Qwen's native
-/// tool-calling chat template) over plain HTTP - no TLS stack needed since
-/// this only ever talks to 127.0.0.1.
-pub struct LlamaClient {
+/// Which flavour of OpenAI-compatible endpoint we're talking to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// A local `llama-server` (llama.cpp, `--jinja`). Accepts and benefits
+    /// from llama.cpp-specific request fields (`cache_prompt`,
+    /// `repeat_penalty`) and exposes `/tokenize` and `/health`.
+    Llama,
+    /// A remote OpenAI-compatible API (Gemini's compat endpoint). Reached
+    /// over HTTPS with a bearer token; only standard OpenAI request fields
+    /// are sent, since the extra llama.cpp ones would be rejected.
+    OpenAiCompat,
+}
+
+/// Talks to an OpenAI-compatible chat-completions endpoint - either a local
+/// `llama-server` over plain HTTP (fully offline), or a remote provider like
+/// Gemini over HTTPS. The `backend` decides which endpoint-specific request
+/// fields and auth are used.
+pub struct ModelClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    backend: Backend,
+    api_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -26,8 +41,11 @@ struct ChatRequest<'a> {
     stream: bool,
     /// Lets llama-server reuse the KV cache for the unchanged prefix
     /// (system prompt + earlier turns) instead of recomputing it every
-    /// request - the single biggest latency win available on CPU.
-    cache_prompt: bool,
+    /// request - the single biggest latency win available on CPU. A
+    /// llama.cpp extension, so it's omitted for remote providers that would
+    /// reject the unknown field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_prompt: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
     /// Sent explicitly (rather than left to llama-server's own default)
@@ -42,8 +60,25 @@ struct ChatRequest<'a> {
     /// low temperature (KRIS defaults to 0.2, deterministic on purpose
     /// for coding tasks) is prone to latching onto a repetitive loop and
     /// never emitting a stop token, running all the way to `max_tokens`
-    /// instead of a normal-length reply.
-    repeat_penalty: f32,
+    /// instead of a normal-length reply. A llama.cpp field name, so it's
+    /// omitted for remote providers (which use `frequency_penalty` instead
+    /// and would reject this one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    /// Asks llama-server to append a final usage chunk (with `choices: []`)
+    /// carrying the exact `prompt_tokens` it actually processed. That count
+    /// is what the context-budget check needs, and getting it here for free
+    /// avoids a separate `/tokenize` round trip that re-tokenizes the whole
+    /// conversation every turn once it grows large - real overhead on a
+    /// phone. It's also strictly more accurate than tokenizing the raw
+    /// message text ourselves, since it reflects the chat-template and tool-
+    /// schema tokens the server actually rendered.
+    stream_options: StreamOptions,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// Final, fully-accumulated result of a streamed chat turn.
@@ -60,6 +95,11 @@ pub struct StreamOutcome {
     /// answer that just happens to start the same way still gets shown
     /// once it's clear it isn't one.
     pub held_back: Option<String>,
+    /// Exact number of prompt tokens llama-server reported processing for
+    /// this request (from the streamed usage chunk), or `None` if the
+    /// server build didn't send one. Lets the caller track context usage
+    /// without a separate `/tokenize` call.
+    pub prompt_tokens: Option<u32>,
 }
 
 /// Whether content deltas are being streamed live via `on_delta`, held
@@ -70,8 +110,13 @@ enum StreamMode {
     HeldBack(String),
 }
 
-impl LlamaClient {
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+impl ModelClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        backend: Backend,
+        api_key: Option<String>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
             .build()
@@ -81,6 +126,19 @@ impl LlamaClient {
             http,
             base_url: base_url.into(),
             model: model.into(),
+            backend,
+            api_key,
+        }
+    }
+
+    /// The chat-completions URL for this backend. llama-server mounts the
+    /// OpenAI routes under `/v1`; Gemini's compat base already ends in
+    /// `.../openai`, so the route is just `/chat/completions`.
+    fn chat_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        match self.backend {
+            Backend::Llama => format!("{base}/v1/chat/completions"),
+            Backend::OpenAiCompat => format!("{base}/chat/completions"),
         }
     }
 
@@ -98,10 +156,11 @@ impl LlamaClient {
         max_tokens: u32,
         mut on_delta: impl FnMut(&str),
     ) -> Result<StreamOutcome> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = self.chat_url();
+
+        // The llama.cpp-only fields are sent only to that backend; a remote
+        // OpenAI-compatible provider would reject the unknown keys.
+        let is_llama = self.backend == Backend::Llama;
 
         let request = ChatRequest {
             model: &self.model,
@@ -109,10 +168,13 @@ impl LlamaClient {
             temperature,
             max_tokens,
             stream: true,
-            cache_prompt: true,
+            cache_prompt: is_llama.then_some(true),
             tools,
             tool_choice: tools.map(|_| "auto"),
-            repeat_penalty: 1.1,
+            repeat_penalty: is_llama.then_some(1.1),
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
         };
 
         const MAX_ATTEMPTS: u32 = 4;
@@ -121,7 +183,12 @@ impl LlamaClient {
         let response = loop {
             attempt += 1;
 
-            match self.http.post(&url).json(&request).send().await {
+            let mut builder = self.http.post(&url).json(&request);
+            if let Some(key) = &self.api_key {
+                builder = builder.bearer_auth(key);
+            }
+
+            match builder.send().await {
                 Ok(response) => break response.error_for_status()?,
                 Err(err) if err.is_connect() && attempt < MAX_ATTEMPTS => {
                     tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
@@ -135,6 +202,7 @@ impl LlamaClient {
         let mut accumulator = ToolCallAccumulator::default();
         let mut content = String::new();
         let mut got_any_content = false;
+        let mut prompt_tokens = None;
         let mut mode = StreamMode::Deciding(String::new());
 
         while let Some(chunk) = byte_stream.next().await {
@@ -150,6 +218,12 @@ impl LlamaClient {
                     Ok(parsed) => parsed,
                     Err(_) => continue, // ignore stray/keep-alive lines
                 };
+
+                if let Some(usage) = parsed.usage {
+                    if let Some(pt) = usage.prompt_tokens {
+                        prompt_tokens = Some(pt);
+                    }
+                }
 
                 for choice in parsed.choices {
                     if let Some(text) = choice.delta.content {
@@ -210,6 +284,7 @@ impl LlamaClient {
             content: if got_any_content { Some(content) } else { None },
             tool_calls: accumulator.finish(),
             held_back,
+            prompt_tokens,
         })
     }
 
@@ -217,6 +292,13 @@ impl LlamaClient {
     /// endpoint, used for context-window budgeting instead of a rough
     /// chars/4 guess.
     pub async fn tokenize(&self, text: &str) -> Result<usize> {
+        // Only llama-server exposes `/tokenize`; for a remote provider the
+        // caller falls back to its own heuristic when this errors, so bail
+        // early rather than firing a request that would just 404.
+        if self.backend != Backend::Llama {
+            anyhow::bail!("tokenize is only available on the local llama-server backend");
+        }
+
         let url = format!("{}/tokenize", self.base_url.trim_end_matches('/'));
 
         #[derive(Serialize)]
@@ -258,7 +340,19 @@ impl LlamaClient {
 
 #[derive(Deserialize)]
 struct ChatChunk {
+    #[serde(default)]
     choices: Vec<ChunkChoice>,
+    /// Present only on the final usage chunk (emitted because we send
+    /// `stream_options.include_usage`); that chunk carries an empty
+    /// `choices` array, hence the `default` above.
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -419,6 +513,27 @@ mod tests {
             events,
             vec!["{\"choices\":[]}".to_string(), "[DONE]".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_usage_only_final_chunk() {
+        // The chunk llama-server appends when stream_options.include_usage
+        // is set: empty choices, a usage object carrying prompt_tokens.
+        let chunk: ChatChunk =
+            serde_json::from_str(r#"{"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":7}}"#)
+                .unwrap();
+        assert!(chunk.choices.is_empty());
+        assert_eq!(chunk.usage.and_then(|u| u.prompt_tokens), Some(1234));
+    }
+
+    #[test]
+    fn parses_content_chunk_without_usage() {
+        // An ordinary content delta has no usage field at all - must still
+        // parse, with usage left as None.
+        let chunk: ChatChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
+        assert_eq!(chunk.choices.len(), 1);
+        assert!(chunk.usage.is_none());
     }
 
     #[test]
