@@ -37,6 +37,13 @@ struct ChatRequest<'a> {
     /// plain text when no tool is warranted.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'a str>,
+    /// Sent explicitly rather than left to llama-server's default -
+    /// without a real penalty against repeating itself, a small model at
+    /// low temperature (KRIS defaults to 0.2, deterministic on purpose
+    /// for coding tasks) is prone to latching onto a repetitive loop and
+    /// never emitting a stop token, running all the way to `max_tokens`
+    /// instead of a normal-length reply.
+    repeat_penalty: f32,
 }
 
 /// Final, fully-accumulated result of a streamed chat turn.
@@ -105,6 +112,7 @@ impl LlamaClient {
             cache_prompt: true,
             tools,
             tool_choice: tools.map(|_| "auto"),
+            repeat_penalty: 1.1,
         };
 
         const MAX_ATTEMPTS: u32 = 4;

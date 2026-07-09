@@ -52,7 +52,13 @@ impl Default for Settings {
             llama_url: "http://127.0.0.1:8080".to_string(),
             context_size: 8192,
             temperature: 0.2,
-            max_tokens: 4096,
+            // Bounds how long a single reply can run if the model ever
+            // latches onto a repetitive loop and never emits a stop
+            // token - at phone-CPU decode speeds, 4096 tokens of that
+            // could mean tens of minutes stuck "thinking" before the cap
+            // even kicks in. Raise via `config set max_tokens <n>` for a
+            // task that genuinely needs longer replies.
+            max_tokens: 1024,
             threads: None,
             mlock: false,
             flash_attn: true,
