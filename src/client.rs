@@ -126,11 +126,21 @@ enum StreamMode {
 /// opens a plain-text answer with a stray `<tool_call>`-shaped fragment
 /// before abandoning it) stayed buffered for the *entire* remaining
 /// generation - `on_delta` never fired, so the REPL's "thinking..." spinner
-/// never updated, making a merely slow reply look completely frozen. 400
-/// bytes is enough to recognize a real leaked JSON tool call (which is
-/// typically short) while bounding the worst-case silent window to a
-/// couple dozen tokens instead of the whole response.
-const MAX_HELD_BACK_BYTES: usize = 400;
+/// never updated, making a merely slow reply look completely frozen.
+///
+/// Confirmed against a real llama-server (Qwen2.5-Coder-1.5B, build
+/// b9888): when `--jinja` doesn't actually engage grammar-constrained
+/// tool-calling for a given model/template, attaching `tools` to the
+/// request doesn't make the model emit structured `tool_calls` at all -
+/// it just writes a plain-text ` ```json ` fence attempting to imitate one,
+/// unconstrained, with no natural stopping point. That's a real, observed
+/// failure mode here, not a hypothetical - so this leans toward showing
+/// something on screen sooner rather than optimizing for never
+/// prematurely revealing a real leaked tool call (which is typically
+/// short and well under this anyway). It only shortens the *visible*
+/// silence, not total generation time - that needs a working
+/// tool-calling grammar (recent llama.cpp) or a smaller max_tokens.
+const MAX_HELD_BACK_BYTES: usize = 150;
 
 /// Advances the held-back/live decision state machine by one content
 /// delta, calling `on_delta` immediately for text that's live (or that
@@ -978,31 +988,36 @@ mod tests {
         // what a full reply would be) and asserts the cap has already
         // released them into on_delta by then, rather than needing the
         // caller to send arbitrarily more text before anything shows up.
-        let mut seen: Vec<String> = Vec::new();
+        let seen: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let mut mode = StreamMode::Deciding(String::new());
 
         {
-            let mut on_delta = |d: &str| seen.push(d.to_string());
+            let mut on_delta = |d: &str| seen.borrow_mut().push(d.to_string());
             mode = apply_content_delta(mode, "{not json", &mut on_delta);
             assert!(matches!(mode, StreamMode::HeldBack(_)));
 
-            // 9 bytes already buffered + 4x100 crosses the 400-byte cap on
-            // the 4th chunk - stop right there so this asserts on_delta
-            // fired exactly once, not on every subsequent live chunk too.
-            let chunk = "x".repeat(100);
-            for _ in 0..4 {
-                mode = apply_content_delta(mode, &chunk, &mut on_delta);
+            // Feed 20-byte chunks, stopping as soon as the cap is crossed,
+            // however MAX_HELD_BACK_BYTES is tuned - so on_delta firing
+            // more than once here would be a real regression rather than
+            // this test just having outlived the flush point.
+            let chunk = "x".repeat(20);
+            let chunks_needed = MAX_HELD_BACK_BYTES.div_ceil(chunk.len()) + 1;
+            for _ in 0..chunks_needed {
+                if seen.borrow().is_empty() {
+                    mode = apply_content_delta(mode, &chunk, &mut on_delta);
+                }
             }
         }
 
         assert!(matches!(mode, StreamMode::Live));
+        let seen = seen.into_inner();
         assert_eq!(
             seen.len(),
             1,
             "on_delta should have fired exactly once, when the cap was crossed"
         );
         assert!(
-            seen[0].len() < 600,
+            seen[0].len() < MAX_HELD_BACK_BYTES + 40,
             "held far more than the cap before flushing"
         );
     }

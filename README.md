@@ -254,6 +254,47 @@ y/n confirmation); inspect git state (read-only); and outline large files
 without reading them in full. File writes/edits/deletes always print a
 diff before applying so you can see exactly what changed.
 
+## Troubleshooting: offline mode stuck "thinking" for a long time
+
+If a plain message that used to answer in a few seconds now sits at
+"thinking..." for minutes, check whether native tool-calling is actually
+engaging on your `llama-server` build. Confirmed on a real device
+(Qwen2.5-Coder-1.5B, llama.cpp build b9888): with `--jinja` on, some
+model/template/build combinations still don't apply grammar-constrained
+tool-calling - instead of using the structured `tool_calls` field, the
+model falls back to writing a plain-text ` ```json ` fence attempting to
+imitate one, with no natural stopping point, and just keeps generating
+until `max_tokens`.
+
+To check: hit `llama-server` directly, once with `tools` and once without,
+and compare:
+
+```
+# baseline - should be a few seconds
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"x","messages":[{"role":"user","content":"halo"}],"stream":true,"max_tokens":50}'
+
+# with a tool attached
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"x","messages":[{"role":"user","content":"halo"}],"stream":true,"max_tokens":50,"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],"tool_choice":"auto"}'
+```
+
+If the second one starts writing ` ```json ` as plain `content` instead of
+a real `tool_calls` delta, that confirms it. What to try:
+
+- `config set max_tokens 256` (or lower) to bound the worst case while you
+  sort out the rest - this doesn't fix the cause, just the ceiling.
+- Rebuild llama.cpp against the latest master (`cd ~/llama.cpp && git pull
+  && cmake --build build --config Release --target llama-server -j 2`) -
+  tool-calling grammar support for various chat templates has kept
+  improving there.
+- Try a different model size/quant - a GGUF's embedded chat template (not
+  just the model weights) needs to define proper tool-call formatting for
+  llama.cpp to build a grammar from it, and not every quantized upload
+  ships one.
+
 ## Verifying changes to KRIS itself
 
 `cargo build`, `cargo clippy --all-targets`, and `cargo test` all run
