@@ -120,6 +120,60 @@ enum StreamMode {
     HeldBack(String),
 }
 
+/// Cap on how much text the "might be a leaked tool call" heuristic will
+/// hold back before giving up and flushing it live regardless. Without a
+/// cap, a reply that merely *starts* with `{`/`` ` ``/`<` (Qwen occasionally
+/// opens a plain-text answer with a stray `<tool_call>`-shaped fragment
+/// before abandoning it) stayed buffered for the *entire* remaining
+/// generation - `on_delta` never fired, so the REPL's "thinking..." spinner
+/// never updated, making a merely slow reply look completely frozen. 400
+/// bytes is enough to recognize a real leaked JSON tool call (which is
+/// typically short) while bounding the worst-case silent window to a
+/// couple dozen tokens instead of the whole response.
+const MAX_HELD_BACK_BYTES: usize = 400;
+
+/// Advances the held-back/live decision state machine by one content
+/// delta, calling `on_delta` immediately for text that's live (or that
+/// just became live/was released from holding), and never for text that's
+/// still being held back pending a decision. Pulled out of the streaming
+/// loop so the cap behavior can be unit-tested deterministically, without
+/// depending on how a real byte stream happens to chunk network reads.
+fn apply_content_delta(
+    mode: StreamMode,
+    text: &str,
+    on_delta: &mut impl FnMut(&str),
+) -> StreamMode {
+    match mode {
+        StreamMode::Live => {
+            on_delta(text);
+            StreamMode::Live
+        }
+        StreamMode::HeldBack(mut buf) => {
+            buf.push_str(text);
+            if buf.len() >= MAX_HELD_BACK_BYTES {
+                // Held long enough without turning into a real tool call -
+                // stop gambling on it being one and let the rest stream
+                // live, so the spinner has something to show.
+                on_delta(&buf);
+                StreamMode::Live
+            } else {
+                StreamMode::HeldBack(buf)
+            }
+        }
+        StreamMode::Deciding(mut buf) => {
+            buf.push_str(text);
+            match buf.trim_start().chars().next() {
+                None => StreamMode::Deciding(buf),
+                Some('{') | Some('`') | Some('<') => StreamMode::HeldBack(buf),
+                Some(_) => {
+                    on_delta(&buf);
+                    StreamMode::Live
+                }
+            }
+        }
+    }
+}
+
 impl ModelClient {
     pub fn new(
         base_url: impl Into<String>,
@@ -272,30 +326,7 @@ impl ModelClient {
                         if !text.is_empty() {
                             content.push_str(&text);
                             got_any_content = true;
-
-                            mode = match mode {
-                                StreamMode::Live => {
-                                    on_delta(&text);
-                                    StreamMode::Live
-                                }
-                                StreamMode::HeldBack(mut buf) => {
-                                    buf.push_str(&text);
-                                    StreamMode::HeldBack(buf)
-                                }
-                                StreamMode::Deciding(mut buf) => {
-                                    buf.push_str(&text);
-                                    match buf.trim_start().chars().next() {
-                                        None => StreamMode::Deciding(buf),
-                                        Some('{') | Some('`') | Some('<') => {
-                                            StreamMode::HeldBack(buf)
-                                        }
-                                        Some(_) => {
-                                            on_delta(&buf);
-                                            StreamMode::Live
-                                        }
-                                    }
-                                }
-                            };
+                            mode = apply_content_delta(mode, &text, &mut on_delta);
                         }
                     }
 
@@ -907,6 +938,74 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_text_reply_streams_live_immediately() {
+        let mut seen = Vec::new();
+        let mode = apply_content_delta(
+            StreamMode::Deciding(String::new()),
+            "Hello there",
+            &mut |d: &str| seen.push(d.to_string()),
+        );
+
+        assert!(matches!(mode, StreamMode::Live));
+        assert_eq!(seen, vec!["Hello there".to_string()]);
+    }
+
+    #[test]
+    fn reply_starting_with_brace_is_held_back_pending_more_text() {
+        let mut seen: Vec<String> = Vec::new();
+        let mode =
+            apply_content_delta(StreamMode::Deciding(String::new()), "{\"tool\"", &mut |d| {
+                seen.push(d.to_string())
+            });
+
+        assert!(matches!(mode, StreamMode::HeldBack(_)));
+        assert!(
+            seen.is_empty(),
+            "nothing should stream while still deciding/held back"
+        );
+    }
+
+    #[test]
+    fn held_back_buffer_flushes_once_it_exceeds_the_cap_instead_of_hanging_forever() {
+        // Regression test: without a cap, a reply that starts with `{` but
+        // never resolves into a real tool call stayed silently buffered for
+        // the *entire* remaining generation, so on_delta (which is what
+        // stops the REPL's "thinking..." spinner) never fired until the
+        // whole response finished - a slow-but-working reply looked
+        // completely frozen. This feeds only 5 small chunks (well under
+        // what a full reply would be) and asserts the cap has already
+        // released them into on_delta by then, rather than needing the
+        // caller to send arbitrarily more text before anything shows up.
+        let mut seen: Vec<String> = Vec::new();
+        let mut mode = StreamMode::Deciding(String::new());
+
+        {
+            let mut on_delta = |d: &str| seen.push(d.to_string());
+            mode = apply_content_delta(mode, "{not json", &mut on_delta);
+            assert!(matches!(mode, StreamMode::HeldBack(_)));
+
+            // 9 bytes already buffered + 4x100 crosses the 400-byte cap on
+            // the 4th chunk - stop right there so this asserts on_delta
+            // fired exactly once, not on every subsequent live chunk too.
+            let chunk = "x".repeat(100);
+            for _ in 0..4 {
+                mode = apply_content_delta(mode, &chunk, &mut on_delta);
+            }
+        }
+
+        assert!(matches!(mode, StreamMode::Live));
+        assert_eq!(
+            seen.len(),
+            1,
+            "on_delta should have fired exactly once, when the cap was crossed"
+        );
+        assert!(
+            seen[0].len() < 600,
+            "held far more than the cap before flushing"
+        );
+    }
 
     #[test]
     fn drains_single_complete_event() {
