@@ -322,19 +322,22 @@ fn describe_mode(settings: &Settings) -> (&'static str, String) {
             },
         ),
         Provider::Gemini => ("online", settings.gemini_model.clone()),
+        Provider::Claude => ("claude", settings.claude_model.clone()),
     }
 }
 
-/// Switches between offline (local llama-server) and online (Gemini) at
-/// runtime. Clears the conversation, since the two backends don't share a
-/// KV cache and a history built against one model is best restarted on the
-/// other. Accepts `offline`/`local` and `online`/`gemini`.
+/// Switches between offline (local llama-server) and an online provider
+/// (Gemini or Claude) at runtime. Clears the conversation, since backends
+/// don't share a KV cache and a history built against one model is best
+/// restarted on another. Accepts `offline`/`local`, `online`/`gemini`, and
+/// `claude`/`anthropic`.
 fn handle_mode(session: &mut Session, arg: &str) {
     if arg.is_empty() {
         let (mode, model) = describe_mode(&session.settings);
         println!("Current mode: {mode} ({model})");
         println!("Usage: mode offline    use the local llama.cpp server");
         println!("       mode online     use the Gemini API");
+        println!("       mode claude     use the Claude API");
         return;
     }
 
@@ -358,7 +361,10 @@ fn handle_mode(session: &mut Session, arg: &str) {
                     dim("No model_path set yet - pick one with `model 3b` or `config set model_path <gguf>`.")
                 );
             } else {
-                println!("{}", dim("Run `serve` to start llama-server if it isn't up."));
+                println!(
+                    "{}",
+                    dim("Run `serve` to start llama-server if it isn't up.")
+                );
             }
         }
         Provider::Gemini => {
@@ -373,6 +379,21 @@ fn handle_mode(session: &mut Session, arg: &str) {
                 println!(
                     "{}",
                     yellow("No API key set - export GEMINI_API_KEY, or `config set gemini_api_key <key>`.")
+                );
+            }
+        }
+        Provider::Claude => {
+            println!(
+                "{}",
+                green(&format!(
+                    "Switched to Claude mode ({}).",
+                    session.settings.claude_model
+                ))
+            );
+            if session.settings.resolved_api_key().is_none() {
+                println!(
+                    "{}",
+                    yellow("No API key set - export ANTHROPIC_API_KEY, or `config set claude_api_key <key>`.")
                 );
             }
         }
@@ -458,7 +479,10 @@ fn handle_workspace(session: &mut Session, arg: &str) {
         green(&format!("Switched workspace to {}", path.display()))
     );
     if !session.has_active_project() {
-        println!("{}", dim("Belum ada project - `project` untuk lihat daftar."));
+        println!(
+            "{}",
+            dim("Belum ada project - `project` untuk lihat daftar.")
+        );
     }
 }
 
@@ -605,9 +629,13 @@ fn print_help() {
     println!("Commands:");
     println!("  <anything else>       ask KRIS about this project");
     println!("  fix [notes]           build and iteratively fix errors until it's clean");
-    println!("  mode [offline|online] show/switch between local llama.cpp and the Gemini API");
+    println!(
+        "  mode [offline|online|claude] show/switch between local llama.cpp, Gemini, and Claude"
+    );
     println!("  health                check whether the active backend is reachable");
-    println!("  serve                 start llama-server in the background if needed (offline mode)");
+    println!(
+        "  serve                 start llama-server in the background if needed (offline mode)"
+    );
     println!("  model [preset]        show/switch the local Qwen2.5-Coder model (1.5b/3b/7b)");
     println!("  workspace [path]      show workspace / pick a project with arrow keys, or switch to a different workspace folder");
     println!("  project [name]        pick a project with arrow keys, or switch straight to <name> - also becomes the new default");
@@ -678,6 +706,10 @@ fn print_turn_error(session: &Session, err: &anyhow::Error) {
             "Check your network connection and that GEMINI_API_KEY is valid (model {} at {}).",
             session.settings.gemini_model, session.settings.gemini_url
         ),
+        Provider::Claude => format!(
+            "Check your network connection and that ANTHROPIC_API_KEY is valid (model {}).",
+            session.settings.claude_model
+        ),
     };
     println!("{}", dim(&hint));
 }
@@ -722,7 +754,11 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 if !summary.is_empty() {
                     let is_error = result.starts_with("Error: ");
                     let truncated: String = summary.chars().take(100).collect();
-                    let ellipsis = if summary.chars().count() > 100 { "…" } else { "" };
+                    let ellipsis = if summary.chars().count() > 100 {
+                        "…"
+                    } else {
+                        ""
+                    };
                     let line = format!("  ⎿ {truncated}{ellipsis}");
                     println!("{}", if is_error { red(&line) } else { dim(&line) });
                 }
@@ -744,7 +780,11 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
             println!();
             println!(
                 "{}",
-                dim(&format!("{} · {}", format_elapsed(elapsed), format_tokens(tokens)))
+                dim(&format!(
+                    "{} · {}",
+                    format_elapsed(elapsed),
+                    format_tokens(tokens)
+                ))
             );
             Ok(())
         }

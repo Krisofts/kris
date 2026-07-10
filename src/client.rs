@@ -3,11 +3,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::message::{FunctionCall, Message, ToolCall};
+use crate::message::{FunctionCall, Message, Role, ToolCall};
 
-/// Which flavour of OpenAI-compatible endpoint we're talking to.
+/// Which flavour of endpoint we're talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// A local `llama-server` (llama.cpp, `--jinja`). Accepts and benefits
@@ -18,7 +18,17 @@ pub enum Backend {
     /// over HTTPS with a bearer token; only standard OpenAI request fields
     /// are sent, since the extra llama.cpp ones would be rejected.
     OpenAiCompat,
+    /// Claude's native Messages API (`/v1/messages`). Not OpenAI-shaped at
+    /// all: system prompt is a separate top-level field, message content is
+    /// an array of typed blocks (text/tool_use/tool_result) rather than a
+    /// flat string, auth is an `x-api-key` header rather than a bearer
+    /// token, and streaming uses named SSE events instead of OpenAI's
+    /// undifferentiated delta chunks.
+    Anthropic,
 }
+
+/// Anthropic API version pinned in the required `anthropic-version` header.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Talks to an OpenAI-compatible chat-completions endpoint - either a local
 /// `llama-server` over plain HTTP (fully offline), or a remote provider like
@@ -140,22 +150,46 @@ impl ModelClient {
 
     /// The chat-completions URL for this backend. llama-server mounts the
     /// OpenAI routes under `/v1`; Gemini's compat base already ends in
-    /// `.../openai`, so the route is just `/chat/completions`.
+    /// `.../openai`, so the route is just `/chat/completions`; Claude's
+    /// native route is `/v1/messages`.
     fn chat_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         match self.backend {
             Backend::Llama => format!("{base}/v1/chat/completions"),
             Backend::OpenAiCompat => format!("{base}/chat/completions"),
+            Backend::Anthropic => format!("{base}/v1/messages"),
         }
     }
 
     /// Streams one chat completion, invoking `on_delta` with each piece of
     /// assistant text content as it arrives so the caller can print it
     /// live, and returns the fully accumulated content/tool_calls once the
-    /// stream ends. Retries the initial connection (not a mid-stream drop)
-    /// a few times with backoff, since a connection refusal right after
-    /// starting llama-server usually means it's still loading the model.
+    /// stream ends. Dispatches to the OpenAI-shaped or Claude-native
+    /// implementation depending on `backend`.
     pub async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: Option<&[Value]>,
+        temperature: f32,
+        max_tokens: u32,
+        on_delta: impl FnMut(&str),
+    ) -> Result<StreamOutcome> {
+        match self.backend {
+            Backend::Llama | Backend::OpenAiCompat => {
+                self.chat_stream_openai(messages, tools, temperature, max_tokens, on_delta)
+                    .await
+            }
+            Backend::Anthropic => {
+                self.chat_stream_anthropic(messages, tools, temperature, max_tokens, on_delta)
+                    .await
+            }
+        }
+    }
+
+    /// Retries the initial connection (not a mid-stream drop) a few times
+    /// with backoff, since a connection refusal right after starting
+    /// llama-server usually means it's still loading the model.
+    async fn chat_stream_openai(
         &self,
         messages: &[Message],
         tools: Option<&[Value]>,
@@ -295,6 +329,143 @@ impl ModelClient {
         })
     }
 
+    /// Claude's native Messages API streaming implementation. Unlike the
+    /// OpenAI-shaped path, text and tool-use content arrive as distinct,
+    /// explicitly typed content blocks - there's no risk of a tool call
+    /// "leaking" into plain text the way an imperfectly grammar-constrained
+    /// local model can, so text deltas are streamed straight to `on_delta`
+    /// with no held-back/deciding buffering.
+    async fn chat_stream_anthropic(
+        &self,
+        messages: &[Message],
+        tools: Option<&[Value]>,
+        temperature: f32,
+        max_tokens: u32,
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<StreamOutcome> {
+        let url = self.chat_url();
+        let (system, anthropic_messages) = to_anthropic_messages(messages);
+
+        let request = AnthropicRequest {
+            model: &self.model,
+            max_tokens,
+            temperature,
+            stream: true,
+            system,
+            messages: anthropic_messages,
+            tools: tools.map(|t| t.to_vec()),
+            tool_choice: tools.map(|_| json!({ "type": "auto" })),
+        };
+
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut attempt = 0;
+
+        let response = loop {
+            attempt += 1;
+
+            let mut builder = self
+                .http
+                .post(&url)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&request);
+            if let Some(key) = &self.api_key {
+                builder = builder.header("x-api-key", key);
+            }
+
+            match builder.send().await {
+                Ok(response) => break response.error_for_status()?,
+                Err(err) if err.is_connect() && attempt < MAX_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        };
+
+        let mut byte_stream = response.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut accumulator = ToolCallAccumulator::default();
+        let mut content = String::new();
+        let mut got_any_content = false;
+        let mut prompt_tokens = None;
+        let mut stream_error: Option<String> = None;
+
+        'outer: while let Some(chunk) = byte_stream.next().await {
+            let chunk = chunk.context("reading stream chunk from Claude")?;
+            buffer.extend_from_slice(&chunk);
+
+            for payload in drain_sse_events(&mut buffer) {
+                let event: AnthropicStreamEvent = match serde_json::from_str(&payload) {
+                    Ok(event) => event,
+                    Err(_) => continue, // ignore stray/keep-alive lines
+                };
+
+                match event {
+                    AnthropicStreamEvent::MessageStart { message } => {
+                        if let Some(usage) = message.usage {
+                            prompt_tokens = usage.input_tokens;
+                        }
+                    }
+                    AnthropicStreamEvent::ContentBlockStart {
+                        index,
+                        content_block: AnthropicContentBlockStart::ToolUse { id, name },
+                    } => {
+                        accumulator.apply(ToolCallDelta {
+                            index,
+                            id: Some(id),
+                            function: Some(FunctionDelta {
+                                name: Some(name),
+                                arguments: None,
+                            }),
+                        });
+                    }
+                    AnthropicStreamEvent::ContentBlockStart { .. } => {}
+                    AnthropicStreamEvent::ContentBlockDelta {
+                        delta: AnthropicDelta::TextDelta { text },
+                        ..
+                    } => {
+                        if !text.is_empty() {
+                            on_delta(&text);
+                            content.push_str(&text);
+                            got_any_content = true;
+                        }
+                    }
+                    AnthropicStreamEvent::ContentBlockDelta {
+                        index,
+                        delta: AnthropicDelta::InputJsonDelta { partial_json },
+                    } => {
+                        accumulator.apply(ToolCallDelta {
+                            index,
+                            id: None,
+                            function: Some(FunctionDelta {
+                                name: None,
+                                arguments: Some(partial_json),
+                            }),
+                        });
+                    }
+                    AnthropicStreamEvent::ContentBlockStop { .. }
+                    | AnthropicStreamEvent::MessageDelta
+                    | AnthropicStreamEvent::Ping => {}
+                    AnthropicStreamEvent::MessageStop => break 'outer,
+                    AnthropicStreamEvent::Error { error } => {
+                        stream_error = Some(error.message);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        if let Some(message) = stream_error {
+            anyhow::bail!("Claude returned an error: {message}");
+        }
+
+        Ok(StreamOutcome {
+            content: if got_any_content { Some(content) } else { None },
+            tool_calls: accumulator.finish(),
+            held_back: None,
+            prompt_tokens,
+        })
+    }
+
     /// Exact token count for `text` via llama-server's `/tokenize`
     /// endpoint, used for context-window budgeting instead of a rough
     /// chars/4 guess.
@@ -423,6 +594,195 @@ where
             StringOrJson::Other(v) => v.to_string(),
         }),
     )
+}
+
+// --- Claude's native Messages API wire format ---------------------------
+
+#[derive(Serialize)]
+struct AnthropicRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    temperature: f32,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    messages: Vec<AnthropicMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct AnthropicMessage {
+    role: &'static str,
+    content: Vec<AnthropicContentBlock>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+/// Converts KRIS's internal OpenAI-shaped `Message` history into Claude's
+/// native shape: the system prompt is pulled out into its own field (there
+/// is no `system`-role message), and consecutive messages of the same role
+/// are merged into one - Claude's API rejects two consecutive messages with
+/// the same role, but the agent loop pushes one `Role::Tool` entry *per*
+/// tool call, which after a multi-tool-call turn means several consecutive
+/// "tool" entries that all need to become content blocks of a single
+/// "user" message replying to the preceding assistant turn.
+fn to_anthropic_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessage>) {
+    let mut system = String::new();
+    let mut out: Vec<AnthropicMessage> = Vec::new();
+
+    for message in messages {
+        let (role, block): (&'static str, AnthropicContentBlock) = match message.role {
+            Role::System => {
+                if let Some(text) = &message.content {
+                    if !system.is_empty() {
+                        system.push('\n');
+                    }
+                    system.push_str(text);
+                }
+                continue;
+            }
+            Role::User => (
+                "user",
+                AnthropicContentBlock::Text {
+                    text: message.content.clone().unwrap_or_default(),
+                },
+            ),
+            Role::Tool => (
+                "user",
+                AnthropicContentBlock::ToolResult {
+                    tool_use_id: message.tool_call_id.clone().unwrap_or_default(),
+                    content: message.content.clone().unwrap_or_default(),
+                },
+            ),
+            Role::Assistant => {
+                let mut blocks = Vec::new();
+                if let Some(text) = &message.content {
+                    if !text.is_empty() {
+                        blocks.push(AnthropicContentBlock::Text { text: text.clone() });
+                    }
+                }
+                for call in message.tool_calls.iter().flatten() {
+                    blocks.push(AnthropicContentBlock::ToolUse {
+                        id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        input: call.parsed_arguments().unwrap_or_else(|_| json!({})),
+                    });
+                }
+                // Claude rejects an empty content array outright.
+                if blocks.is_empty() {
+                    blocks.push(AnthropicContentBlock::Text {
+                        text: String::new(),
+                    });
+                }
+                merge_or_push(&mut out, "assistant", blocks);
+                continue;
+            }
+        };
+
+        merge_or_push(&mut out, role, vec![block]);
+    }
+
+    let system = (!system.is_empty()).then_some(system);
+    (system, out)
+}
+
+/// Appends `blocks` to the last message if it's already the same role,
+/// otherwise starts a new message - the merging step `to_anthropic_messages`
+/// relies on to keep roles strictly alternating.
+fn merge_or_push(
+    out: &mut Vec<AnthropicMessage>,
+    role: &'static str,
+    blocks: Vec<AnthropicContentBlock>,
+) {
+    match out.last_mut() {
+        Some(last) if last.role == role => last.content.extend(blocks),
+        _ => out.push(AnthropicMessage {
+            role,
+            content: blocks,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicStreamEvent {
+    MessageStart {
+        message: AnthropicMessageStart,
+    },
+    ContentBlockStart {
+        index: usize,
+        content_block: AnthropicContentBlockStart,
+    },
+    ContentBlockDelta {
+        index: usize,
+        delta: AnthropicDelta,
+    },
+    ContentBlockStop {
+        #[allow(dead_code)]
+        index: usize,
+    },
+    MessageDelta,
+    MessageStop,
+    Ping,
+    Error {
+        error: AnthropicError,
+    },
+}
+
+#[derive(Deserialize)]
+struct AnthropicMessageStart {
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContentBlockStart {
+    Text {
+        #[serde(default)]
+        #[allow(dead_code)]
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicDelta {
+    TextDelta { text: String },
+    InputJsonDelta { partial_json: String },
+}
+
+#[derive(Deserialize)]
+struct AnthropicError {
+    message: String,
 }
 
 /// Accumulates streamed `tool_calls` deltas, which arrive as fragments
@@ -559,9 +919,10 @@ mod tests {
     fn parses_usage_only_final_chunk() {
         // The chunk llama-server appends when stream_options.include_usage
         // is set: empty choices, a usage object carrying prompt_tokens.
-        let chunk: ChatChunk =
-            serde_json::from_str(r#"{"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":7}}"#)
-                .unwrap();
+        let chunk: ChatChunk = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":7}}"#,
+        )
+        .unwrap();
         assert!(chunk.choices.is_empty());
         assert_eq!(chunk.usage.and_then(|u| u.prompt_tokens), Some(1234));
     }
@@ -651,5 +1012,183 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.name, "tool_a");
         assert_eq!(calls[1].function.name, "tool_b");
+    }
+
+    #[test]
+    fn anthropic_conversion_pulls_system_prompt_out() {
+        let messages = vec![Message::system("be helpful"), Message::user("hi")];
+        let (system, converted) = to_anthropic_messages(&messages);
+
+        assert_eq!(system, Some("be helpful".to_string()));
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+    }
+
+    #[test]
+    fn anthropic_conversion_merges_consecutive_tool_results_into_one_user_message() {
+        // Mirrors what the agent loop actually produces after a multi-tool
+        // response: one assistant message with two tool_calls, followed by
+        // two separate Role::Tool history entries (one per call).
+        let messages = vec![
+            Message::user("read both files"),
+            Message::assistant_tool_calls(
+                None,
+                vec![
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: "{\"path\":\"a.txt\"}".to_string(),
+                        },
+                    },
+                    ToolCall {
+                        id: "call_2".to_string(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: "{\"path\":\"b.txt\"}".to_string(),
+                        },
+                    },
+                ],
+            ),
+            Message::tool_result("call_1", "contents of a"),
+            Message::tool_result("call_2", "contents of b"),
+        ];
+
+        let (_, converted) = to_anthropic_messages(&messages);
+
+        // user, assistant(2 tool_use blocks), user(2 tool_result blocks
+        // merged) - never two consecutive same-role messages, which
+        // Claude's API rejects outright.
+        assert_eq!(converted.len(), 3);
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(converted[1].role, "assistant");
+        assert_eq!(converted[1].content.len(), 2);
+        assert_eq!(converted[2].role, "user");
+        assert_eq!(converted[2].content.len(), 2);
+    }
+
+    #[test]
+    fn anthropic_conversion_carries_tool_use_id_and_parsed_input() {
+        let messages = vec![Message::assistant_tool_calls(
+            Some("checking".to_string()),
+            vec![ToolCall {
+                id: "call_abc".to_string(),
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"a.rs\"}".to_string(),
+                },
+            }],
+        )];
+
+        let (_, converted) = to_anthropic_messages(&messages);
+        assert_eq!(converted[0].content.len(), 2);
+
+        let rendered = serde_json::to_value(&converted[0]).unwrap();
+        let blocks = rendered["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "checking");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "call_abc");
+        assert_eq!(blocks[1]["input"]["path"], "a.rs");
+    }
+
+    #[test]
+    fn anthropic_stream_event_parses_text_delta() {
+        let event: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        )
+        .unwrap();
+
+        match event {
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::TextDelta { text },
+                ..
+            } => assert_eq!(text, "hi"),
+            _ => panic!("expected a text delta"),
+        }
+    }
+
+    #[test]
+    fn anthropic_stream_event_parses_tool_use_start_and_input_delta() {
+        let start: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+        )
+        .unwrap();
+        match start {
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block: AnthropicContentBlockStart::ToolUse { id, name },
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "read_file");
+            }
+            _ => panic!("expected a tool_use content_block_start"),
+        }
+
+        let delta: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+        )
+        .unwrap();
+        match delta {
+            AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::InputJsonDelta { partial_json },
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(partial_json, "{\"path\":\"a.rs\"}");
+            }
+            _ => panic!("expected an input_json_delta"),
+        }
+    }
+
+    #[test]
+    fn anthropic_stream_event_parses_message_start_usage() {
+        let event: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"usage":{"input_tokens":42,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+
+        match event {
+            AnthropicStreamEvent::MessageStart { message } => {
+                assert_eq!(message.usage.and_then(|u| u.input_tokens), Some(42));
+            }
+            _ => panic!("expected message_start"),
+        }
+    }
+
+    #[test]
+    fn anthropic_stream_event_ignores_extra_fields_on_unit_variants() {
+        // message_delta and message_stop carry extra fields (delta, usage)
+        // this crate doesn't model - they must still parse as their unit
+        // variant rather than fail deserialization.
+        let event: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}"#,
+        )
+        .unwrap();
+        assert!(matches!(event, AnthropicStreamEvent::MessageDelta));
+
+        let event: AnthropicStreamEvent =
+            serde_json::from_str(r#"{"type":"message_stop"}"#).unwrap();
+        assert!(matches!(event, AnthropicStreamEvent::MessageStop));
+
+        let event: AnthropicStreamEvent = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
+        assert!(matches!(event, AnthropicStreamEvent::Ping));
+    }
+
+    #[test]
+    fn anthropic_stream_event_parses_error() {
+        let event: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        )
+        .unwrap();
+
+        match event {
+            AnthropicStreamEvent::Error { error } => assert_eq!(error.message, "Overloaded"),
+            _ => panic!("expected an error event"),
+        }
     }
 }

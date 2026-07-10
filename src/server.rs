@@ -8,13 +8,22 @@ use crate::style::{dim, green, red, yellow};
 
 pub fn client_for(settings: &Settings) -> ModelClient {
     match settings.provider {
-        Provider::Local => {
-            ModelClient::new(settings.llama_url.clone(), String::new(), Backend::Llama, None)
-        }
+        Provider::Local => ModelClient::new(
+            settings.llama_url.clone(),
+            String::new(),
+            Backend::Llama,
+            None,
+        ),
         Provider::Gemini => ModelClient::new(
             settings.gemini_url.clone(),
             settings.gemini_model.clone(),
             Backend::OpenAiCompat,
+            settings.resolved_api_key(),
+        ),
+        Provider::Claude => ModelClient::new(
+            settings.claude_url.clone(),
+            settings.claude_model.clone(),
+            Backend::Anthropic,
             settings.resolved_api_key(),
         ),
     }
@@ -23,10 +32,10 @@ pub fn client_for(settings: &Settings) -> ModelClient {
 pub async fn check_health(settings: &Settings) -> bool {
     match settings.provider {
         Provider::Local => client_for(settings).health().await,
-        // The online provider has no cheap unauthenticated health endpoint;
-        // treat "an API key is configured" as ready and let the first real
-        // request surface any auth or network problem.
-        Provider::Gemini => settings.resolved_api_key().is_some(),
+        // Neither online provider has a cheap unauthenticated health
+        // endpoint; treat "an API key is configured" as ready and let the
+        // first real request surface any auth or network problem.
+        Provider::Gemini | Provider::Claude => settings.resolved_api_key().is_some(),
     }
 }
 
@@ -40,7 +49,7 @@ pub async fn ensure_running(settings: &Settings) -> bool {
     // Online mode has no local process to launch or wait on - readiness is
     // just "is there an API key?". The rest of this function is entirely
     // about managing a local llama-server.
-    if settings.provider == Provider::Gemini {
+    if settings.provider != Provider::Local {
         return ensure_online_ready(settings);
     }
 
@@ -174,21 +183,29 @@ pub async fn ensure_running(settings: &Settings) -> bool {
 /// so this just checks a key is present and reports which model requests
 /// will go to.
 fn ensure_online_ready(settings: &Settings) -> bool {
+    let (env_var, config_key, model, url) = match settings.provider {
+        Provider::Local => unreachable!("only called for an online provider"),
+        Provider::Gemini => (
+            "GEMINI_API_KEY",
+            "gemini_api_key",
+            &settings.gemini_model,
+            &settings.gemini_url,
+        ),
+        Provider::Claude => (
+            "ANTHROPIC_API_KEY",
+            "claude_api_key",
+            &settings.claude_model,
+            &settings.claude_url,
+        ),
+    };
+
     if settings.resolved_api_key().is_none() {
         println!("{}", red("Online mode selected but no API key is set."));
-        println!(
-            "Set it: export GEMINI_API_KEY=...  (or `config set gemini_api_key <key>`)"
-        );
+        println!("Set it: export {env_var}=...  (or `config set {config_key} <key>`)");
         return false;
     }
 
-    println!(
-        "{}",
-        green(&format!(
-            "Online mode: {} via {}",
-            settings.gemini_model, settings.gemini_url
-        ))
-    );
+    println!("{}", green(&format!("Online mode: {model} via {url}")));
     true
 }
 
@@ -218,10 +235,10 @@ async fn wait_for_health(settings: &Settings) -> bool {
     println!();
     println!(
         "{}",
-        yellow(&format!(
+        yellow(
             "llama-server still hasn't responded after 60s - it may just be very busy \
              (check ~/llama-server.log for what it's doing) rather than actually down."
-        ))
+        )
     );
     false
 }
@@ -233,10 +250,13 @@ async fn wait_for_health(settings: &Settings) -> bool {
 /// starved to answer requests.
 async fn port_is_open(host: &str, port: &str) -> bool {
     let addr = format!("{host}:{port}");
-    tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(&addr))
-        .await
-        .map(|result| result.is_ok())
-        .unwrap_or(false)
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false)
 }
 
 fn parse_host_port(url: &str) -> Option<(String, String)> {

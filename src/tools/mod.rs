@@ -136,10 +136,34 @@ impl ToolRegistry {
         let mut schemas = self.describe_all();
         for entry in &mut schemas {
             if let Some(parameters) = entry.pointer_mut("/function/parameters") {
-                sanitize_gemini_schema(parameters);
+                sanitize_remote_schema(parameters);
             }
         }
         schemas
+    }
+
+    /// Claude's native Messages API tools shape: flat `{"name",
+    /// "description", "input_schema"}` objects (no `{"type":"function",
+    /// "function": {...}}` wrapper the OpenAI-compatible backends use).
+    /// Schemas are sanitized the same way as Gemini's, since Claude's
+    /// schema validator is similarly strict about unrecognized keywords.
+    pub fn describe_all_anthropic(&self) -> Vec<Value> {
+        let mut names = self.names();
+        names.sort_unstable();
+
+        names
+            .into_iter()
+            .map(|name| {
+                let tool = &self.tools[name];
+                let mut parameters = tool.parameters_schema();
+                sanitize_remote_schema(&mut parameters);
+                json!({
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "input_schema": parameters,
+                })
+            })
+            .collect()
     }
 
     pub fn execute(&self, name: &str, root: &Path, args: &Value) -> Result<String, ToolError> {
@@ -150,12 +174,12 @@ impl ToolRegistry {
     }
 }
 
-/// Recursively strips JSON Schema keywords that Gemini's function-calling
-/// schema validator rejects, so a schema written for the fuller subset
-/// llama.cpp accepts still passes there. Only removes keys; the structural
-/// `type`/`properties`/`required`/`items`/`enum`/`description` that Gemini
-/// does support are left untouched.
-fn sanitize_gemini_schema(value: &mut Value) {
+/// Recursively strips JSON Schema keywords that remote providers' (Gemini,
+/// Claude) function-calling schema validators reject, so a schema written
+/// for the fuller subset llama.cpp accepts still passes there. Only removes
+/// keys; the structural `type`/`properties`/`required`/`items`/`enum`/
+/// `description` that both providers do support are left untouched.
+fn sanitize_remote_schema(value: &mut Value) {
     const UNSUPPORTED: &[&str] = &[
         "additionalProperties",
         "$schema",
@@ -174,12 +198,12 @@ fn sanitize_gemini_schema(value: &mut Value) {
                 map.remove(*key);
             }
             for child in map.values_mut() {
-                sanitize_gemini_schema(child);
+                sanitize_remote_schema(child);
             }
         }
         Value::Array(items) => {
             for item in items {
-                sanitize_gemini_schema(item);
+                sanitize_remote_schema(item);
             }
         }
         _ => {}
@@ -222,6 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_schemas_use_flat_shape_and_stay_clean() {
+        let registry = ToolRegistry::with_defaults(false);
+        let described = registry.describe_all_anthropic();
+
+        assert!(!described.is_empty());
+        for entry in &described {
+            assert!(entry["name"].is_string());
+            assert!(entry["description"].is_string());
+            let params = &entry["input_schema"];
+            assert_eq!(params["type"], "object");
+            assert!(entry.get("type").is_none());
+            assert!(!schema_contains_key(params, "additionalProperties"));
+            assert!(!schema_contains_key(params, "default"));
+            assert!(!schema_contains_key(params, "$schema"));
+        }
+    }
+
+    #[test]
     fn sanitizer_strips_unsupported_keywords_recursively() {
         let mut schema = json!({
             "type": "object",
@@ -240,7 +282,7 @@ mod tests {
             "required": ["path"]
         });
 
-        sanitize_gemini_schema(&mut schema);
+        sanitize_remote_schema(&mut schema);
 
         // Supported structure is preserved...
         assert_eq!(schema["type"], "object");

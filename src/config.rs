@@ -4,13 +4,15 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Which backend serves the model: a local `llama-server` (fully offline)
-/// or an online, OpenAI-compatible API (Gemini's compatibility endpoint).
+/// Which backend serves the model: a local `llama-server` (fully offline),
+/// an online OpenAI-compatible API (Gemini's compatibility endpoint), or
+/// Claude's native Messages API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Local,
     Gemini,
+    Claude,
 }
 
 impl Provider {
@@ -18,16 +20,20 @@ impl Provider {
         match self {
             Provider::Local => "local",
             Provider::Gemini => "gemini",
+            Provider::Claude => "claude",
         }
     }
 
     /// Accepts the internal names plus the friendlier "offline"/"online"
     /// aliases the `mode` command speaks, so `config set provider online`
-    /// and `mode online` land on the same value.
+    /// and `mode online` land on the same value. "online" stays mapped to
+    /// Gemini specifically (its long-standing meaning here) - Claude is
+    /// only ever selected by its own name(s), not the generic alias.
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "local" | "offline" | "llama" => Some(Provider::Local),
             "gemini" | "online" => Some(Provider::Gemini),
+            "claude" | "anthropic" => Some(Provider::Claude),
             _ => None,
         }
     }
@@ -69,6 +75,19 @@ pub struct Settings {
     /// `-c` allocation) so a large online window doesn't make the local
     /// server try to reserve gigabytes of KV cache.
     pub gemini_context_size: u32,
+    /// Base URL for Claude's native Messages API.
+    pub claude_url: String,
+    /// Model id sent in Claude requests, e.g. `claude-sonnet-5`.
+    pub claude_model: String,
+    /// API key for Claude. Left empty by default: the `ANTHROPIC_API_KEY`
+    /// environment variable is preferred and checked first, so the key
+    /// need not be written to disk in plain text at all. Never set this
+    /// from a hardcoded value in source - only from the environment or a
+    /// value the user types in themselves.
+    pub claude_api_key: String,
+    /// Context-window budget for Claude, tracked separately for the same
+    /// reason as `gemini_context_size`.
+    pub claude_context_size: u32,
     /// Parent folder holding every project - what the `project` command
     /// lists and picks from. Every project lives as a direct subfolder of
     /// this one; there is no separate single-project directory anymore.
@@ -116,6 +135,10 @@ impl Default for Settings {
             gemini_model: "gemini-2.5-flash".to_string(),
             gemini_api_key: String::new(),
             gemini_context_size: 128_000,
+            claude_url: "https://api.anthropic.com".to_string(),
+            claude_model: "claude-sonnet-5".to_string(),
+            claude_api_key: String::new(),
+            claude_context_size: 200_000,
             workspace: home.join("workspace").display().to_string(),
             active_project: String::new(),
             bypass_permissions: false,
@@ -162,7 +185,7 @@ impl Settings {
         match key {
             "provider" => {
                 self.provider = Provider::parse(value).with_context(|| {
-                    format!("expected local/offline or gemini/online, got \"{value}\"")
+                    format!("expected local/offline, gemini/online, or claude, got \"{value}\"")
                 })?;
             }
             "gemini_url" => self.gemini_url = value.to_string(),
@@ -174,6 +197,16 @@ impl Settings {
                     anyhow::bail!("gemini_context_size must be greater than 0");
                 }
                 self.gemini_context_size = parsed;
+            }
+            "claude_url" => self.claude_url = value.to_string(),
+            "claude_model" => self.claude_model = value.to_string(),
+            "claude_api_key" => self.claude_api_key = value.to_string(),
+            "claude_context_size" => {
+                let parsed: u32 = value.parse().context("expected an integer")?;
+                if parsed == 0 {
+                    anyhow::bail!("claude_context_size must be greater than 0");
+                }
+                self.claude_context_size = parsed;
             }
             "model_path" => self.model_path = value.to_string(),
             "llama_server_path" => self.llama_server_path = value.to_string(),
@@ -202,7 +235,9 @@ impl Settings {
             "threads" => {
                 let parsed: u32 = value.parse().context("expected an integer")?;
                 if parsed == 0 {
-                    anyhow::bail!("threads must be greater than 0 (unset it instead to use the default)");
+                    anyhow::bail!(
+                        "threads must be greater than 0 (unset it instead to use the default)"
+                    );
                 }
                 self.threads = Some(parsed);
             }
@@ -236,26 +271,34 @@ impl Settings {
         toml_render_inner(self, true)
     }
 
-    /// Resolves the online API key, preferring the `GEMINI_API_KEY`
-    /// environment variable over the persisted config value so the key
-    /// need never be written to disk.
+    /// Resolves the active online provider's API key, preferring its
+    /// environment variable (`GEMINI_API_KEY` / `ANTHROPIC_API_KEY`) over
+    /// the persisted config value so the key need never be written to disk
+    /// at all. Returns `None` for the local provider, which needs no key.
     pub fn resolved_api_key(&self) -> Option<String> {
-        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        let (env_var, configured) = match self.provider {
+            Provider::Local => return None,
+            Provider::Gemini => ("GEMINI_API_KEY", &self.gemini_api_key),
+            Provider::Claude => ("ANTHROPIC_API_KEY", &self.claude_api_key),
+        };
+
+        if let Ok(key) = std::env::var(env_var) {
             if !key.trim().is_empty() {
                 return Some(key);
             }
         }
-        let key = self.gemini_api_key.trim();
+        let key = configured.trim();
         (!key.is_empty()).then(|| key.to_string())
     }
 
     /// Context-window budget the history-trimmer should respect for the
-    /// active provider - the online window is tracked separately from the
-    /// local llama-server allocation.
+    /// active provider - each online window is tracked separately from the
+    /// local llama-server allocation (and from each other).
     pub fn effective_context_size(&self) -> u32 {
         match self.provider {
             Provider::Local => self.context_size,
             Provider::Gemini => self.gemini_context_size,
+            Provider::Claude => self.claude_context_size,
         }
     }
 
@@ -280,6 +323,14 @@ impl Settings {
             warnings.push(
                 "online mode (provider = gemini) is selected but no API key is set - export \
                  GEMINI_API_KEY, or run `config set gemini_api_key <key>`."
+                    .to_string(),
+            );
+        }
+
+        if self.provider == Provider::Claude && self.resolved_api_key().is_none() {
+            warnings.push(
+                "Claude mode (provider = claude) is selected but no API key is set - export \
+                 ANTHROPIC_API_KEY, or run `config set claude_api_key <key>`."
                     .to_string(),
             );
         }
@@ -330,6 +381,18 @@ fn toml_render_inner(settings: &Settings, redact: bool) -> String {
     out.push_str(&format!(
         "gemini_context_size = {}\n",
         settings.gemini_context_size
+    ));
+    out.push_str(&format!("claude_url = {:?}\n", settings.claude_url));
+    out.push_str(&format!("claude_model = {:?}\n", settings.claude_model));
+    let claude_api_key = if redact && !settings.claude_api_key.is_empty() {
+        "***".to_string()
+    } else {
+        settings.claude_api_key.clone()
+    };
+    out.push_str(&format!("claude_api_key = {claude_api_key:?}\n"));
+    out.push_str(&format!(
+        "claude_context_size = {}\n",
+        settings.claude_context_size
     ));
     out.push_str(&format!("workspace = {:?}\n", settings.workspace));
     out.push_str(&format!("active_project = {:?}\n", settings.active_project));
@@ -418,6 +481,10 @@ mod tests {
         assert_eq!(settings.provider, Provider::Local);
         settings.set_field("provider", "gemini").unwrap();
         assert_eq!(settings.provider, Provider::Gemini);
+        settings.set_field("provider", "claude").unwrap();
+        assert_eq!(settings.provider, Provider::Claude);
+        settings.set_field("provider", "anthropic").unwrap();
+        assert_eq!(settings.provider, Provider::Claude);
 
         assert!(settings.set_field("provider", "nonsense").is_err());
     }
@@ -442,25 +509,57 @@ mod tests {
         let mut settings = Settings {
             context_size: 8192,
             gemini_context_size: 128_000,
+            claude_context_size: 200_000,
             ..Settings::default()
         };
         assert_eq!(settings.effective_context_size(), 8192);
         settings.provider = Provider::Gemini;
         assert_eq!(settings.effective_context_size(), 128_000);
+        settings.provider = Provider::Claude;
+        assert_eq!(settings.effective_context_size(), 200_000);
+    }
+
+    #[test]
+    fn claude_fields_round_trip() {
+        let settings = Settings {
+            provider: Provider::Claude,
+            claude_model: "claude-opus-4-8".to_string(),
+            claude_context_size: 200_000,
+            ..Settings::default()
+        };
+
+        let parsed = toml_parse(&toml_render(&settings)).unwrap();
+        assert_eq!(parsed.provider, Provider::Claude);
+        assert_eq!(parsed.claude_model, "claude-opus-4-8");
+        assert_eq!(parsed.claude_context_size, 200_000);
     }
 
     #[test]
     fn describe_redacts_api_key_but_save_keeps_it() {
         let settings = Settings {
             gemini_api_key: "secret-key-value".to_string(),
+            claude_api_key: "another-secret".to_string(),
             ..Settings::default()
         };
 
         let shown = settings.describe();
         assert!(shown.contains("gemini_api_key = \"***\""));
+        assert!(shown.contains("claude_api_key = \"***\""));
         assert!(!shown.contains("secret-key-value"));
+        assert!(!shown.contains("another-secret"));
 
         // The on-disk form (what save writes) must keep the real value.
         assert!(toml_render(&settings).contains("secret-key-value"));
+        assert!(toml_render(&settings).contains("another-secret"));
+    }
+
+    #[test]
+    fn resolved_api_key_is_none_for_local_provider() {
+        let settings = Settings {
+            provider: Provider::Local,
+            claude_api_key: "should-be-ignored".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(settings.resolved_api_key(), None);
     }
 }

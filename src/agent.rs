@@ -99,10 +99,12 @@ impl Agent {
         let turn_start = history.len();
         history.push(Message::user(user_input));
 
-        // A remote provider (Gemini) validates tool schemas strictly, so
-        // hand it the sanitized subset; llama-server takes the full schema.
+        // A remote provider (Gemini, Claude) validates tool schemas
+        // strictly and expects its own shape, so hand it the matching
+        // sanitized form; llama-server takes the full schema as-is.
         let tool_schemas = match self.client.backend() {
             Backend::OpenAiCompat => self.tools.describe_all_gemini(),
+            Backend::Anthropic => self.tools.describe_all_anthropic(),
             Backend::Llama => self.tools.describe_all(),
         };
 

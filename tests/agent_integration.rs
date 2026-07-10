@@ -28,6 +28,24 @@ const FINAL_ANSWER_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+const ANTHROPIC_TOOL_CALL_SSE: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":50,\"output_tokens\":1}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \\\"a.txt\\\"}\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":10}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+const ANTHROPIC_FINAL_ANSWER_SSE: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":80,\"output_tokens\":1}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"The file says hi.\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
 async fn spawn_mock_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -66,6 +84,15 @@ async fn handle_connection(mut stream: TcpStream, chat_calls: Arc<AtomicUsize>) 
                 TOOL_CALL_SSE
             } else {
                 FINAL_ANSWER_SSE
+            };
+            respond(&mut stream, "text/event-stream", body).await;
+        }
+        "/v1/messages" => {
+            let call_index = chat_calls.fetch_add(1, Ordering::SeqCst);
+            let body = if call_index == 0 {
+                ANTHROPIC_TOOL_CALL_SSE
+            } else {
+                ANTHROPIC_FINAL_ANSWER_SSE
             };
             respond(&mut stream, "text/event-stream", body).await;
         }
@@ -169,5 +196,55 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
     // History should carry the full turn: system, user, assistant(tool_calls),
     // tool result, assistant(final text) - so a follow-up turn has the
     // right context.
+    assert_eq!(history.len(), 5);
+}
+
+#[tokio::test]
+async fn agent_streams_a_tool_call_then_a_final_answer_via_claude() {
+    let base_url = spawn_mock_server().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+
+    let client = ModelClient::new(
+        base_url,
+        "claude-sonnet-5".to_string(),
+        Backend::Anthropic,
+        Some("test-key".to_string()),
+    );
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false),
+        0.2,
+        512,
+        200_000,
+    );
+
+    let mut history: Vec<Message> = Vec::new();
+    let mut tool_calls_seen: Vec<(String, String)> = Vec::new();
+    let mut streamed_text = String::new();
+
+    let answer = agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "please read a.txt",
+            5,
+            |delta| streamed_text.push_str(delta),
+            |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
+        )
+        .await
+        .expect("agent turn should succeed against the mock Claude server");
+
+    assert_eq!(answer, "The file says hi.");
+    assert!(streamed_text.contains("The file says hi."));
+
+    assert_eq!(tool_calls_seen.len(), 1);
+    assert_eq!(tool_calls_seen[0].0, "read_file");
+    assert!(tool_calls_seen[0].1.contains("hi"));
     assert_eq!(history.len(), 5);
 }
