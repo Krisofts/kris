@@ -829,13 +829,18 @@ fn format_tool_call(tool_name: &str, args: &Value) -> String {
 }
 
 fn clear_line() {
-    print!("\r{}\r", " ".repeat(40));
+    // Clear-to-end-of-line rather than padding a fixed width - the
+    // spinner's label length varies (it grows once the elapsed-time
+    // warning kicks in), so a fixed-width blank could leave remnants of a
+    // longer line behind.
+    print!("\r\x1b[K");
     let _ = std::io::stdout().flush();
 }
 
 async fn spin(waiting: Arc<AtomicBool>) {
     const FRAMES: [&str; 10] = ["-", "\\", "|", "/", "-", "\\", "|", "/", "*", "+"];
     let mut i = 0;
+    let started = Instant::now();
 
     while waiting.load(Ordering::SeqCst) {
         // A tool is blocked on a y/N confirmation right now - stay quiet
@@ -843,7 +848,29 @@ async fn spin(waiting: Arc<AtomicBool>) {
         // hide it and make KRIS look stuck "thinking" forever while it's
         // actually just waiting on the user.
         if !AWAITING_CONFIRMATION.load(Ordering::SeqCst) {
-            print!("\r{} {}", dim(FRAMES[i % FRAMES.len()]), dim("thinking..."));
+            let elapsed = started.elapsed().as_secs();
+
+            // A visible running clock, not just a spinning glyph, so a
+            // genuinely long wait (a local model stuck generating a
+            // repetitive reply, or a slow tool call) reads as "still
+            // working, N seconds so far" instead of looking identically
+            // frozen at 5s and at 5 minutes. Past a minute, that's long
+            // enough for a plain chat reply that it's worth a nudge toward
+            // what to check, rather than just letting it keep spinning
+            // silently - `\x1b[K` (clear to end of line) instead of
+            // padding with spaces, since this label's length changes as
+            // the elapsed count grows.
+            let label = if elapsed >= 60 {
+                format!(
+                    "thinking... {elapsed}s (unusually long - if this is local/offline mode, \
+                     the model may be stuck in a repetitive generation loop; check \
+                     ~/llama-server.log, or try `config set max_tokens 256` to bound it)"
+                )
+            } else {
+                format!("thinking... {elapsed}s")
+            };
+
+            print!("\r\x1b[K{} {}", dim(FRAMES[i % FRAMES.len()]), dim(&label));
             let _ = std::io::stdout().flush();
             i += 1;
         }
