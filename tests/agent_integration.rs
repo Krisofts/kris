@@ -28,6 +28,16 @@ const FINAL_ANSWER_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+// Mirrors a real, on-device observation: without a working tool-calling
+// grammar, a model can hallucinate a call to a tool name that was never
+// registered (here, "hello" - echoing back the user's greeting) instead of
+// using the native tool_calls field.
+const HALLUCINATED_TOOL_SSE: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",",
+    "\"content\":\"{\\\"tool\\\": \\\"hello\\\", \\\"args\\\": {}}\"}}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
 const ANTHROPIC_TOOL_CALL_SSE: &str = concat!(
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":50,\"output_tokens\":1}}}\n\n",
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n",
@@ -189,6 +199,37 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+async fn spawn_single_response_server(body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let header_text = read_request_headers(&mut stream).await;
+                let path = header_text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("");
+
+                match path {
+                    "/health" => respond(&mut stream, "application/json", "{}").await,
+                    "/v1/chat/completions" => respond(&mut stream, "text/event-stream", body).await,
+                    other => panic!("mock server got an unexpected request path: {other}"),
+                }
+            });
+        }
+    });
+
+    format!("http://{addr}")
+}
+
 #[tokio::test]
 async fn agent_streams_a_tool_call_then_a_final_answer() {
     let base_url = spawn_mock_server().await;
@@ -307,4 +348,47 @@ async fn a_rejected_request_surfaces_the_provider_error_body() {
     let message = err.to_string();
     assert!(message.contains("400"));
     assert!(message.contains("claude-sonnet-5 is not supported"));
+}
+
+#[tokio::test]
+async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
+    // Regression test for an on-device observation: without a working
+    // tool-calling grammar, a local model can hallucinate a call to a tool
+    // name that was never registered instead of using the native
+    // tool_calls field or answering normally. Executing that call just
+    // produces an "unknown tool" error the model then rambles about -
+    // worse than simply showing its raw text as the answer.
+    let base_url = spawn_single_response_server(HALLUCINATED_TOOL_SSE).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let agent = Agent::new(client, ToolRegistry::with_defaults(false), 0.2, 512, 8192);
+
+    let mut history: Vec<Message> = Vec::new();
+    let mut tool_calls_seen: Vec<(String, String)> = Vec::new();
+
+    let answer = agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "halo",
+            5,
+            |_delta| {},
+            |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
+        )
+        .await
+        .expect("agent turn should succeed even with a hallucinated tool name");
+
+    assert!(
+        tool_calls_seen.is_empty(),
+        "a call to a nonexistent tool name should never actually be executed"
+    );
+    assert!(
+        answer.contains("hello"),
+        "the model's raw text should still be shown as the answer: {answer}"
+    );
 }

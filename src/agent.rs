@@ -156,6 +156,16 @@ impl Agent {
                     .content
                     .as_deref()
                     .and_then(parse_tool_call_from_text)
+                    // Confirmed on-device: without a working tool-calling
+                    // grammar, a model can hallucinate a call to a tool
+                    // name that doesn't exist at all (e.g. "hello", echoing
+                    // the user's greeting) - executing that just produces
+                    // an "unknown tool" error the model then rambles about
+                    // instead of answering normally. Only trust this
+                    // fallback for a name that's actually registered;
+                    // anything else falls through to being shown as plain
+                    // text like any other answer.
+                    .filter(|(name, _)| self.tools.names().contains(&name.as_str()))
                     .map(|(name, args)| {
                         vec![ToolCall {
                             id: "call_fallback_0".to_string(),
