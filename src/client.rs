@@ -230,7 +230,8 @@ impl ModelClient {
             }
 
             match builder.send().await {
-                Ok(response) => break response.error_for_status()?,
+                Ok(response) if response.status().is_success() => break response,
+                Ok(response) => return Err(response_error(response).await),
                 Err(err) if err.is_connect() && attempt < MAX_ATTEMPTS => {
                     tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
                 }
@@ -373,7 +374,8 @@ impl ModelClient {
             }
 
             match builder.send().await {
-                Ok(response) => break response.error_for_status()?,
+                Ok(response) if response.status().is_success() => break response,
+                Ok(response) => return Err(response_error(response).await),
                 Err(err) if err.is_connect() && attempt < MAX_ATTEMPTS => {
                     tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
                 }
@@ -840,6 +842,25 @@ impl ToolCallAccumulator {
                 },
             })
             .collect()
+    }
+}
+
+/// Turns a non-2xx HTTP response into an error that includes the response
+/// body, not just the status code. `reqwest::Response::error_for_status`
+/// alone discards the body, which for a JSON API error (Anthropic and
+/// Gemini both return a structured `{"error": {...}}` explaining exactly
+/// what was wrong - bad model id, malformed schema, auth failure, etc.) is
+/// the one piece of information that actually explains a 400/401/403 to
+/// the person looking at it instead of just "400 Bad Request".
+async fn response_error(response: reqwest::Response) -> anyhow::Error {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let body = body.trim();
+
+    if body.is_empty() {
+        anyhow::anyhow!("HTTP {status}")
+    } else {
+        anyhow::anyhow!("HTTP {status}: {body}")
     }
 }
 

@@ -141,8 +141,18 @@ async fn read_request_headers(stream: &mut TcpStream) -> String {
 }
 
 async fn respond(stream: &mut TcpStream, content_type: &str, body: &str) {
+    respond_with_status(stream, 200, "OK", content_type, body).await;
+}
+
+async fn respond_with_status(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+) {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len(),
     );
     stream
@@ -150,6 +160,29 @@ async fn respond(stream: &mut TcpStream, content_type: &str, body: &str) {
         .await
         .expect("write response");
     let _ = stream.shutdown().await;
+}
+
+/// A single-route mock server that always answers `/v1/messages` with the
+/// given status/body, for testing how KRIS surfaces a rejected request
+/// (e.g. an invalid model id) rather than a successful stream.
+async fn spawn_error_server(status: u16, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = read_request_headers(&mut stream).await;
+                respond_with_status(&mut stream, status, "Bad Request", "application/json", body)
+                    .await;
+            });
+        }
+    });
+
+    format!("http://{addr}")
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -247,4 +280,31 @@ async fn agent_streams_a_tool_call_then_a_final_answer_via_claude() {
     assert_eq!(tool_calls_seen[0].0, "read_file");
     assert!(tool_calls_seen[0].1.contains("hi"));
     assert_eq!(history.len(), 5);
+}
+
+#[tokio::test]
+async fn a_rejected_request_surfaces_the_provider_error_body() {
+    // Regression test: a bare `.error_for_status()` discards the response
+    // body, so a 400 from Claude/Gemini explaining exactly what was wrong
+    // (bad model id, malformed schema, ...) used to come through to the
+    // user as a content-free "400 Bad Request". The error KRIS surfaces
+    // must include that body.
+    let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"model: claude-sonnet-5 is not supported"}}"#;
+    let base_url = spawn_error_server(400, body).await;
+
+    let client = ModelClient::new(
+        base_url,
+        "claude-sonnet-5".to_string(),
+        Backend::Anthropic,
+        Some("test-key".to_string()),
+    );
+
+    let err = client
+        .chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {})
+        .await
+        .expect_err("a 400 response should surface as an error");
+
+    let message = err.to_string();
+    assert!(message.contains("400"));
+    assert!(message.contains("claude-sonnet-5 is not supported"));
 }
