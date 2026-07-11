@@ -106,6 +106,15 @@ pub struct Settings {
     /// same reason as `gemini_context_size` - it varies a lot by whichever
     /// model is selected behind it.
     pub openrouter_context_size: u32,
+    /// OpenRouter's `reasoning.effort` override: one of `"none"`,
+    /// `"minimal"`, `"low"`, `"medium"`, `"high"`, or empty to omit the
+    /// field entirely (provider/model default). Reasoning models routed
+    /// through OpenRouter (e.g. Tencent's Hy3) can otherwise spend their
+    /// whole `max_tokens` budget on a hidden "thinking" trace and never
+    /// reach a visible answer or tool call - capping effort here leaves
+    /// more of that budget for the actual response. Empty by default since
+    /// not every model on OpenRouter supports or wants this field.
+    pub openrouter_reasoning_effort: String,
     /// Parent folder holding every project - what the `project` command
     /// lists and picks from. Every project lives as a direct subfolder of
     /// this one; there is no separate single-project directory anymore.
@@ -169,6 +178,7 @@ impl Default for Settings {
             openrouter_model: "openai/gpt-5".to_string(),
             openrouter_api_key: String::new(),
             openrouter_context_size: 128_000,
+            openrouter_reasoning_effort: String::new(),
             workspace: home.join("workspace").display().to_string(),
             active_project: String::new(),
             bypass_permissions: false,
@@ -281,6 +291,17 @@ impl Settings {
                     anyhow::bail!("openrouter_context_size must be greater than 0");
                 }
                 self.openrouter_context_size = parsed;
+            }
+            "openrouter_reasoning_effort" => {
+                const ALLOWED: &[&str] = &["", "none", "minimal", "low", "medium", "high"];
+                let normalized = value.trim().to_ascii_lowercase();
+                if !ALLOWED.contains(&normalized.as_str()) {
+                    anyhow::bail!(
+                        "openrouter_reasoning_effort must be one of: none, minimal, low, \
+                         medium, high, or empty to unset - got \"{value}\""
+                    );
+                }
+                self.openrouter_reasoning_effort = normalized;
             }
             "model_path" => self.model_path = value.to_string(),
             "llama_server_path" => self.llama_server_path = value.to_string(),
@@ -497,6 +518,10 @@ fn toml_render_inner(settings: &Settings, redact: bool) -> String {
         "openrouter_context_size = {}\n",
         settings.openrouter_context_size
     ));
+    out.push_str(&format!(
+        "openrouter_reasoning_effort = {:?}\n",
+        settings.openrouter_reasoning_effort
+    ));
     out.push_str(&format!("workspace = {:?}\n", settings.workspace));
     out.push_str(&format!("active_project = {:?}\n", settings.active_project));
     out.push_str(&format!(
@@ -708,6 +733,34 @@ mod tests {
         assert_eq!(parsed.provider, Provider::OpenRouter);
         assert_eq!(parsed.openrouter_model, "anthropic/claude-sonnet-5");
         assert_eq!(parsed.openrouter_context_size, 100_000);
+    }
+
+    #[test]
+    fn openrouter_reasoning_effort_round_trips_and_validates() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.openrouter_reasoning_effort, "");
+
+        settings
+            .set_field("openrouter_reasoning_effort", "low")
+            .unwrap();
+        assert_eq!(settings.openrouter_reasoning_effort, "low");
+
+        let parsed = toml_parse(&toml_render(&settings)).unwrap();
+        assert_eq!(parsed.openrouter_reasoning_effort, "low");
+
+        // Case-insensitive, and empty clears it back to "no override".
+        settings
+            .set_field("openrouter_reasoning_effort", "NONE")
+            .unwrap();
+        assert_eq!(settings.openrouter_reasoning_effort, "none");
+        settings
+            .set_field("openrouter_reasoning_effort", "")
+            .unwrap();
+        assert_eq!(settings.openrouter_reasoning_effort, "");
+
+        assert!(settings
+            .set_field("openrouter_reasoning_effort", "extreme")
+            .is_err());
     }
 
     #[test]

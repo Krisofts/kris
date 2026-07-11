@@ -31,6 +31,10 @@ pub fn client_for(settings: &Settings) -> ModelClient {
             settings.openrouter_model.clone(),
             Backend::OpenAiCompat,
             settings.resolved_api_key(),
+        )
+        .with_reasoning_effort(
+            (!settings.openrouter_reasoning_effort.is_empty())
+                .then(|| settings.openrouter_reasoning_effort.clone()),
         ),
     }
 }

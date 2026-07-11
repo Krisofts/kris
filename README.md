@@ -144,10 +144,26 @@ Configuration (all optional, saved to `config.toml`):
 | `openrouter_api_key`       | *(empty)*                        | fallback if `OPENROUTER_API_KEY` isn't set  |
 | `openrouter_context_size`  | `128000`                         | history-trim budget in OpenRouter mode       |
 | `openrouter_url`           | `https://openrouter.ai/api/v1`   | OpenAI-compatible base URL                   |
+| `openrouter_reasoning_effort` | *(empty)*                     | `none`/`minimal`/`low`/`medium`/`high`, or empty to omit |
 
 Set any of these with e.g. `config set openrouter_model anthropic/claude-sonnet-5`.
 Same masking behavior as Gemini and Claude: the `config` command never
 prints the real key.
+
+#### Reasoning models (e.g. Tencent's Hy3)
+
+A reasoning model can spend its whole `max_tokens` budget on a hidden
+"thinking" trace before ever writing a visible answer or tool call, which
+otherwise looks like an empty reply after a long wait. KRIS streams that
+trace live (dimmed, prefixed with `(thinking)`) instead of showing
+nothing, and surfaces a diagnostic instead of silence if a reply is
+truncated with no content at all. If it's still cutting off before
+answering, cap how much of the budget reasoning is allowed to use:
+
+```
+config set openrouter_reasoning_effort low
+config set max_tokens 8000
+```
 
 ## Running on Termux (Android)
 

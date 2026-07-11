@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::message::{FunctionCall, Message, Role, ToolCall};
+use crate::style::dim;
 
 /// Which flavour of endpoint we're talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,14 @@ pub struct ModelClient {
     model: String,
     backend: Backend,
     api_key: Option<String>,
+    /// OpenRouter's `reasoning.effort` override (`"none"`, `"minimal"`,
+    /// `"low"`, `"medium"`, or `"high"`), unset by default so most
+    /// providers/models see no `reasoning` field at all. Reasoning models
+    /// routed through OpenRouter (e.g. Tencent's Hy3) can otherwise spend
+    /// their entire `max_tokens` budget on hidden "thinking" before ever
+    /// writing a visible answer or tool call - capping effort here leaves
+    /// more of that budget for the actual response.
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +93,11 @@ struct ChatRequest<'a> {
     /// message text ourselves, since it reflects the chat-template and tool-
     /// schema tokens the server actually rendered.
     stream_options: StreamOptions,
+    /// OpenRouter's reasoning-effort override (see `ModelClient::
+    /// with_reasoning_effort`). Omitted entirely unless explicitly set, so
+    /// providers/models with no opinion on reasoning never see this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -202,7 +216,17 @@ impl ModelClient {
             model: model.into(),
             backend,
             api_key,
+            reasoning_effort: None,
         }
+    }
+
+    /// Sets the `reasoning.effort` override sent with every request on the
+    /// OpenAI-compatible path (OpenRouter's own field - ignored by
+    /// llama-server and Gemini's compat endpoint, which never receive it
+    /// since only `server::client_for`'s OpenRouter branch calls this).
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 
     /// Which backend this client talks to - lets the agent pick the right
@@ -280,6 +304,10 @@ impl ModelClient {
             stream_options: StreamOptions {
                 include_usage: true,
             },
+            reasoning: self
+                .reasoning_effort
+                .as_ref()
+                .map(|effort| json!({ "effort": effort })),
         };
 
         const MAX_ATTEMPTS: u32 = 4;
@@ -311,6 +339,10 @@ impl ModelClient {
         let mut prompt_tokens = None;
         let mut mode = StreamMode::Deciding(String::new());
         let mut finish_reason: Option<String> = None;
+        // Tracks whether a reasoning trace is currently being streamed, so
+        // the first fragment gets a "(thinking)" label and the transition
+        // into real content gets a blank line to separate the two visually.
+        let mut reasoning_started = false;
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.context("reading stream chunk from llama-server")?;
@@ -333,8 +365,28 @@ impl ModelClient {
                 }
 
                 for choice in parsed.choices {
+                    // Streamed live rather than held back/analyzed like
+                    // `content` - a reasoning trace is prose, not something
+                    // that could itself be a leaked tool call, and it's
+                    // never counted toward `got_any_content` (a reasoning-
+                    // only stream should still trigger the truncation
+                    // diagnostic below, not be mistaken for a real answer).
+                    if let Some(text) = choice.delta.reasoning {
+                        if !text.is_empty() {
+                            if !reasoning_started {
+                                on_delta(&dim("\n(thinking) "));
+                                reasoning_started = true;
+                            }
+                            on_delta(&dim(&text));
+                        }
+                    }
+
                     if let Some(text) = choice.delta.content {
                         if !text.is_empty() {
+                            if reasoning_started {
+                                on_delta("\n\n");
+                                reasoning_started = false;
+                            }
                             content.push_str(&text);
                             got_any_content = true;
                             mode = apply_content_delta(mode, &text, &mut on_delta);
@@ -632,6 +684,12 @@ struct ChunkDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
+    /// A reasoning model's hidden "thinking" trace, streamed separately
+    /// from `content` on providers that support it (OpenRouter uses
+    /// `reasoning`; some passthroughs use the DeepSeek-style
+    /// `reasoning_content` name instead - either is accepted).
+    #[serde(default, alias = "reasoning_content")]
+    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1115,6 +1173,56 @@ mod tests {
             serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
         assert_eq!(chunk.choices.len(), 1);
         assert!(chunk.usage.is_none());
+    }
+
+    #[test]
+    fn parses_reasoning_delta_under_either_field_name() {
+        // OpenRouter's own field is "reasoning"; some passthroughs use the
+        // DeepSeek-style "reasoning_content" name instead - both must parse
+        // to the same place.
+        let chunk: ChatChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"reasoning":"pondering..."}}]}"#)
+                .unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning.as_deref(),
+            Some("pondering...")
+        );
+
+        let chunk: ChatChunk =
+            serde_json::from_str(r#"{"choices":[{"delta":{"reasoning_content":"pondering..."}}]}"#)
+                .unwrap();
+        assert_eq!(
+            chunk.choices[0].delta.reasoning.as_deref(),
+            Some("pondering...")
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_is_omitted_unless_explicitly_set() {
+        let request = ChatRequest {
+            model: "test-model",
+            messages: &[],
+            temperature: 0.2,
+            max_tokens: 512,
+            stream: true,
+            cache_prompt: None,
+            tools: None,
+            tool_choice: None,
+            repeat_penalty: None,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+            reasoning: None,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("reasoning").is_none());
+
+        let request_with_effort = ChatRequest {
+            reasoning: Some(json!({ "effort": "low" })),
+            ..request
+        };
+        let value = serde_json::to_value(&request_with_effort).unwrap();
+        assert_eq!(value["reasoning"]["effort"], "low");
     }
 
     #[test]

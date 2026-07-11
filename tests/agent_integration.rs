@@ -451,6 +451,34 @@ async fn truncated_reasoning_reply_surfaces_a_diagnostic_instead_of_silence() {
 }
 
 #[tokio::test]
+async fn reasoning_trace_streams_live_but_is_kept_out_of_the_final_answer() {
+    // A reasoning model (e.g. Tencent's Hy3 via OpenRouter) streams its
+    // hidden "thinking" separately from the real answer. It should still
+    // show up live (so a long reasoning phase doesn't look like a frozen
+    // "thinking..." spinner) but never leak into the final content that
+    // gets pushed into conversation history.
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning\":\"let me check the file\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"It says hi.\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let base_url = spawn_single_response_server(body).await;
+
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+
+    let mut streamed = String::new();
+    let outcome = client
+        .chat_stream(&[Message::user("hi")], None, 0.2, 512, |delta| {
+            streamed.push_str(delta)
+        })
+        .await
+        .expect("stream should succeed");
+
+    assert!(streamed.contains("let me check the file"));
+    assert_eq!(outcome.content.as_deref(), Some("It says hi."));
+}
+
+#[tokio::test]
 async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
     // Regression test: previously, when the model never produced a final
     // answer within max_iterations, the "reached the maximum" notice was
