@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use kris::agent::{Agent, Project};
 use kris::client::{Backend, ModelClient};
@@ -479,6 +480,53 @@ async fn reasoning_trace_is_not_dumped_to_the_terminal() {
     assert!(!streamed.contains("let me check the file"));
     assert_eq!(streamed, "It says hi.");
     assert_eq!(outcome.content.as_deref(), Some("It says hi."));
+}
+
+#[tokio::test]
+async fn done_marker_ends_the_stream_even_if_the_connection_stays_open() {
+    // Regression test for an on-device hang: chat_stream_openai used to
+    // rely entirely on the connection itself closing (byte_stream.next()
+    // returning None) to know a reply was finished - the SSE "[DONE]"
+    // event was seen but only caused a `continue`, not a break. A server/
+    // proxy that sends "[DONE]" and then leaves an idle keep-alive
+    // connection open (no Content-Length, no closing handshake) left the
+    // client waiting forever for more bytes that were never coming - a
+    // total, unrecoverable freeze right after the visible answer text,
+    // with no error and no way out short of restarting KRIS.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request_headers(&mut stream).await;
+
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        // Deliberately no Content-Length/Transfer-Encoding and no
+        // shutdown() afterward - the connection is just left open, as if
+        // kept alive for a future request.
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}");
+        let _ = stream.write_all(response.as_bytes()).await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
+    });
+
+    let base_url = format!("http://{addr}");
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}),
+    )
+    .await
+    .expect(
+        "chat_stream should return as soon as [DONE] arrives, not hang waiting for the \
+         connection to close",
+    )
+    .expect("stream should succeed");
+
+    assert_eq!(outcome.content.as_deref(), Some("hi"));
 }
 
 #[tokio::test]

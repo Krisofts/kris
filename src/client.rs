@@ -339,13 +339,23 @@ impl ModelClient {
         let mut mode = StreamMode::Deciding(String::new());
         let mut finish_reason: Option<String> = None;
 
-        while let Some(chunk) = byte_stream.next().await {
+        // Labeled so "[DONE]" can end the whole read loop immediately,
+        // rather than relying on the connection itself closing right
+        // after: on-device, a server/proxy that keeps an idle keep-alive
+        // connection open past the final SSE event left byte_stream.next()
+        // parked waiting for more bytes that were never coming, hanging
+        // the entire turn forever with no error and no recovery. The
+        // Anthropic path already breaks on its own terminal event
+        // (MessageStop) for the same reason - this brings the OpenAI-
+        // compatible path (llama-server, Gemini, OpenRouter) in line with
+        // it instead of trusting the transport to end things.
+        'outer: while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.context("reading stream chunk from llama-server")?;
             buffer.extend_from_slice(&chunk);
 
             for payload in drain_sse_events(&mut buffer) {
                 if payload == "[DONE]" {
-                    continue;
+                    break 'outer;
                 }
 
                 let parsed: ChatChunk = match serde_json::from_str(&payload) {

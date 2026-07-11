@@ -85,6 +85,14 @@ impl Tool for RunCommandTool {
             .arg("-c")
             .arg(command)
             .current_dir(root)
+            // Without this, the child inherits KRIS's own stdin - so a
+            // command that turns out to need interactive input (e.g. `npm
+            // create vite` asking "Which linter?") just sits there with
+            // nobody answering it, confirmed on-device to run out the
+            // full 120s TIMEOUT before getting killed instead of failing
+            // fast. Closing stdin makes most CLIs either bail immediately
+            // on EOF or fall back to a non-interactive default.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
