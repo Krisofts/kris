@@ -121,6 +121,14 @@ pub struct Settings {
     /// every session. Off by default since it removes the only safety
     /// net against a model acting on the project unsupervised.
     pub bypass_permissions: bool,
+    /// Narrower sibling of `bypass_permissions`: auto-approves only the
+    /// file-editing tools (write_file, edit_file, delete_file,
+    /// delete_directory, move_file, create_directory), leaving
+    /// run_command and git_commit still asking for confirmation. Lets
+    /// someone skip the diff prompt for routine edits while keeping a
+    /// manual gate on anything that runs a shell command. Has no effect
+    /// when `bypass_permissions` is already true.
+    pub auto_approve_edits: bool,
 }
 
 impl Default for Settings {
@@ -164,6 +172,7 @@ impl Default for Settings {
             workspace: home.join("workspace").display().to_string(),
             active_project: String::new(),
             bypass_permissions: false,
+            auto_approve_edits: false,
         }
     }
 }
@@ -323,6 +332,9 @@ impl Settings {
             "projects_root" => {}
             "bypass_permissions" => {
                 self.bypass_permissions = value.parse().context("expected true or false")?
+            }
+            "auto_approve_edits" => {
+                self.auto_approve_edits = value.parse().context("expected true or false")?
             }
             other => anyhow::bail!("unknown config key \"{other}\""),
         }
@@ -491,6 +503,10 @@ fn toml_render_inner(settings: &Settings, redact: bool) -> String {
         "bypass_permissions = {}\n",
         settings.bypass_permissions
     ));
+    out.push_str(&format!(
+        "auto_approve_edits = {}\n",
+        settings.auto_approve_edits
+    ));
     out
 }
 
@@ -650,6 +666,18 @@ mod tests {
         let mut settings = Settings::default();
         settings.set_field("workspace", "/data/workspace").unwrap();
         assert_eq!(settings.workspace, "/data/workspace");
+    }
+
+    #[test]
+    fn auto_approve_edits_round_trips_and_defaults_off() {
+        let mut settings = Settings::default();
+        assert!(!settings.auto_approve_edits);
+
+        settings.set_field("auto_approve_edits", "true").unwrap();
+        assert!(settings.auto_approve_edits);
+
+        let parsed = toml_parse(&toml_render(&settings)).unwrap();
+        assert!(parsed.auto_approve_edits);
     }
 
     #[test]

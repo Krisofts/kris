@@ -49,7 +49,7 @@ pub struct ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        Self::with_defaults(false)
+        Self::with_defaults(false, false)
     }
 }
 
@@ -58,7 +58,11 @@ impl ToolRegistry {
     /// already-approved (as if "always" had been answered up front),
     /// for `config set bypass_permissions true` / the `--yes`-style
     /// unattended use case - off means every gate starts fresh and asks.
-    pub fn with_defaults(bypass_permissions: bool) -> Self {
+    /// `auto_approve_edits` is the narrower `config set auto_approve_edits
+    /// true`: it only seeds the file-editing tools' shared gate, leaving
+    /// run_command and git_commit still asking - has no extra effect once
+    /// `bypass_permissions` is already true.
+    pub fn with_defaults(bypass_permissions: bool, auto_approve_edits: bool) -> Self {
         let mut registry = Self {
             tools: HashMap::new(),
         };
@@ -66,7 +70,7 @@ impl ToolRegistry {
         // Shared so approving one filesystem change with "always" covers
         // writes, edits, deletes, and moves for the rest of the session,
         // rather than needing a separate "always" per tool.
-        let auto_approve = Rc::new(Cell::new(bypass_permissions));
+        let auto_approve = Rc::new(Cell::new(bypass_permissions || auto_approve_edits));
 
         registry.register(fs::ReadFileTool);
         registry.register(fs::ListDirectoryTool);
@@ -216,8 +220,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auto_approve_edits_seeds_edit_tools_without_reading_stdin() {
+        // The confirm() gate checks auto_approve before ever touching stdin,
+        // so if this is seeded correctly write_file succeeds immediately
+        // instead of hanging on (or failing to read) a confirmation prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::with_defaults(false, true);
+
+        let result = registry
+            .execute(
+                "write_file",
+                dir.path(),
+                &json!({ "path": "f.txt", "content": "hi" }),
+            )
+            .unwrap();
+
+        assert!(result.starts_with("Wrote"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "hi"
+        );
+    }
+
+    #[test]
     fn describe_all_uses_openai_function_shape() {
-        let registry = ToolRegistry::with_defaults(false);
+        let registry = ToolRegistry::with_defaults(false, false);
         let described = registry.describe_all();
 
         assert!(!described.is_empty());
@@ -230,7 +257,7 @@ mod tests {
 
     #[test]
     fn gemini_schemas_keep_openai_shape_and_stay_clean() {
-        let registry = ToolRegistry::with_defaults(false);
+        let registry = ToolRegistry::with_defaults(false, false);
         let described = registry.describe_all_gemini();
 
         assert!(!described.is_empty());
@@ -248,7 +275,7 @@ mod tests {
 
     #[test]
     fn anthropic_schemas_use_flat_shape_and_stay_clean() {
-        let registry = ToolRegistry::with_defaults(false);
+        let registry = ToolRegistry::with_defaults(false, false);
         let described = registry.describe_all_anthropic();
 
         assert!(!described.is_empty());
@@ -310,7 +337,7 @@ mod tests {
 
     #[test]
     fn execute_reports_unknown_tool() {
-        let registry = ToolRegistry::with_defaults(false);
+        let registry = ToolRegistry::with_defaults(false, false);
         let err = registry
             .execute("does_not_exist", Path::new("."), &json!({}))
             .unwrap_err();

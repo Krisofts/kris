@@ -299,7 +299,13 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
     std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
 
     let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
-    let agent = Agent::new(client, ToolRegistry::with_defaults(false), 0.2, 512, 8192);
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
 
     let mut history: Vec<Message> = Vec::new();
     let mut tool_calls_seen: Vec<(String, String)> = Vec::new();
@@ -349,7 +355,7 @@ async fn agent_streams_a_tool_call_then_a_final_answer_via_claude() {
     );
     let agent = Agent::new(
         client,
-        ToolRegistry::with_defaults(false),
+        ToolRegistry::with_defaults(false, false),
         0.2,
         512,
         200_000,
@@ -456,7 +462,13 @@ async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
     let dir = tempfile::tempdir().unwrap();
 
     let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
-    let agent = Agent::new(client, ToolRegistry::with_defaults(false), 0.2, 512, 8192);
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
 
     let mut history: Vec<Message> = Vec::new();
 
@@ -496,7 +508,13 @@ async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
 
     let dir = tempfile::tempdir().unwrap();
     let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
-    let agent = Agent::new(client, ToolRegistry::with_defaults(false), 0.2, 512, 8192);
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
 
     let mut history: Vec<Message> = Vec::new();
     let mut tool_calls_seen: Vec<(String, String)> = Vec::new();

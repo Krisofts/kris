@@ -98,7 +98,10 @@ impl Session {
     fn agent(&self) -> Agent {
         Agent::new(
             server::client_for(&self.settings),
-            ToolRegistry::with_defaults(self.settings.bypass_permissions),
+            ToolRegistry::with_defaults(
+                self.settings.bypass_permissions,
+                self.settings.auto_approve_edits,
+            ),
             self.settings.temperature,
             self.settings.max_tokens,
             self.settings.effective_context_size(),
