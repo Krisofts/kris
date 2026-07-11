@@ -451,12 +451,14 @@ async fn truncated_reasoning_reply_surfaces_a_diagnostic_instead_of_silence() {
 }
 
 #[tokio::test]
-async fn reasoning_trace_streams_live_but_is_kept_out_of_the_final_answer() {
+async fn reasoning_trace_is_not_dumped_to_the_terminal() {
     // A reasoning model (e.g. Tencent's Hy3 via OpenRouter) streams its
-    // hidden "thinking" separately from the real answer. It should still
-    // show up live (so a long reasoning phase doesn't look like a frozen
-    // "thinking..." spinner) but never leak into the final content that
-    // gets pushed into conversation history.
+    // hidden "thinking" separately from the real answer. On-device, an
+    // earlier version of this streamed that raw chain-of-thought straight
+    // to the terminal, which flooded a phone screen with a wall of text
+    // for a genuinely long reasoning phase. It must not be streamed at
+    // all - the REPL's spinner already covers "still working" - and must
+    // never leak into the final content either.
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning\":\"let me check the file\"}}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"It says hi.\"}}]}\n\n",
@@ -474,7 +476,8 @@ async fn reasoning_trace_streams_live_but_is_kept_out_of_the_final_answer() {
         .await
         .expect("stream should succeed");
 
-    assert!(streamed.contains("let me check the file"));
+    assert!(!streamed.contains("let me check the file"));
+    assert_eq!(streamed, "It says hi.");
     assert_eq!(outcome.content.as_deref(), Some("It says hi."));
 }
 

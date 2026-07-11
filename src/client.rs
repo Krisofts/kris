@@ -6,7 +6,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
 use crate::message::{FunctionCall, Message, Role, ToolCall};
-use crate::style::dim;
 
 /// Which flavour of endpoint we're talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,10 +338,6 @@ impl ModelClient {
         let mut prompt_tokens = None;
         let mut mode = StreamMode::Deciding(String::new());
         let mut finish_reason: Option<String> = None;
-        // Tracks whether a reasoning trace is currently being streamed, so
-        // the first fragment gets a "(thinking)" label and the transition
-        // into real content gets a blank line to separate the two visually.
-        let mut reasoning_started = false;
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.context("reading stream chunk from llama-server")?;
@@ -365,28 +360,20 @@ impl ModelClient {
                 }
 
                 for choice in parsed.choices {
-                    // Streamed live rather than held back/analyzed like
-                    // `content` - a reasoning trace is prose, not something
-                    // that could itself be a leaked tool call, and it's
-                    // never counted toward `got_any_content` (a reasoning-
-                    // only stream should still trigger the truncation
-                    // diagnostic below, not be mistaken for a real answer).
-                    if let Some(text) = choice.delta.reasoning {
-                        if !text.is_empty() {
-                            if !reasoning_started {
-                                on_delta(&dim("\n(thinking) "));
-                                reasoning_started = true;
-                            }
-                            on_delta(&dim(&text));
-                        }
-                    }
-
+                    // Deliberately not streamed to on_delta: a reasoning
+                    // model's raw chain-of-thought can run to thousands of
+                    // words, which used to flood a phone terminal with a
+                    // wall of text (confirmed on-device). The REPL's
+                    // spinner already shows a live "still working" status
+                    // for as long as no real content has arrived - a
+                    // reasoning trace doesn't need its own visible
+                    // rendering on top of that. It's still never counted
+                    // toward `got_any_content` either way, so a reasoning-
+                    // only stream still triggers the truncation
+                    // diagnostic below rather than being mistaken for a
+                    // real answer.
                     if let Some(text) = choice.delta.content {
                         if !text.is_empty() {
-                            if reasoning_started {
-                                on_delta("\n\n");
-                                reasoning_started = false;
-                            }
                             content.push_str(&text);
                             got_any_content = true;
                             mode = apply_content_delta(mode, &text, &mut on_delta);
@@ -684,12 +671,6 @@ struct ChunkDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
-    /// A reasoning model's hidden "thinking" trace, streamed separately
-    /// from `content` on providers that support it (OpenRouter uses
-    /// `reasoning`; some passthroughs use the DeepSeek-style
-    /// `reasoning_content` name instead - either is accepted).
-    #[serde(default, alias = "reasoning_content")]
-    reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1176,25 +1157,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_reasoning_delta_under_either_field_name() {
-        // OpenRouter's own field is "reasoning"; some passthroughs use the
-        // DeepSeek-style "reasoning_content" name instead - both must parse
-        // to the same place.
+    fn reasoning_delta_is_ignored_rather_than_failing_to_parse() {
+        // A reasoning model's delta.reasoning/reasoning_content is
+        // deliberately not modeled - streaming it raw used to flood a
+        // phone terminal with a wall of chain-of-thought text (confirmed
+        // on-device). It must still parse cleanly as an unknown field
+        // (content stays None) rather than erroring the whole chunk out.
         let chunk: ChatChunk =
             serde_json::from_str(r#"{"choices":[{"delta":{"reasoning":"pondering..."}}]}"#)
                 .unwrap();
-        assert_eq!(
-            chunk.choices[0].delta.reasoning.as_deref(),
-            Some("pondering...")
-        );
+        assert!(chunk.choices[0].delta.content.is_none());
 
         let chunk: ChatChunk =
             serde_json::from_str(r#"{"choices":[{"delta":{"reasoning_content":"pondering..."}}]}"#)
                 .unwrap();
-        assert_eq!(
-            chunk.choices[0].delta.reasoning.as_deref(),
-            Some("pondering...")
-        );
+        assert!(chunk.choices[0].delta.content.is_none());
     }
 
     #[test]

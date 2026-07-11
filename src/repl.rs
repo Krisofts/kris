@@ -1066,6 +1066,31 @@ fn clear_line() {
     let _ = std::io::stdout().flush();
 }
 
+/// Rotated through every few seconds for the spinner label, Claude Code-
+/// style ("Thinking...", "Brewing...", ...) - purely cosmetic liveliness
+/// for a wait that can otherwise run long with nothing else on screen
+/// (this is also what covers a reasoning model's hidden "thinking" phase,
+/// since that trace itself is never printed - see chat_stream_openai's
+/// own comment on why).
+const SPINNER_VERBS: [&str; 10] = [
+    "Thinking",
+    "Pondering",
+    "Brewing",
+    "Percolating",
+    "Mulling",
+    "Ruminating",
+    "Cogitating",
+    "Musing",
+    "Noodling",
+    "Contemplating",
+];
+
+fn spinner_verb(elapsed_secs: u64) -> &'static str {
+    const SECONDS_PER_VERB: u64 = 8;
+    let index = (elapsed_secs / SECONDS_PER_VERB) as usize % SPINNER_VERBS.len();
+    SPINNER_VERBS[index]
+}
+
 /// Runs for the whole turn (stopped externally via `.abort()`), rather
 /// than exiting the moment `waiting` first goes false - `run_turn` flips
 /// it back to true after each tool call, so this needs to keep ticking
@@ -1094,14 +1119,15 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
             // silently - `\x1b[K` (clear to end of line) instead of
             // padding with spaces, since this label's length changes as
             // the elapsed count grows.
+            let verb = spinner_verb(elapsed);
             let mut label = if elapsed >= 60 {
                 format!(
-                    "thinking... {elapsed}s (unusually long - if this is local/offline mode, \
+                    "{verb}... {elapsed}s (unusually long - if this is local/offline mode, \
                      the model may be stuck in a repetitive generation loop; check \
                      ~/llama-server.log, or try `config set max_tokens 256` to bound it)"
                 )
             } else {
-                format!("thinking... {elapsed}s")
+                format!("{verb}... {elapsed}s")
             };
 
             // Live "Read N files · Ran N commands" recap, like Claude Code
@@ -1164,6 +1190,21 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spinner_verb_stays_put_within_its_window_then_rotates() {
+        assert_eq!(spinner_verb(0), "Thinking");
+        assert_eq!(spinner_verb(7), "Thinking");
+        assert_eq!(spinner_verb(8), "Pondering");
+        assert_eq!(spinner_verb(15), "Pondering");
+        assert_eq!(spinner_verb(16), "Brewing");
+    }
+
+    #[test]
+    fn spinner_verb_wraps_around_after_the_last_one() {
+        let period = 8 * SPINNER_VERBS.len() as u64;
+        assert_eq!(spinner_verb(0), spinner_verb(period));
+    }
 
     #[test]
     fn truncate_to_width_leaves_short_text_untouched() {
