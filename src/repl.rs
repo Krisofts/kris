@@ -478,7 +478,12 @@ fn handle_workspace(session: &mut Session, arg: &str) {
         return;
     }
 
-    let path = PathBuf::from(shellexpand_home(arg));
+    // Routed through `set_field` so relative input is anchored at the home
+    // directory rather than wherever the `kris` process happens to be
+    // running from (e.g. inside its own cloned source repo) - see
+    // `normalize_workspace_path` in config.rs.
+    let _ = session.settings.set_field("workspace", arg);
+    let path = PathBuf::from(&session.settings.workspace);
     if let Err(err) = fs::create_dir_all(&path) {
         println!(
             "{}",
@@ -604,15 +609,6 @@ fn apply_project_switch(session: &mut Session, name: &str) {
             session.root.display()
         ))
     );
-}
-
-fn shellexpand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).display().to_string();
-        }
-    }
-    path.to_string()
 }
 
 fn handle_config(session: &mut Session, rest: &str) {

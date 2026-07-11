@@ -173,6 +173,37 @@ fn config_path() -> Result<PathBuf> {
     Ok(base.join(".config").join("kris").join("config.toml"))
 }
 
+/// Resolves a workspace path to an absolute one, expanding a leading `~`
+/// and anchoring any relative path at the home directory - deliberately
+/// never at the process's current working directory. Without this, a
+/// relative `workspace` (from an old config, or a bare name typed at the
+/// `workspace`/`config set workspace` prompt) would resolve against
+/// wherever the `kris` binary happened to be launched from - e.g. from
+/// inside its own cloned source repo - silently writing every generated
+/// project file into that repo instead of a real workspace folder.
+fn normalize_workspace_path(value: &str) -> String {
+    let home = dirs::home_dir();
+
+    let expanded = if value == "~" {
+        home.clone().unwrap_or_else(|| PathBuf::from(value))
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.as_ref()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(value))
+    } else {
+        PathBuf::from(value)
+    };
+
+    if expanded.is_absolute() {
+        return expanded.display().to_string();
+    }
+
+    match home {
+        Some(h) => h.join(expanded).display().to_string(),
+        None => expanded.display().to_string(),
+    }
+}
+
 impl Settings {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
@@ -279,7 +310,7 @@ impl Settings {
             "flash_attn" => self.flash_attn = value.parse().context("expected true or false")?,
             "cache_type_k" => self.cache_type_k = Some(value.to_string()),
             "cache_type_v" => self.cache_type_v = Some(value.to_string()),
-            "workspace" => self.workspace = value.to_string(),
+            "workspace" => self.workspace = normalize_workspace_path(value),
             "active_project" => self.active_project = value.to_string(),
             // Legacy key from before this file's fields were renamed -
             // silently ignored (not rejected, so an old config.toml still
@@ -584,6 +615,41 @@ mod tests {
         assert_eq!(settings.effective_context_size(), 200_000);
         settings.provider = Provider::OpenRouter;
         assert_eq!(settings.effective_context_size(), 64_000);
+    }
+
+    #[test]
+    fn workspace_relative_path_anchors_at_home_not_cwd() {
+        // Regression test: a relative workspace used to resolve against
+        // whatever directory the `kris` process happened to be launched
+        // from - e.g. its own cloned source repo - instead of always
+        // landing under the home directory.
+        let mut settings = Settings::default();
+        settings.set_field("workspace", "myproject").unwrap();
+
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            settings.workspace,
+            home.join("myproject").display().to_string()
+        );
+    }
+
+    #[test]
+    fn workspace_tilde_expands_to_home() {
+        let mut settings = Settings::default();
+        settings.set_field("workspace", "~/projects").unwrap();
+
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            settings.workspace,
+            home.join("projects").display().to_string()
+        );
+    }
+
+    #[test]
+    fn workspace_absolute_path_is_left_unchanged() {
+        let mut settings = Settings::default();
+        settings.set_field("workspace", "/data/workspace").unwrap();
+        assert_eq!(settings.workspace, "/data/workspace");
     }
 
     #[test]
