@@ -200,8 +200,32 @@ fn print_sanity_warnings(settings: &Settings) {
     }
 }
 
+/// Draws a small boxed header (title + subtitle) sized to its own text
+/// rather than the terminal width - safe on the narrow terminals Termux
+/// phones often have, and simple enough to need no extra crate (padding
+/// is computed on the plain text, then the ANSI color codes are wrapped
+/// around the padded string so they don't throw off the width math).
 fn print_banner(session: &Session) {
-    println!("{}", bold("KRIS - local & online coding assistant"));
+    let title = format!("KRIS v{}", env!("CARGO_PKG_VERSION"));
+    let subtitle = "local & online coding assistant";
+    let width = title.len().max(subtitle.len());
+
+    println!("{}", cyan(&format!("╭{}╮", "─".repeat(width + 2))));
+    println!(
+        "{} {} {}",
+        cyan("│"),
+        bold(&format!("{title:<width$}")),
+        cyan("│")
+    );
+    println!(
+        "{} {} {}",
+        cyan("│"),
+        dim(&format!("{subtitle:<width$}")),
+        cyan("│")
+    );
+    println!("{}", cyan(&format!("╰{}╯", "─".repeat(width + 2))));
+    println!();
+
     let (mode, model) = describe_mode(&session.settings);
     println!(
         "{}",
