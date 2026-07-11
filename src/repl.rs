@@ -1097,7 +1097,23 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
                 label = format!("{label} · {summary}");
             }
 
-            print!("\r\x1b[K{} {}", dim(FRAMES[i % FRAMES.len()]), dim(&label));
+            // Regression guard: `\r\x1b[K` only rewinds/clears the terminal's
+            // *current* line - once the "unusually long" note and a growing
+            // tally push this past the terminal width, it wraps onto
+            // several lines, and every 90ms tick then only clears the last
+            // of those, leaving the earlier wrapped lines behind to pile up
+            // as the terminal scrolls (confirmed on-device: dozens of
+            // near-duplicate lines flooding a ~40-column Termux window).
+            // Truncating to fit the actual terminal width guarantees this
+            // is always a single line, so the redraw stays in place.
+            let frame = FRAMES[i % FRAMES.len()];
+            let prefix_width = frame.chars().count() + 1; // frame + one space
+            let max_label_width = terminal_width()
+                .saturating_sub(1) // leave the cursor's own column free
+                .saturating_sub(prefix_width);
+            let label = truncate_to_width(&label, max_label_width);
+
+            print!("\r\x1b[K{} {}", dim(frame), dim(&label));
             let _ = std::io::stdout().flush();
             i += 1;
         }
@@ -1105,9 +1121,62 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
     }
 }
 
+/// Current terminal width in columns, falling back to a conservative
+/// default (safe even on a fairly narrow phone terminal) if it can't be
+/// queried - e.g. output isn't a real tty.
+fn terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(40)
+}
+
+/// Truncates `text` to at most `max_width` characters, appending an
+/// ellipsis in place of the last character when it doesn't fit - used to
+/// keep the spinner label from ever wrapping to a second terminal line.
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+
+    let mut truncated: String = text.chars().take(max_width.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_to_width_leaves_short_text_untouched() {
+        assert_eq!(truncate_to_width("thinking... 4s", 40), "thinking... 4s");
+    }
+
+    #[test]
+    fn truncate_to_width_caps_long_text_with_an_ellipsis() {
+        // Regression test: an unbounded spinner label (the "unusually
+        // long" note plus a growing tool-count tally) can exceed the
+        // terminal width, which makes it wrap onto several lines - `\r`
+        // then only rewinds the last of those, so each 90ms redraw leaves
+        // the earlier wrapped lines behind instead of overwriting them,
+        // flooding the terminal with near-duplicate lines. Truncating to
+        // the terminal width keeps this to one line, so `\r\x1b[K` always
+        // covers the whole thing.
+        let long = "thinking... 144s (unusually long - ...) · Read 21 files · Edited 2 files";
+        let truncated = truncate_to_width(long, 20);
+
+        assert_eq!(truncated.chars().count(), 20);
+        assert!(truncated.ends_with('…'));
+        assert!(long.starts_with(&truncated[..truncated.len() - '…'.len_utf8()]));
+    }
+
+    #[test]
+    fn truncate_to_width_handles_zero_width() {
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
 
     #[test]
     fn tool_category_classifies_every_built_in_tool() {
