@@ -310,6 +310,7 @@ impl ModelClient {
         let mut got_any_content = false;
         let mut prompt_tokens = None;
         let mut mode = StreamMode::Deciding(String::new());
+        let mut finish_reason: Option<String> = None;
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.context("reading stream chunk from llama-server")?;
@@ -345,6 +346,10 @@ impl ModelClient {
                             accumulator.apply(delta);
                         }
                     }
+
+                    if let Some(reason) = choice.finish_reason {
+                        finish_reason = Some(reason);
+                    }
                 }
             }
         }
@@ -363,9 +368,42 @@ impl ModelClient {
             StreamMode::Live => None,
         };
 
+        let tool_calls = accumulator.finish();
+
+        // A stream that ended with no content and no tool call at all
+        // usually isn't a deliberate empty reply - it's most often a
+        // reasoning model that spent its entire `max_tokens` budget on a
+        // hidden "thinking" field this client never sees, so nothing ever
+        // arrived in `delta.content`. Surface that instead of silently
+        // showing nothing, which otherwise looks indistinguishable from a
+        // crash. Left as `None` for a genuine `finish_reason: "stop"` with
+        // no content, since that's a real (if unusual) empty answer.
+        let content = if got_any_content {
+            Some(content)
+        } else if tool_calls.is_empty() {
+            let note = match finish_reason.as_deref() {
+                Some("length") => Some(
+                    "(Model gave no visible answer before hitting max_tokens - it likely spent \
+                     its whole budget on hidden reasoning. Try raising it, e.g. `config set \
+                     max_tokens 4096`, or switch models.)"
+                        .to_string(),
+                ),
+                Some(reason) if reason != "stop" => Some(format!(
+                    "(Model gave no visible answer - finish_reason: \"{reason}\".)"
+                )),
+                _ => None,
+            };
+            if let Some(note) = &note {
+                on_delta(note);
+            }
+            note
+        } else {
+            None
+        };
+
         Ok(StreamOutcome {
-            content: if got_any_content { Some(content) } else { None },
-            tool_calls: accumulator.finish(),
+            content,
+            tool_calls,
             held_back,
             prompt_tokens,
         })
@@ -579,6 +617,13 @@ struct Usage {
 #[derive(Deserialize)]
 struct ChunkChoice {
     delta: ChunkDelta,
+    /// Only present on the final chunk for a choice. Used to tell a
+    /// genuinely empty reply apart from one truncated by `max_tokens` -
+    /// the latter is common with reasoning models that spend their whole
+    /// budget on a hidden "thinking" field this client doesn't parse,
+    /// leaving `delta.content` empty for the entire stream.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

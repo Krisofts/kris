@@ -351,6 +351,39 @@ async fn a_rejected_request_surfaces_the_provider_error_body() {
 }
 
 #[tokio::test]
+async fn truncated_reasoning_reply_surfaces_a_diagnostic_instead_of_silence() {
+    // Regression test: a reasoning model can spend its entire max_tokens
+    // budget on a hidden "thinking" field this client never parses, so
+    // delta.content stays empty for the whole stream and the request ends
+    // with finish_reason "length" - on-device this showed up as OpenRouter's
+    // free tencent/hy3:free model answering a short message with nothing at
+    // all, indistinguishable from a crash. It must come back as a visible
+    // diagnostic instead of a silent empty reply.
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let base_url = spawn_single_response_server(body).await;
+
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+
+    let mut streamed = String::new();
+    let outcome = client
+        .chat_stream(&[Message::user("hi")], None, 0.2, 16, |delta| {
+            streamed.push_str(delta)
+        })
+        .await
+        .expect("a truncated-with-no-content stream should still succeed");
+
+    let content = outcome
+        .content
+        .expect("should synthesize a diagnostic note instead of None");
+    assert!(content.contains("max_tokens"));
+    assert!(streamed.contains("max_tokens"));
+}
+
+#[tokio::test]
 async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
     // Regression test for an on-device observation: without a working
     // tool-calling grammar, a local model can hallucinate a call to a tool
