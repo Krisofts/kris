@@ -274,6 +274,9 @@ Inside the REPL:
 |---|---|
 | *(anything else)* | ask KRIS about the current project |
 | `fix [notes]` | build and iteratively fix errors until it's clean |
+| `init` | explore the project and write/update `KRIS.md` with a summary for future turns |
+| `review [notes]` | review pending changes (`git diff`) for correctness bugs and simplification opportunities |
+| `security-review [notes]` | review pending changes (`git diff`) for security issues |
 | `health` | check whether llama-server is reachable |
 | `serve` | start llama-server in the background if it isn't running |
 | `model [preset]` | show/switch the Qwen2.5-Coder model (`1.5b`/`3b`/`7b`) |

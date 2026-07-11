@@ -316,6 +316,50 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
             );
             ask_with_iterations(session, &prompt, FIX_MIN_ITERATIONS).await;
         }
+        "init" => {
+            let prompt = "Explore this project (file tree, key source files, config, README \
+                 if any) and write a concise KRIS.md at the project root summarizing: what \
+                 the project is and its language/framework, the folder structure, how to \
+                 build/test/run it, and any conventions or gotchas a coding assistant should \
+                 know before making changes. Keep it information-dense, not padded prose - a \
+                 few hundred lines at most. If KRIS.md already exists, read it first and \
+                 update it rather than starting over.";
+            ask_with_iterations(session, prompt, DEFAULT_MAX_ITERATIONS).await;
+        }
+        "review" => {
+            let prompt = format!(
+                "Review the currently pending changes (git diff against HEAD) for correctness \
+                 bugs and clear simplification opportunities. Use the git tool (diff) to see \
+                 what changed, and read any files you need more context on. Report findings \
+                 as a short list: file, what's wrong, and a concrete failure scenario for each \
+                 bug. If there are no pending changes, say so instead of reviewing something \
+                 else.{}",
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Additional context from the user: {rest}")
+                }
+            );
+            ask_with_iterations(session, &prompt, DEFAULT_MAX_ITERATIONS).await;
+        }
+        "security-review" => {
+            let prompt = format!(
+                "Do a security review of the currently pending changes (git diff against \
+                 HEAD) - not a general audit of the whole codebase. Use the git tool (diff) \
+                 to see what changed, then look for vulnerability classes introduced or \
+                 worsened by this diff specifically: injection, path traversal, secrets \
+                 committed in plain text, unsafe deserialization, missing auth/permission \
+                 checks, and similar. Report findings as a short list: file, the \
+                 vulnerability, and a concrete exploit scenario for each. If there are no \
+                 pending changes, say so instead of reviewing something else.{}",
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Additional context from the user: {rest}")
+                }
+            );
+            ask_with_iterations(session, &prompt, DEFAULT_MAX_ITERATIONS).await;
+        }
         _ => ask(session, line).await,
     }
 
@@ -671,6 +715,9 @@ fn print_help() {
     println!("Commands:");
     println!("  <anything else>       ask KRIS about this project");
     println!("  fix [notes]           build and iteratively fix errors until it's clean");
+    println!("  init                  explore the project and write/update KRIS.md with a summary for future turns");
+    println!("  review [notes]        review pending changes (git diff) for correctness bugs and simplification");
+    println!("  security-review [notes] review pending changes (git diff) for security issues");
     println!(
         "  mode [offline|online|claude|openrouter] show/switch between local llama.cpp, Gemini, Claude, and OpenRouter"
     );
