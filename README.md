@@ -306,7 +306,11 @@ Inside the REPL:
 KRIS can read, search, write, and edit files; run shell commands (with a
 y/n confirmation); inspect git state (read-only); and outline large files
 without reading them in full. File writes/edits/deletes always print a
-diff before applying so you can see exactly what changed.
+diff before applying so you can see exactly what changed. It can also
+pause and ask *you* a clarifying question - an arrow-key pick between a
+few options (one may be marked recommended), with a plain numbered
+fallback and a free-text "Other" answer always available - instead of
+guessing when a request is genuinely ambiguous.
 
 ## Troubleshooting: offline mode stuck "thinking" for a long time
 

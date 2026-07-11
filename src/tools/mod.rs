@@ -1,3 +1,4 @@
+mod ask;
 mod edit;
 mod fs;
 mod git;
@@ -88,6 +89,7 @@ impl ToolRegistry {
         registry.register(git::GitTool);
         registry.register(git::GitCommitTool::new(bypass_permissions));
         registry.register(outline::OutlineFileTool);
+        registry.register(ask::AskQuestionTool);
 
         registry
     }

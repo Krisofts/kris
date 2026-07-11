@@ -1040,9 +1040,16 @@ fn format_tool_call(tool_name: &str, args: &Value) -> String {
         }
     }
 
-    let summary = ["command", "path", "pattern", "keyword", "subcommand"]
-        .into_iter()
-        .find_map(|key| args.get(key).and_then(Value::as_str));
+    let summary = [
+        "command",
+        "path",
+        "pattern",
+        "keyword",
+        "subcommand",
+        "question",
+    ]
+    .into_iter()
+    .find_map(|key| args.get(key).and_then(Value::as_str));
 
     match summary {
         Some(summary) => format!("{tool_name}({summary})"),

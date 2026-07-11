@@ -72,7 +72,9 @@ impl Agent {
              tool by itself - run it via run_command. Verify nontrivial changes by \
              building/testing via run_command before finishing, when the project has such a \
              command. Only commit to git when explicitly asked, via git_commit - never \
-             automatically. Give your final answer as plain text."
+             automatically. If a request is genuinely ambiguous between a few clear \
+             approaches, use ask_question instead of guessing - not for things you could \
+             reasonably decide yourself. Give your final answer as plain text."
         )
     }
 
