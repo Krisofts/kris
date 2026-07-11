@@ -64,7 +64,9 @@ impl Tool for WriteFileTool {
     fn description(&self) -> &'static str {
         "Create a file, or overwrite it if it already exists, with the given content. \
          Path is relative to the project root. Prefer edit_file for small changes to an \
-         existing file - this always replaces the whole file."
+         existing file - this always replaces the whole file. For a long new file, prefer \
+         writing a first chunk here and growing it with append_file calls, rather than one \
+         very large write_file."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -103,6 +105,68 @@ impl Tool for WriteFileTool {
         fs::write(&full_path, content)?;
 
         Ok(format!("Wrote {} bytes to {path}", content.len()))
+    }
+}
+
+pub struct AppendFileTool {
+    auto_approve: Rc<Cell<bool>>,
+}
+
+impl AppendFileTool {
+    pub fn new(auto_approve: Rc<Cell<bool>>) -> Self {
+        Self { auto_approve }
+    }
+}
+
+impl Tool for AppendFileTool {
+    fn name(&self) -> &'static str {
+        "append_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Append content to the end of a file, creating it (and any parent directories) if it \
+         doesn't exist yet. Prefer several append_file calls over one big write_file when \
+         creating a long new file - each call only needs to generate its own small chunk, \
+         instead of the whole file having to fit in a single response before it gets cut off."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path relative to the project root" },
+                "content": { "type": "string", "description": "Text to append to the end of the file" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("path".to_string()))?;
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArgs("content".to_string()))?;
+
+        let full_path = root.join(path);
+        let old = fs::read_to_string(&full_path).unwrap_or_default();
+        let updated = format!("{old}{content}");
+
+        println!("{}", render_unified_diff(path, &old, &updated));
+
+        if !confirm(&self.auto_approve) {
+            return Ok(format!("{path} not appended to (user declined)."));
+        }
+
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&full_path, &updated)?;
+
+        Ok(format!("Appended {} bytes to {path}", content.len()))
     }
 }
 
@@ -475,6 +539,28 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ToolError::Tool(_)));
+    }
+
+    #[test]
+    fn append_file_creates_missing_file_then_grows_it() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tool = AppendFileTool::new(approved());
+        tool.execute(
+            dir.path(),
+            &json!({ "path": "notes/plan.md", "content": "# Plan\n" }),
+        )
+        .unwrap();
+        tool.execute(
+            dir.path(),
+            &json!({ "path": "notes/plan.md", "content": "More detail.\n" }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes/plan.md")).unwrap(),
+            "# Plan\nMore detail.\n"
+        );
     }
 
     #[test]

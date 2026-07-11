@@ -62,8 +62,11 @@ impl Agent {
              working inside \"{project_name}\".{type_line} Only use a tool when the request \
              needs it - for chit-chat or general questions, just answer in plain text. One \
              tool call at a time; wait for its result before the next step. Prefer edit_file \
-             over write_file for existing files. For a brand-new project, use the language's \
-             own scaffolding command via run_command (cargo new, npm init -y, django-admin \
+             over write_file for existing files. For a long new file, write a short first \
+             chunk with write_file and grow it with several append_file calls instead of one \
+             large write_file - keeps each step within a safe token budget instead of risking \
+             a truncated response mid-file. For a brand-new project, use the language's own \
+             scaffolding command via run_command (cargo new, npm init -y, django-admin \
              startproject, go mod init, etc.) instead of creating files by hand, unless no \
              such generator exists. A shell built-in (echo, cat, ls, mkdir, ...) is not a \
              tool by itself - run it via run_command. Verify nontrivial changes by \

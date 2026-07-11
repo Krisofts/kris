@@ -74,6 +74,7 @@ impl ToolRegistry {
         registry.register(fs::FindFilesTool);
         registry.register(fs::SearchCodeTool);
         registry.register(edit::WriteFileTool::new(auto_approve.clone()));
+        registry.register(edit::AppendFileTool::new(auto_approve.clone()));
         registry.register(edit::EditFileTool::new(auto_approve.clone()));
         registry.register(edit::DeleteFileTool::new(auto_approve.clone()));
         registry.register(edit::DeleteDirectoryTool::new(auto_approve.clone()));
