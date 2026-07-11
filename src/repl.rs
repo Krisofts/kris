@@ -1,9 +1,7 @@
-use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -820,12 +818,12 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
 
     let waiting = Arc::new(AtomicBool::new(true));
     let spinner_waiting = waiting.clone();
-    let spinner = tokio::spawn(spin(spinner_waiting));
+    let counts = Arc::new(SharedTurnCounts::default());
+    let spinner_counts = counts.clone();
+    let spinner = tokio::spawn(spin(spinner_waiting, spinner_counts));
 
     let history_len_before = session.history.len();
     let started = Instant::now();
-    let counts = Rc::new(RefCell::new(TurnCounts::default()));
-    let counts_for_closure = counts.clone();
 
     let result = agent
         .run(
@@ -849,7 +847,7 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                     clear_line();
                 }
                 println!("{} {}", cyan("●"), bold(&format_tool_call(tool_name, args)));
-                counts_for_closure.borrow_mut().record(tool_name);
+                counts.record(tool_name);
 
                 let is_error = result.starts_with("Error: ");
 
@@ -873,6 +871,13 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                         println!("{}", if is_error { red(&line) } else { dim(&line) });
                     }
                 }
+
+                // Re-arms the spinner for the wait before the next
+                // iteration's model response - a multi-step turn commonly
+                // runs several tool calls in a row, each separated by its
+                // own round trip, and each of those waits deserves the
+                // same "still working" feedback the first one got.
+                waiting.store(true, Ordering::SeqCst);
             },
         )
         .await;
@@ -889,9 +894,9 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
             let elapsed = started.elapsed();
             let tokens = heuristic_tokens(&session.history[history_len_before..]);
             println!();
-            if let Some(summary) = counts.borrow().summary() {
-                println!("{}", dim(&summary));
-            }
+            // The "Read N files · Ran N commands" tally lived only in the
+            // spinner label above while the turn was in progress - like
+            // Claude Code, it isn't repeated here once things are done.
             println!(
                 "{}",
                 dim(&format!(
@@ -936,15 +941,6 @@ struct TurnCounts {
 }
 
 impl TurnCounts {
-    fn record(&mut self, tool_name: &str) {
-        match tool_category(tool_name) {
-            ToolCategory::Read => self.read += 1,
-            ToolCategory::Edit => self.edited += 1,
-            ToolCategory::Command => self.commands += 1,
-            ToolCategory::Other => {}
-        }
-    }
-
     fn summary(&self) -> Option<String> {
         let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
 
@@ -959,6 +955,39 @@ impl TurnCounts {
         .collect();
 
         (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// Thread-safe tally shared between the closure recording tool calls (in
+/// `run_turn`, on the main task) and the spinner (its own tokio task) that
+/// displays a running "Read N files · Ran N commands" recap live, next to
+/// the "thinking..." label, while the turn is still in progress - unlike
+/// `TurnCounts`, which is a plain snapshot, not something updated from two
+/// tasks at once.
+#[derive(Default)]
+struct SharedTurnCounts {
+    read: AtomicUsize,
+    edited: AtomicUsize,
+    commands: AtomicUsize,
+}
+
+impl SharedTurnCounts {
+    fn record(&self, tool_name: &str) {
+        let counter = match tool_category(tool_name) {
+            ToolCategory::Read => &self.read,
+            ToolCategory::Edit => &self.edited,
+            ToolCategory::Command => &self.commands,
+            ToolCategory::Other => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> TurnCounts {
+        TurnCounts {
+            read: self.read.load(Ordering::Relaxed),
+            edited: self.edited.load(Ordering::Relaxed),
+            commands: self.commands.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1022,17 +1051,22 @@ fn clear_line() {
     let _ = std::io::stdout().flush();
 }
 
-async fn spin(waiting: Arc<AtomicBool>) {
+/// Runs for the whole turn (stopped externally via `.abort()`), rather
+/// than exiting the moment `waiting` first goes false - `run_turn` flips
+/// it back to true after each tool call, so this needs to keep ticking
+/// and simply stay quiet in between, ready to resume drawing for the next
+/// wait instead of having already exited after the first one.
+async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
     const FRAMES: [&str; 10] = ["-", "\\", "|", "/", "-", "\\", "|", "/", "*", "+"];
     let mut i = 0;
     let started = Instant::now();
 
-    while waiting.load(Ordering::SeqCst) {
+    loop {
         // A tool is blocked on a y/N confirmation right now - stay quiet
         // instead of redrawing over that prompt every 90ms, which would
         // hide it and make KRIS look stuck "thinking" forever while it's
         // actually just waiting on the user.
-        if !AWAITING_CONFIRMATION.load(Ordering::SeqCst) {
+        if waiting.load(Ordering::SeqCst) && !AWAITING_CONFIRMATION.load(Ordering::SeqCst) {
             let elapsed = started.elapsed().as_secs();
 
             // A visible running clock, not just a spinning glyph, so a
@@ -1045,7 +1079,7 @@ async fn spin(waiting: Arc<AtomicBool>) {
             // silently - `\x1b[K` (clear to end of line) instead of
             // padding with spaces, since this label's length changes as
             // the elapsed count grows.
-            let label = if elapsed >= 60 {
+            let mut label = if elapsed >= 60 {
                 format!(
                     "thinking... {elapsed}s (unusually long - if this is local/offline mode, \
                      the model may be stuck in a repetitive generation loop; check \
@@ -1054,6 +1088,14 @@ async fn spin(waiting: Arc<AtomicBool>) {
             } else {
                 format!("thinking... {elapsed}s")
             };
+
+            // Live "Read N files · Ran N commands" recap, like Claude Code
+            // shows while a turn is still in progress - it disappears with
+            // the rest of this line once the turn finishes, rather than
+            // being printed again afterward.
+            if let Some(summary) = counts.snapshot().summary() {
+                label = format!("{label} · {summary}");
+            }
 
             print!("\r\x1b[K{} {}", dim(FRAMES[i % FRAMES.len()]), dim(&label));
             let _ = std::io::stdout().flush();
@@ -1081,31 +1123,31 @@ mod tests {
 
     #[test]
     fn turn_counts_summary_omits_zero_categories_and_pluralizes() {
-        let mut counts = TurnCounts::default();
-        assert_eq!(counts.summary(), None);
+        let counts = SharedTurnCounts::default();
+        assert_eq!(counts.snapshot().summary(), None);
 
         counts.record("read_file");
-        assert_eq!(counts.summary().as_deref(), Some("Read 1 file"));
+        assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
 
         counts.record("edit_file");
         assert_eq!(
-            counts.summary().as_deref(),
+            counts.snapshot().summary().as_deref(),
             Some("Read 1 file · Edited 1 file")
         );
 
         counts.record("run_command");
         counts.record("run_command");
         assert_eq!(
-            counts.summary().as_deref(),
+            counts.snapshot().summary().as_deref(),
             Some("Read 1 file · Edited 1 file · Ran 2 commands")
         );
     }
 
     #[test]
     fn turn_counts_ignores_uncategorized_tools() {
-        let mut counts = TurnCounts::default();
+        let counts = SharedTurnCounts::default();
         counts.record("outline_file");
         counts.record("something_unknown");
-        assert_eq!(counts.summary().as_deref(), Some("Read 1 file"));
+        assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
     }
 }

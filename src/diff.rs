@@ -71,6 +71,27 @@ pub fn render_unified_diff(path: &str, old: &str, new: &str) -> String {
     out
 }
 
+/// Total (additions, removals) between `old` and `new`, for a compact
+/// `+A -B` stat in a tool's one-line result (e.g. "Wrote foo.rs (+16
+/// -0)") - unlike `render_unified_diff`'s own trailing count, this isn't
+/// capped by `MAX_DIFF_LINES`, so it stays accurate even past that many
+/// changed lines.
+pub fn diff_stat(old: &str, new: &str) -> (usize, usize) {
+    let diff = TextDiff::from_lines(old, new);
+
+    let mut additions = 0usize;
+    let mut removals = 0usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => additions += 1,
+            ChangeTag::Delete => removals += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+
+    (additions, removals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +110,25 @@ mod tests {
 
         let out = render_unified_diff("big.rs", &old, &new);
         assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn diff_stat_counts_additions_and_removals() {
+        let (add, rem) = diff_stat("line1\nline2\n", "line1\nline2 changed\nline3\n");
+        assert_eq!(add, 2);
+        assert_eq!(rem, 1);
+    }
+
+    #[test]
+    fn diff_stat_is_not_capped_by_max_diff_lines() {
+        // render_unified_diff's own trailing count only reflects what it
+        // actually printed (capped at MAX_DIFF_LINES) - diff_stat must
+        // still see the true total past that cap.
+        let old = String::new();
+        let new: String = (0..200).map(|i| format!("line{i}\n")).collect();
+
+        let (add, rem) = diff_stat(&old, &new);
+        assert_eq!(add, 200);
+        assert_eq!(rem, 0);
     }
 }

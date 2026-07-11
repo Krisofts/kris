@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use serde_json::{json, Value};
 
-use crate::diff::render_unified_diff;
+use crate::diff::{diff_stat, render_unified_diff};
 use crate::style::cyan;
 
 use super::{Tool, ToolError, AWAITING_CONFIRMATION};
@@ -104,7 +104,11 @@ impl Tool for WriteFileTool {
         }
         fs::write(&full_path, content)?;
 
-        Ok(format!("Wrote {} bytes to {path}", content.len()))
+        let (add, rem) = diff_stat(&old, content);
+        Ok(format!(
+            "Wrote {} bytes to {path} (+{add} -{rem})",
+            content.len()
+        ))
     }
 }
 
@@ -166,7 +170,11 @@ impl Tool for AppendFileTool {
         }
         fs::write(&full_path, &updated)?;
 
-        Ok(format!("Appended {} bytes to {path}", content.len()))
+        let (add, rem) = diff_stat(&old, &updated);
+        Ok(format!(
+            "Appended {} bytes to {path} (+{add} -{rem})",
+            content.len()
+        ))
     }
 }
 
@@ -251,7 +259,10 @@ impl Tool for EditFileTool {
         fs::write(&full_path, &updated)?;
 
         let count = if replace_all { occurrences } else { 1 };
-        Ok(format!("Replaced {count} occurrence(s) in {path}"))
+        let (add, rem) = diff_stat(&content, &updated);
+        Ok(format!(
+            "Replaced {count} occurrence(s) in {path} (+{add} -{rem})"
+        ))
     }
 }
 
@@ -578,6 +589,52 @@ mod tests {
             fs::read_to_string(dir.path().join("nested/dir/f.txt")).unwrap(),
             "hi"
         );
+    }
+
+    #[test]
+    fn write_file_result_includes_diff_stat() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tool = WriteFileTool::new(approved());
+        let result = tool
+            .execute(
+                dir.path(),
+                &json!({ "path": "f.txt", "content": "line1\nline2\n" }),
+            )
+            .unwrap();
+
+        assert!(result.contains("(+2 -0)"), "result was: {result}");
+    }
+
+    #[test]
+    fn edit_file_result_includes_diff_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "hello\n").unwrap();
+
+        let tool = EditFileTool::new(approved());
+        let result = tool
+            .execute(
+                dir.path(),
+                &json!({ "path": "f.txt", "old_string": "hello", "new_string": "goodbye" }),
+            )
+            .unwrap();
+
+        assert!(result.contains("(+1 -1)"), "result was: {result}");
+    }
+
+    #[test]
+    fn append_file_result_includes_diff_stat() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tool = AppendFileTool::new(approved());
+        let result = tool
+            .execute(
+                dir.path(),
+                &json!({ "path": "f.txt", "content": "line1\nline2\n" }),
+            )
+            .unwrap();
+
+        assert!(result.contains("(+2 -0)"), "result was: {result}");
     }
 
     #[test]
