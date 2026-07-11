@@ -1007,11 +1007,50 @@ fn print_boxed_output(result: &str, is_error: bool) {
     let border = |s: &str| if is_error { red(s) } else { cyan(s) };
     let content = |s: &str| if is_error { red(s) } else { dim(s) };
 
+    // run_command's result always starts with "exit code: N" - pulled out
+    // of the body and shown on the closing border instead of as just
+    // another line of output, colored by whether it actually succeeded
+    // (independent of `is_error`, which only reflects whether the tool
+    // call itself errored - a command that ran but exited non-zero is
+    // still an Ok result). git/git_commit's plain output has no such
+    // line, so this is a no-op for those.
+    let (exit_code, body) = split_exit_code(result);
+
+    // A line long enough to wrap would otherwise continue past the
+    // border with no "│" prefix on the wrapped part - clamping to the
+    // terminal width (same helper the spinner uses, for the same reason)
+    // keeps every line, and the border around it, intact.
+    let max_width = terminal_width().saturating_sub(2); // "│ " prefix
+
     println!("{}", border("┌─"));
-    for line in result.lines() {
-        println!("{} {}", border("│"), content(line));
+    for line in body.lines() {
+        println!(
+            "{} {}",
+            border("│"),
+            content(&truncate_to_width(line, max_width))
+        );
     }
-    println!("{}", border("└─"));
+
+    match exit_code {
+        Some(code) if code == "0" => {
+            println!("{} {}", border("└─"), green(&format!("exit code: {code}")))
+        }
+        Some(code) => println!("{} {}", border("└─"), red(&format!("exit code: {code}"))),
+        None => println!("{}", border("└─")),
+    }
+}
+
+/// Splits run_command's `"exit code: N\n<output>"` result shape into the
+/// code and the rest of the body - `None` if the text doesn't start with
+/// that exact prefix (e.g. git/git_commit's plain output, which has no
+/// exit code line at all).
+fn split_exit_code(result: &str) -> (Option<&str>, &str) {
+    match result.split_once('\n') {
+        Some((first, rest)) if first.starts_with("exit code: ") => {
+            (Some(&first["exit code: ".len()..]), rest)
+        }
+        _ => (None, result),
+    }
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -1190,6 +1229,21 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_exit_code_extracts_the_code_and_leaves_the_rest() {
+        let (code, body) = split_exit_code("exit code: 0\nrunning 3 tests\nok");
+        assert_eq!(code, Some("0"));
+        assert_eq!(body, "running 3 tests\nok");
+    }
+
+    #[test]
+    fn split_exit_code_is_none_for_output_with_no_exit_code_line() {
+        // git/git_commit's plain output, e.g.
+        let (code, body) = split_exit_code("[main 1234abc] a commit message\n1 file changed");
+        assert_eq!(code, None);
+        assert_eq!(body, "[main 1234abc] a commit message\n1 file changed");
+    }
 
     #[test]
     fn spinner_verb_stays_put_within_its_window_then_rotates() {
