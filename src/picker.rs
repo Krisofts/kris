@@ -10,6 +10,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::style::{bold, cyan, dim};
+use crate::term::{rows_for_width, terminal_width};
 
 /// Result of showing the picker - kept distinct from a plain
 /// `Option<String>` so a caller can tell "the user backed out" apart
@@ -76,13 +77,13 @@ fn run(prompt: &str, options: &[String], selected: &mut usize) -> Option<String>
                 return Some(options[*selected].clone());
             }
             KeyCode::Esc | KeyCode::Char('q') => {
-                clear_lines(options.len());
+                clear_lines(total_rows(options, terminal_width()));
                 print!("{}\r\n", dim("Cancelled."));
                 let _ = io::stdout().flush();
                 return None;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                clear_lines(options.len());
+                clear_lines(total_rows(options, terminal_width()));
                 return None;
             }
             _ => {}
@@ -91,8 +92,25 @@ fn run(prompt: &str, options: &[String], selected: &mut usize) -> Option<String>
 }
 
 fn redraw(options: &[String], selected: usize) {
-    clear_lines(options.len());
+    clear_lines(total_rows(options, terminal_width()));
     render(options, selected, false);
+}
+
+/// How many terminal rows the current render of `options` actually
+/// occupies at the given terminal width - each option is a "pointer +
+/// space" (2 columns) prefix plus its label, so a long label can wrap
+/// onto more than one row on a narrow terminal. `clear_lines` needs the
+/// true row count, not just `options.len()`, or it moves the cursor up
+/// too few lines and leaves the earlier wrapped rows behind - confirmed
+/// on-device: a long ask_question option wrapping to 2 lines made every
+/// arrow-key redraw stack a fresh, undeleted copy of the whole list
+/// underneath the last one instead of overwriting it.
+fn total_rows(options: &[String], width: usize) -> usize {
+    const PREFIX_WIDTH: usize = 2; // "❯ " / "✓ " / "  "
+    options
+        .iter()
+        .map(|name| rows_for_width(PREFIX_WIDTH + name.chars().count(), width))
+        .sum()
 }
 
 fn render(options: &[String], selected: usize, confirmed: bool) {
@@ -117,4 +135,36 @@ fn render(options: &[String], selected: usize, confirmed: bool) {
 fn clear_lines(n: usize) {
     print!("\x1b[{n}A\x1b[J");
     let _ = io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_rows_is_one_per_option_when_everything_fits() {
+        let options = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        assert_eq!(total_rows(&options, 40), 3);
+    }
+
+    #[test]
+    fn total_rows_counts_wrapped_rows_for_a_long_option() {
+        // Regression test: on-device, a long ask_question option label
+        // wrapped to 2 terminal rows, but clear_lines was only ever told
+        // to move up options.len() rows - one short per wrapped option -
+        // so each arrow-key redraw left the previous render's overflow
+        // behind instead of erasing it, stacking up duplicate copies of
+        // the whole list on screen.
+        let long_label = "x".repeat(50); // + 2-char prefix = 52 wide
+        let options = vec!["short".to_string(), long_label];
+
+        // "short" (2+5=7 wide) fits on one row; the 52-wide one wraps to
+        // two rows at a 40-column terminal.
+        assert_eq!(total_rows(&options, 40), 1 + 2);
+    }
+
+    #[test]
+    fn total_rows_handles_an_empty_option_list() {
+        assert_eq!(total_rows(&[], 40), 0);
+    }
 }

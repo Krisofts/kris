@@ -7,4 +7,5 @@ pub mod picker;
 pub mod repl;
 pub mod server;
 pub mod style;
+pub mod term;
 pub mod tools;

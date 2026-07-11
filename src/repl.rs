@@ -15,7 +15,8 @@ use crate::config::{Provider, Settings};
 use crate::message::Message;
 use crate::picker;
 use crate::server;
-use crate::style::{bold, cyan, dim, green, red, yellow};
+use crate::style::{blue, bold, cyan, dim, green, red, yellow};
+use crate::term::{terminal_width, truncate_to_width};
 use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION};
 
 // Raised from 10/24: a multi-file task (scaffold a project, add a feature,
@@ -1004,7 +1005,7 @@ impl SharedTurnCounts {
 /// like build/test logs or a git diff is actually readable rather than
 /// just showing its first line.
 fn print_boxed_output(result: &str, is_error: bool) {
-    let border = |s: &str| if is_error { red(s) } else { cyan(s) };
+    let border = |s: &str| if is_error { red(s) } else { blue(s) };
     let content = |s: &str| if is_error { red(s) } else { dim(s) };
 
     // run_command's result always starts with "exit code: N" - pulled out
@@ -1201,31 +1202,6 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
     }
 }
 
-/// Current terminal width in columns, falling back to a conservative
-/// default (safe even on a fairly narrow phone terminal) if it can't be
-/// queried - e.g. output isn't a real tty.
-fn terminal_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(cols, _)| cols as usize)
-        .unwrap_or(40)
-}
-
-/// Truncates `text` to at most `max_width` characters, appending an
-/// ellipsis in place of the last character when it doesn't fit - used to
-/// keep the spinner label from ever wrapping to a second terminal line.
-fn truncate_to_width(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= max_width {
-        return text.to_string();
-    }
-
-    let mut truncated: String = text.chars().take(max_width.saturating_sub(1)).collect();
-    truncated.push('…');
-    truncated
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,34 +1234,6 @@ mod tests {
     fn spinner_verb_wraps_around_after_the_last_one() {
         let period = 8 * SPINNER_VERBS.len() as u64;
         assert_eq!(spinner_verb(0), spinner_verb(period));
-    }
-
-    #[test]
-    fn truncate_to_width_leaves_short_text_untouched() {
-        assert_eq!(truncate_to_width("thinking... 4s", 40), "thinking... 4s");
-    }
-
-    #[test]
-    fn truncate_to_width_caps_long_text_with_an_ellipsis() {
-        // Regression test: an unbounded spinner label (the "unusually
-        // long" note plus a growing tool-count tally) can exceed the
-        // terminal width, which makes it wrap onto several lines - `\r`
-        // then only rewinds the last of those, so each 90ms redraw leaves
-        // the earlier wrapped lines behind instead of overwriting them,
-        // flooding the terminal with near-duplicate lines. Truncating to
-        // the terminal width keeps this to one line, so `\r\x1b[K` always
-        // covers the whole thing.
-        let long = "thinking... 144s (unusually long - ...) · Read 21 files · Edited 2 files";
-        let truncated = truncate_to_width(long, 20);
-
-        assert_eq!(truncated.chars().count(), 20);
-        assert!(truncated.ends_with('…'));
-        assert!(long.starts_with(&truncated[..truncated.len() - '…'.len_utf8()]));
-    }
-
-    #[test]
-    fn truncate_to_width_handles_zero_width() {
-        assert_eq!(truncate_to_width("anything", 0), "");
     }
 
     #[test]
