@@ -6,8 +6,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context as RlContext, Editor, Helper};
 use serde_json::Value;
 
 use crate::agent::{heuristic_tokens, Agent, Project};
@@ -32,6 +37,88 @@ const MODEL_PRESETS: &[(&str, &str)] = &[
     ("3b", "qwen2.5-coder-3b-instruct-q4_k_m.gguf"),
     ("7b", "qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
 ];
+
+/// Every REPL command `dispatch` recognizes as the first word of a line -
+/// kept as its own list (rather than derived from `dispatch`'s `match`)
+/// so tab-completion has something to complete against without needing
+/// to parse that function.
+const KNOWN_COMMANDS: &[&str] = &[
+    "help",
+    "version",
+    "clear",
+    "health",
+    "serve",
+    "mode",
+    "model",
+    "workspace",
+    "project",
+    "config",
+    "fix",
+    "init",
+    "review",
+    "security-review",
+    "exit",
+    "quit",
+];
+
+/// Gives the REPL's line editor two suggestion sources, both accepted
+/// with Tab (rustyline's default binding for `Complete`) then Enter:
+/// known command names for a bare word (`he` -> `health`/`help`), and
+/// previous history entries matching the current prefix (rustyline's
+/// built-in `HistoryHinter`, shown as inline ghost text) for anything
+/// else - so a repeated or similar prompt doesn't have to be retyped in
+/// full.
+struct KrisHelper {
+    history_hinter: HistoryHinter,
+}
+
+impl KrisHelper {
+    fn new() -> Self {
+        Self {
+            history_hinter: HistoryHinter::new(),
+        }
+    }
+}
+
+impl Completer for KrisHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RlContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        // Only offers command-name completions for the first word of the
+        // line, and only while the cursor is still inside it - typing
+        // `mode onl<Tab>` shouldn't try to complete "onl" against command
+        // names, since it's an argument, not a command.
+        let prefix = &line[..pos];
+        if prefix.contains(' ') {
+            return Ok((0, Vec::new()));
+        }
+
+        let matches: Vec<String> = KNOWN_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.starts_with(prefix))
+            .map(|cmd| cmd.to_string())
+            .collect();
+
+        Ok((0, matches))
+    }
+}
+
+impl Hinter for KrisHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &RlContext<'_>) -> Option<String> {
+        self.history_hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Highlighter for KrisHelper {}
+impl Validator for KrisHelper {}
+impl Helper for KrisHelper {}
 
 struct Session {
     settings: Settings,
@@ -174,7 +261,8 @@ pub async fn run_interactive(settings: Settings) -> Result<()> {
 
     print_banner(&session);
 
-    let mut editor = DefaultEditor::new()?;
+    let mut editor = Editor::<KrisHelper, DefaultHistory>::new()?;
+    editor.set_helper(Some(KrisHelper::new()));
 
     loop {
         let prompt = format!("{} ", cyan("kris>"));
@@ -738,6 +826,10 @@ fn print_help() {
     println!("  help                  show this message");
     println!("  version               show the KRIS version");
     println!("  exit / quit           leave KRIS");
+    println!();
+    println!(
+        "Press Tab to complete a command name or accept a suggestion from history, then Enter."
+    );
 }
 
 async fn ask(session: &mut Session, prompt: &str) {
@@ -1205,6 +1297,40 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::history::DefaultHistory;
+
+    fn complete_at_end(prefix: &str) -> Vec<String> {
+        let helper = KrisHelper::new();
+        let history = DefaultHistory::new();
+        let ctx = RlContext::new(&history);
+        helper.complete(prefix, prefix.len(), &ctx).unwrap().1
+    }
+
+    #[test]
+    fn completer_suggests_matching_command_names() {
+        let matches = complete_at_end("he");
+        assert!(matches.contains(&"help".to_string()));
+        assert!(matches.contains(&"health".to_string()));
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn completer_matches_a_single_command_exactly() {
+        assert_eq!(complete_at_end("mod"), vec!["mode", "model"]);
+        assert_eq!(complete_at_end("fix"), vec!["fix"]);
+    }
+
+    #[test]
+    fn completer_offers_nothing_once_past_the_command_word() {
+        // `mode onl` is an argument to `mode`, not a command name itself -
+        // completing it against KNOWN_COMMANDS would be wrong.
+        assert!(complete_at_end("mode onl").is_empty());
+    }
+
+    #[test]
+    fn completer_offers_nothing_for_an_unknown_prefix() {
+        assert!(complete_at_end("zzz").is_empty());
+    }
 
     #[test]
     fn split_exit_code_extracts_the_code_and_leaves_the_rest() {

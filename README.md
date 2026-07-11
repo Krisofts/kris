@@ -303,6 +303,11 @@ Inside the REPL:
 | `help` | show the command list |
 | `exit` / `quit` | leave KRIS |
 
+Press **Tab** at the prompt to complete a command name (`he` + Tab -&gt;
+`health`/`help`) or accept a suggestion from your command history (shown
+as ghost text once you've typed a matching prefix before), then **Enter**
+to run it.
+
 KRIS can read, search, write, and edit files; run shell commands (with a
 y/n confirmation); inspect git state (read-only); and outline large files
 without reading them in full. File writes/edits/deletes always print a
