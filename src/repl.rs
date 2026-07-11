@@ -872,6 +872,14 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                     }
                 }
 
+                // Running "Read N files · Edited N files · Ran N commands"
+                // recap, printed right below each tool call as it happens
+                // (not just live in the spinner, which disappears once the
+                // turn ends) - a persistent record of progress so far.
+                if let Some(summary) = counts.snapshot().summary() {
+                    println!("{}", dim(&summary));
+                }
+
                 // Re-arms the spinner for the wait before the next
                 // iteration's model response - a multi-step turn commonly
                 // runs several tool calls in a row, each separated by its
