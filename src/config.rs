@@ -5,14 +5,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Which backend serves the model: a local `llama-server` (fully offline),
-/// an online OpenAI-compatible API (Gemini's compatibility endpoint), or
-/// Claude's native Messages API.
+/// an online OpenAI-compatible API (Gemini's compatibility endpoint, or
+/// OpenRouter's), or Claude's native Messages API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Local,
     Gemini,
     Claude,
+    OpenRouter,
 }
 
 impl Provider {
@@ -21,19 +22,22 @@ impl Provider {
             Provider::Local => "local",
             Provider::Gemini => "gemini",
             Provider::Claude => "claude",
+            Provider::OpenRouter => "openrouter",
         }
     }
 
     /// Accepts the internal names plus the friendlier "offline"/"online"
     /// aliases the `mode` command speaks, so `config set provider online`
     /// and `mode online` land on the same value. "online" stays mapped to
-    /// Gemini specifically (its long-standing meaning here) - Claude is
-    /// only ever selected by its own name(s), not the generic alias.
+    /// Gemini specifically (its long-standing meaning here) - Claude and
+    /// OpenRouter are only ever selected by their own name(s), not the
+    /// generic alias.
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "local" | "offline" | "llama" => Some(Provider::Local),
             "gemini" | "online" => Some(Provider::Gemini),
             "claude" | "anthropic" => Some(Provider::Claude),
+            "openrouter" | "or" => Some(Provider::OpenRouter),
             _ => None,
         }
     }
@@ -88,6 +92,20 @@ pub struct Settings {
     /// Context-window budget for Claude, tracked separately for the same
     /// reason as `gemini_context_size`.
     pub claude_context_size: u32,
+    /// OpenAI-compatible base URL for OpenRouter, which fronts many
+    /// different model providers behind one API and key.
+    pub openrouter_url: String,
+    /// Model id sent in OpenRouter requests, e.g.
+    /// `anthropic/claude-sonnet-5` or `openai/gpt-5`.
+    pub openrouter_model: String,
+    /// API key for OpenRouter. Left empty by default: the
+    /// `OPENROUTER_API_KEY` environment variable is preferred and checked
+    /// first, so the key need not be written to disk in plain text at all.
+    pub openrouter_api_key: String,
+    /// Context-window budget for OpenRouter, tracked separately for the
+    /// same reason as `gemini_context_size` - it varies a lot by whichever
+    /// model is selected behind it.
+    pub openrouter_context_size: u32,
     /// Parent folder holding every project - what the `project` command
     /// lists and picks from. Every project lives as a direct subfolder of
     /// this one; there is no separate single-project directory anymore.
@@ -139,6 +157,10 @@ impl Default for Settings {
             claude_model: "claude-sonnet-5".to_string(),
             claude_api_key: String::new(),
             claude_context_size: 200_000,
+            openrouter_url: "https://openrouter.ai/api/v1".to_string(),
+            openrouter_model: "openai/gpt-5".to_string(),
+            openrouter_api_key: String::new(),
+            openrouter_context_size: 128_000,
             workspace: home.join("workspace").display().to_string(),
             active_project: String::new(),
             bypass_permissions: false,
@@ -185,7 +207,9 @@ impl Settings {
         match key {
             "provider" => {
                 self.provider = Provider::parse(value).with_context(|| {
-                    format!("expected local/offline, gemini/online, or claude, got \"{value}\"")
+                    format!(
+                        "expected local/offline, gemini/online, claude, or openrouter, got \"{value}\""
+                    )
                 })?;
             }
             "gemini_url" => self.gemini_url = value.to_string(),
@@ -207,6 +231,16 @@ impl Settings {
                     anyhow::bail!("claude_context_size must be greater than 0");
                 }
                 self.claude_context_size = parsed;
+            }
+            "openrouter_url" => self.openrouter_url = value.to_string(),
+            "openrouter_model" => self.openrouter_model = value.to_string(),
+            "openrouter_api_key" => self.openrouter_api_key = value.to_string(),
+            "openrouter_context_size" => {
+                let parsed: u32 = value.parse().context("expected an integer")?;
+                if parsed == 0 {
+                    anyhow::bail!("openrouter_context_size must be greater than 0");
+                }
+                self.openrouter_context_size = parsed;
             }
             "model_path" => self.model_path = value.to_string(),
             "llama_server_path" => self.llama_server_path = value.to_string(),
@@ -272,14 +306,16 @@ impl Settings {
     }
 
     /// Resolves the active online provider's API key, preferring its
-    /// environment variable (`GEMINI_API_KEY` / `ANTHROPIC_API_KEY`) over
-    /// the persisted config value so the key need never be written to disk
-    /// at all. Returns `None` for the local provider, which needs no key.
+    /// environment variable (`GEMINI_API_KEY` / `ANTHROPIC_API_KEY` /
+    /// `OPENROUTER_API_KEY`) over the persisted config value so the key
+    /// need never be written to disk at all. Returns `None` for the local
+    /// provider, which needs no key.
     pub fn resolved_api_key(&self) -> Option<String> {
         let (env_var, configured) = match self.provider {
             Provider::Local => return None,
             Provider::Gemini => ("GEMINI_API_KEY", &self.gemini_api_key),
             Provider::Claude => ("ANTHROPIC_API_KEY", &self.claude_api_key),
+            Provider::OpenRouter => ("OPENROUTER_API_KEY", &self.openrouter_api_key),
         };
 
         if let Ok(key) = std::env::var(env_var) {
@@ -299,6 +335,7 @@ impl Settings {
             Provider::Local => self.context_size,
             Provider::Gemini => self.gemini_context_size,
             Provider::Claude => self.claude_context_size,
+            Provider::OpenRouter => self.openrouter_context_size,
         }
     }
 
@@ -331,6 +368,14 @@ impl Settings {
             warnings.push(
                 "Claude mode (provider = claude) is selected but no API key is set - export \
                  ANTHROPIC_API_KEY, or run `config set claude_api_key <key>`."
+                    .to_string(),
+            );
+        }
+
+        if self.provider == Provider::OpenRouter && self.resolved_api_key().is_none() {
+            warnings.push(
+                "OpenRouter mode (provider = openrouter) is selected but no API key is set - \
+                 export OPENROUTER_API_KEY, or run `config set openrouter_api_key <key>`."
                     .to_string(),
             );
         }
@@ -393,6 +438,21 @@ fn toml_render_inner(settings: &Settings, redact: bool) -> String {
     out.push_str(&format!(
         "claude_context_size = {}\n",
         settings.claude_context_size
+    ));
+    out.push_str(&format!("openrouter_url = {:?}\n", settings.openrouter_url));
+    out.push_str(&format!(
+        "openrouter_model = {:?}\n",
+        settings.openrouter_model
+    ));
+    let openrouter_api_key = if redact && !settings.openrouter_api_key.is_empty() {
+        "***".to_string()
+    } else {
+        settings.openrouter_api_key.clone()
+    };
+    out.push_str(&format!("openrouter_api_key = {openrouter_api_key:?}\n"));
+    out.push_str(&format!(
+        "openrouter_context_size = {}\n",
+        settings.openrouter_context_size
     ));
     out.push_str(&format!("workspace = {:?}\n", settings.workspace));
     out.push_str(&format!("active_project = {:?}\n", settings.active_project));
@@ -485,6 +545,10 @@ mod tests {
         assert_eq!(settings.provider, Provider::Claude);
         settings.set_field("provider", "anthropic").unwrap();
         assert_eq!(settings.provider, Provider::Claude);
+        settings.set_field("provider", "openrouter").unwrap();
+        assert_eq!(settings.provider, Provider::OpenRouter);
+        settings.set_field("provider", "or").unwrap();
+        assert_eq!(settings.provider, Provider::OpenRouter);
 
         assert!(settings.set_field("provider", "nonsense").is_err());
     }
@@ -510,6 +574,7 @@ mod tests {
             context_size: 8192,
             gemini_context_size: 128_000,
             claude_context_size: 200_000,
+            openrouter_context_size: 64_000,
             ..Settings::default()
         };
         assert_eq!(settings.effective_context_size(), 8192);
@@ -517,6 +582,8 @@ mod tests {
         assert_eq!(settings.effective_context_size(), 128_000);
         settings.provider = Provider::Claude;
         assert_eq!(settings.effective_context_size(), 200_000);
+        settings.provider = Provider::OpenRouter;
+        assert_eq!(settings.effective_context_size(), 64_000);
     }
 
     #[test]
@@ -535,22 +602,41 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_fields_round_trip() {
+        let settings = Settings {
+            provider: Provider::OpenRouter,
+            openrouter_model: "anthropic/claude-sonnet-5".to_string(),
+            openrouter_context_size: 100_000,
+            ..Settings::default()
+        };
+
+        let parsed = toml_parse(&toml_render(&settings)).unwrap();
+        assert_eq!(parsed.provider, Provider::OpenRouter);
+        assert_eq!(parsed.openrouter_model, "anthropic/claude-sonnet-5");
+        assert_eq!(parsed.openrouter_context_size, 100_000);
+    }
+
+    #[test]
     fn describe_redacts_api_key_but_save_keeps_it() {
         let settings = Settings {
             gemini_api_key: "secret-key-value".to_string(),
             claude_api_key: "another-secret".to_string(),
+            openrouter_api_key: "yet-another-secret".to_string(),
             ..Settings::default()
         };
 
         let shown = settings.describe();
         assert!(shown.contains("gemini_api_key = \"***\""));
         assert!(shown.contains("claude_api_key = \"***\""));
+        assert!(shown.contains("openrouter_api_key = \"***\""));
         assert!(!shown.contains("secret-key-value"));
         assert!(!shown.contains("another-secret"));
+        assert!(!shown.contains("yet-another-secret"));
 
         // The on-disk form (what save writes) must keep the real value.
         assert!(toml_render(&settings).contains("secret-key-value"));
         assert!(toml_render(&settings).contains("another-secret"));
+        assert!(toml_render(&settings).contains("yet-another-secret"));
     }
 
     #[test]

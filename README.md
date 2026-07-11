@@ -8,11 +8,13 @@ a phone under Termux with a small Qwen2.5-Coder model, but works on any
 Linux/macOS box with llama.cpp installed.
 
 It can also run **online**, sending the same conversation to a cloud model
-through Google's Gemini API or Anthropic's Claude API instead — useful when
-you want a stronger model than the phone can host, or when you don't have
-llama.cpp set up. Either way the tools (file edits, `run_command`, git, …)
-still run locally on your machine; only the model's "thinking" moves to the
-cloud. Switch at any time with `mode offline` / `mode online` / `mode claude`.
+through Google's Gemini API, Anthropic's Claude API, or OpenRouter (which
+fronts many different providers' models behind one API and key) instead —
+useful when you want a stronger model than the phone can host, or when you
+don't have llama.cpp set up. Either way the tools (file edits, `run_command`,
+git, …) still run locally on your machine; only the model's "thinking" moves
+to the cloud. Switch at any time with `mode offline` / `mode online` /
+`mode claude` / `mode openrouter`.
 
 ## What it does
 
@@ -40,10 +42,10 @@ cargo build --release
 
 The binary is `target/release/kris`.
 
-## Online mode (Gemini / Claude)
+## Online mode (Gemini / Claude / OpenRouter)
 
 > **Never put an API key in source code, a commit, or anywhere inside this
-> repo.** Both online providers below read their key from an environment
+> repo.** All three online providers below read their key from an environment
 > variable first, specifically so it never has to touch disk in plain text
 > as part of a config file you might accidentally commit. If a key is ever
 > pasted somewhere it could be logged or shared (a chat, an issue, a
@@ -68,13 +70,13 @@ mode offline         # switch back to local llama.cpp
 
 Configuration (all optional, saved to `config.toml`):
 
-| Key                   | Default                            | Meaning                                   |
-| --------------------- | ---------------------------------- | ----------------------------------------- |
-| `provider`            | `local`                            | `local` (offline) or `gemini` (online)    |
-| `gemini_model`        | `gemini-2.5-flash`                 | model id used online                      |
-| `gemini_api_key`      | *(empty)*                          | fallback if `GEMINI_API_KEY` isn't set    |
-| `gemini_context_size` | `128000`                           | history-trim budget in online mode        |
-| `gemini_url`          | Gemini's `/v1beta/openai` endpoint | OpenAI-compatible base URL                 |
+| Key                   | Default                            | Meaning                                     |
+| --------------------- | ---------------------------------- | -------------------------------------------- |
+| `provider`            | `local`                            | `local` (offline), `gemini` (online), `claude`, or `openrouter` |
+| `gemini_model`        | `gemini-2.5-flash`                 | model id used online                        |
+| `gemini_api_key`      | *(empty)*                          | fallback if `GEMINI_API_KEY` isn't set      |
+| `gemini_context_size` | `128000`                           | history-trim budget in online mode          |
+| `gemini_url`          | Gemini's `/v1beta/openai` endpoint | OpenAI-compatible base URL                   |
 
 Set any of these with e.g. `config set gemini_model gemini-2.5-pro`. The
 `GEMINI_API_KEY` environment variable takes precedence over the stored
@@ -105,7 +107,7 @@ Configuration (all optional, saved to `config.toml`):
 
 | Key                   | Default                     | Meaning                                   |
 | ---------------------- | --------------------------- | ----------------------------------------- |
-| `provider`             | `local`                     | `local`, `gemini`, or `claude`            |
+| `provider`             | `local`                     | `local`, `gemini`, `claude`, or `openrouter` |
 | `claude_model`         | `claude-sonnet-5`           | model id used, e.g. `claude-opus-4-8`     |
 | `claude_api_key`       | *(empty)*                   | fallback if `ANTHROPIC_API_KEY` isn't set |
 | `claude_context_size`  | `200000`                    | history-trim budget in Claude mode        |
@@ -113,6 +115,39 @@ Configuration (all optional, saved to `config.toml`):
 
 Set any of these with e.g. `config set claude_model claude-opus-4-8`. Same
 masking behavior as Gemini: the `config` command never prints the real key.
+
+### OpenRouter
+
+KRIS can also talk to [OpenRouter](https://openrouter.ai), which fronts many
+different model providers (OpenAI, Anthropic, Google, Meta, and others)
+behind one OpenAI-compatible API and key — handy for trying a model without
+signing up for that provider directly. Get an API key from
+[openrouter.ai/keys](https://openrouter.ai/keys), then:
+
+```
+export OPENROUTER_API_KEY=your-key-here     # preferred: never written to disk
+```
+
+In the REPL:
+
+```
+mode openrouter      # switch to OpenRouter
+mode offline         # switch back to local llama.cpp
+```
+
+Configuration (all optional, saved to `config.toml`):
+
+| Key                        | Default                         | Meaning                                     |
+| -------------------------- | -------------------------------- | -------------------------------------------- |
+| `provider`                 | `local`                          | `local`, `gemini`, `claude`, or `openrouter` |
+| `openrouter_model`         | `openai/gpt-5`                   | model id used, e.g. `anthropic/claude-sonnet-5` |
+| `openrouter_api_key`       | *(empty)*                        | fallback if `OPENROUTER_API_KEY` isn't set  |
+| `openrouter_context_size`  | `128000`                         | history-trim budget in OpenRouter mode       |
+| `openrouter_url`           | `https://openrouter.ai/api/v1`   | OpenAI-compatible base URL                   |
+
+Set any of these with e.g. `config set openrouter_model anthropic/claude-sonnet-5`.
+Same masking behavior as Gemini and Claude: the `config` command never
+prints the real key.
 
 ## Running on Termux (Android)
 

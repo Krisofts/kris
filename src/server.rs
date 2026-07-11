@@ -26,16 +26,24 @@ pub fn client_for(settings: &Settings) -> ModelClient {
             Backend::Anthropic,
             settings.resolved_api_key(),
         ),
+        Provider::OpenRouter => ModelClient::new(
+            settings.openrouter_url.clone(),
+            settings.openrouter_model.clone(),
+            Backend::OpenAiCompat,
+            settings.resolved_api_key(),
+        ),
     }
 }
 
 pub async fn check_health(settings: &Settings) -> bool {
     match settings.provider {
         Provider::Local => client_for(settings).health().await,
-        // Neither online provider has a cheap unauthenticated health
+        // None of the online providers has a cheap unauthenticated health
         // endpoint; treat "an API key is configured" as ready and let the
         // first real request surface any auth or network problem.
-        Provider::Gemini | Provider::Claude => settings.resolved_api_key().is_some(),
+        Provider::Gemini | Provider::Claude | Provider::OpenRouter => {
+            settings.resolved_api_key().is_some()
+        }
     }
 }
 
@@ -196,6 +204,12 @@ fn ensure_online_ready(settings: &Settings) -> bool {
             "claude_api_key",
             &settings.claude_model,
             &settings.claude_url,
+        ),
+        Provider::OpenRouter => (
+            "OPENROUTER_API_KEY",
+            "openrouter_api_key",
+            &settings.openrouter_model,
+            &settings.openrouter_url,
         ),
     };
 
