@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use kris::agent::{Agent, Project};
 use kris::client::{Backend, ModelClient};
-use kris::message::Message;
+use kris::message::{Message, Role};
 use kris::tools::ToolRegistry;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -199,6 +199,67 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// A mock server that never gives a final answer - every request gets a
+/// distinct tool call (a different file path each time, so it never
+/// collides with the "same call proposed twice" early-stop check) - so
+/// the agent loop is guaranteed to run all the way to `max_iterations`.
+async fn spawn_endless_tool_call_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(handle_endless_tool_call_connection(
+                stream,
+                chat_calls.clone(),
+            ));
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+async fn handle_endless_tool_call_connection(mut stream: TcpStream, chat_calls: Arc<AtomicUsize>) {
+    let header_text = read_request_headers(&mut stream).await;
+    let path = header_text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("");
+
+    match path {
+        "/health" => respond(&mut stream, "application/json", "{}").await,
+        "/v1/chat/completions" => {
+            let index = chat_calls.fetch_add(1, Ordering::SeqCst);
+            let payload = serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": format!("call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": format!("{{\"path\": \"file_{index}.txt\"}}"),
+                            }
+                        }]
+                    }
+                }]
+            });
+            let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+            respond(&mut stream, "text/event-stream", &body).await;
+        }
+        other => panic!("mock server got an unexpected request path: {other}"),
+    }
+}
+
 async fn spawn_single_response_server(body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -381,6 +442,46 @@ async fn truncated_reasoning_reply_surfaces_a_diagnostic_instead_of_silence() {
         .expect("should synthesize a diagnostic note instead of None");
     assert!(content.contains("max_tokens"));
     assert!(streamed.contains("max_tokens"));
+}
+
+#[tokio::test]
+async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
+    // Regression test: previously, when the model never produced a final
+    // answer within max_iterations, the "reached the maximum" notice was
+    // only streamed live via on_delta - it was never pushed into `history`,
+    // leaving the turn dangling right after an unanswered tool result
+    // instead of closing normally. That left the next turn's history in an
+    // inconsistent state (no assistant message ever closed the loop).
+    let base_url = spawn_endless_tool_call_server().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let agent = Agent::new(client, ToolRegistry::with_defaults(false), 0.2, 512, 8192);
+
+    let mut history: Vec<Message> = Vec::new();
+
+    let answer = agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "keep reading files forever",
+            3,
+            |_delta| {},
+            |_name, _args, _result| {},
+        )
+        .await
+        .expect("hitting max_iterations should still be a successful turn, not an error");
+
+    assert!(answer.contains("maximum number of tool calls"));
+    assert!(answer.to_lowercase().contains("continue"));
+
+    let last = history.last().expect("history should not be empty");
+    assert_eq!(last.role, Role::Assistant);
+    assert_eq!(last.content.as_deref(), Some(answer.as_str()));
 }
 
 #[tokio::test]

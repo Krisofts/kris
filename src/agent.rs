@@ -248,8 +248,12 @@ impl Agent {
             }
         }
 
-        let notice = "Reached the maximum number of tool calls without a final answer.".to_string();
+        let notice = "Reached the maximum number of tool calls without a final answer. Ask \
+             KRIS to continue - the conversation so far is kept, so it can pick up where it \
+             left off instead of starting over."
+            .to_string();
         on_delta(&notice);
+        history.push(Message::assistant_text(notice.clone()));
         Ok(notice)
     }
 

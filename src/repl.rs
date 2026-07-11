@@ -18,8 +18,13 @@ use crate::server;
 use crate::style::{bold, cyan, dim, green, red, yellow};
 use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION};
 
-const DEFAULT_MAX_ITERATIONS: u32 = 10;
-const FIX_MIN_ITERATIONS: u32 = 24;
+// Raised from 10/24: a multi-file task (scaffold a project, add a feature,
+// verify with clippy/tests) easily needs more tool calls than that,
+// especially now that append_file encourages building a long new file as
+// several small chunks rather than one big write_file - each chunk is its
+// own iteration.
+const DEFAULT_MAX_ITERATIONS: u32 = 20;
+const FIX_MIN_ITERATIONS: u32 = 40;
 
 const MODEL_PRESETS: &[(&str, &str)] = &[
     ("1.5b", "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"),
