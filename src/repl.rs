@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -822,6 +824,8 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
 
     let history_len_before = session.history.len();
     let started = Instant::now();
+    let counts = Rc::new(RefCell::new(TurnCounts::default()));
+    let counts_for_closure = counts.clone();
 
     let result = agent
         .run(
@@ -845,18 +849,29 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                     clear_line();
                 }
                 println!("{} {}", cyan("●"), bold(&format_tool_call(tool_name, args)));
+                counts_for_closure.borrow_mut().record(tool_name);
 
-                let summary = result.lines().next().unwrap_or("").trim();
-                if !summary.is_empty() {
-                    let is_error = result.starts_with("Error: ");
-                    let truncated: String = summary.chars().take(100).collect();
-                    let ellipsis = if summary.chars().count() > 100 {
-                        "…"
-                    } else {
-                        ""
-                    };
-                    let line = format!("  ⎿ {truncated}{ellipsis}");
-                    println!("{}", if is_error { red(&line) } else { dim(&line) });
+                let is_error = result.starts_with("Error: ");
+
+                // A command's real output (build/test logs, diffs, ...) is
+                // worth seeing in full rather than just its first line - a
+                // boxed, line-prefixed block reads far easier than a wall
+                // of text, and matches the ┌─/│/└─ style the confirmation
+                // prompts already use elsewhere.
+                if tool_category(tool_name) == ToolCategory::Command && result.lines().count() > 1 {
+                    print_boxed_output(result, is_error);
+                } else {
+                    let summary = result.lines().next().unwrap_or("").trim();
+                    if !summary.is_empty() {
+                        let truncated: String = summary.chars().take(100).collect();
+                        let ellipsis = if summary.chars().count() > 100 {
+                            "…"
+                        } else {
+                            ""
+                        };
+                        let line = format!("  ⎿ {truncated}{ellipsis}");
+                        println!("{}", if is_error { red(&line) } else { dim(&line) });
+                    }
                 }
             },
         )
@@ -874,6 +889,9 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
             let elapsed = started.elapsed();
             let tokens = heuristic_tokens(&session.history[history_len_before..]);
             println!();
+            if let Some(summary) = counts.borrow().summary() {
+                println!("{}", dim(&summary));
+            }
             println!(
                 "{}",
                 dim(&format!(
@@ -886,6 +904,77 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
         }
         Err(err) => Err(err),
     }
+}
+
+/// Which of Claude Code's three broad action groups a tool call belongs
+/// to, for the end-of-turn "Read N files · Edited N files · Ran N
+/// commands" recap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCategory {
+    Read,
+    Edit,
+    Command,
+    Other,
+}
+
+fn tool_category(name: &str) -> ToolCategory {
+    match name {
+        "read_file" | "list_directory" | "tree" | "find_files" | "search_code" | "outline_file"
+        | "git" => ToolCategory::Read,
+        "write_file" | "append_file" | "edit_file" | "delete_file" | "delete_directory"
+        | "move_file" | "create_directory" => ToolCategory::Edit,
+        "run_command" | "git_commit" => ToolCategory::Command,
+        _ => ToolCategory::Other,
+    }
+}
+
+#[derive(Default)]
+struct TurnCounts {
+    read: usize,
+    edited: usize,
+    commands: usize,
+}
+
+impl TurnCounts {
+    fn record(&mut self, tool_name: &str) {
+        match tool_category(tool_name) {
+            ToolCategory::Read => self.read += 1,
+            ToolCategory::Edit => self.edited += 1,
+            ToolCategory::Command => self.commands += 1,
+            ToolCategory::Other => {}
+        }
+    }
+
+    fn summary(&self) -> Option<String> {
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+
+        let parts: Vec<String> = [
+            (self.read, "Read", "file"),
+            (self.edited, "Edited", "file"),
+            (self.commands, "Ran", "command"),
+        ]
+        .into_iter()
+        .filter(|(n, ..)| *n > 0)
+        .map(|(n, verb, word)| format!("{verb} {}", plural(n, word)))
+        .collect();
+
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// Prints a command's full result in a bordered, line-prefixed block
+/// (┌─ / │ / └─) instead of a single truncated line, so multi-line output
+/// like build/test logs or a git diff is actually readable rather than
+/// just showing its first line.
+fn print_boxed_output(result: &str, is_error: bool) {
+    let border = |s: &str| if is_error { red(s) } else { cyan(s) };
+    let content = |s: &str| if is_error { red(s) } else { dim(s) };
+
+    println!("{}", border("┌─"));
+    for line in result.lines() {
+        println!("{} {}", border("│"), content(line));
+    }
+    println!("{}", border("└─"));
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -971,5 +1060,52 @@ async fn spin(waiting: Arc<AtomicBool>) {
             i += 1;
         }
         tokio::time::sleep(Duration::from_millis(90)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_category_classifies_every_built_in_tool() {
+        assert_eq!(tool_category("read_file"), ToolCategory::Read);
+        assert_eq!(tool_category("search_code"), ToolCategory::Read);
+        assert_eq!(tool_category("git"), ToolCategory::Read);
+        assert_eq!(tool_category("write_file"), ToolCategory::Edit);
+        assert_eq!(tool_category("append_file"), ToolCategory::Edit);
+        assert_eq!(tool_category("run_command"), ToolCategory::Command);
+        assert_eq!(tool_category("git_commit"), ToolCategory::Command);
+        assert_eq!(tool_category("something_unknown"), ToolCategory::Other);
+    }
+
+    #[test]
+    fn turn_counts_summary_omits_zero_categories_and_pluralizes() {
+        let mut counts = TurnCounts::default();
+        assert_eq!(counts.summary(), None);
+
+        counts.record("read_file");
+        assert_eq!(counts.summary().as_deref(), Some("Read 1 file"));
+
+        counts.record("edit_file");
+        assert_eq!(
+            counts.summary().as_deref(),
+            Some("Read 1 file · Edited 1 file")
+        );
+
+        counts.record("run_command");
+        counts.record("run_command");
+        assert_eq!(
+            counts.summary().as_deref(),
+            Some("Read 1 file · Edited 1 file · Ran 2 commands")
+        );
+    }
+
+    #[test]
+    fn turn_counts_ignores_uncategorized_tools() {
+        let mut counts = TurnCounts::default();
+        counts.record("outline_file");
+        counts.record("something_unknown");
+        assert_eq!(counts.summary().as_deref(), Some("Read 1 file"));
     }
 }
