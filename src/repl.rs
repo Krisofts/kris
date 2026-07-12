@@ -1100,45 +1100,67 @@ impl SharedTurnCounts {
     }
 }
 
-/// Prints a command's full result in a bordered, line-prefixed block
-/// (┌─ / │ / └─) instead of a single truncated line, so multi-line output
-/// like build/test logs or a git diff is actually readable rather than
-/// just showing its first line.
+/// Prints a command's full result in a closed box (╭─╮ / │ … │ / ╰─╯),
+/// the same border style as the startup banner, instead of a single
+/// truncated line - so multi-line output like build/test logs or a git
+/// diff is actually readable rather than just showing its first line.
 fn print_boxed_output(result: &str, is_error: bool) {
     let border = |s: &str| if is_error { red(s) } else { blue(s) };
     let content = |s: &str| if is_error { red(s) } else { dim(s) };
 
     // run_command's result always starts with "exit code: N" - pulled out
-    // of the body and shown on the closing border instead of as just
+    // of the body and shown as its own row inside the box instead of just
     // another line of output, colored by whether it actually succeeded
     // (independent of `is_error`, which only reflects whether the tool
     // call itself errored - a command that ran but exited non-zero is
     // still an Ok result). git/git_commit's plain output has no such
     // line, so this is a no-op for those.
     let (exit_code, body) = split_exit_code(result);
+    let exit_line = exit_code.map(|code| format!("exit code: {code}"));
 
-    // A line long enough to wrap would otherwise continue past the
-    // border with no "│" prefix on the wrapped part - clamping to the
-    // terminal width (same helper the spinner uses, for the same reason)
-    // keeps every line, and the border around it, intact.
-    let max_width = terminal_width().saturating_sub(2); // "│ " prefix
+    // A line long enough to wrap would otherwise continue past the right
+    // border with nothing to close it - clamping to the terminal width
+    // (same helper the spinner uses, for the same reason) keeps every
+    // line, and the border around it, intact. "│ " + " │" eats 4 columns.
+    let max_inner = terminal_width().saturating_sub(4).max(1);
 
-    println!("{}", border("┌─"));
-    for line in body.lines() {
+    let lines: Vec<String> = body
+        .lines()
+        .map(|line| truncate_to_width(line, max_inner))
+        .collect();
+
+    // Sized to the longest actual line - like the banner sizes itself to
+    // its title/subtitle - rather than always stretching to the full
+    // terminal width, so a short result doesn't get lost in an oversized
+    // box.
+    let inner_width = lines
+        .iter()
+        .chain(exit_line.iter())
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+
+    let rule = "─".repeat(inner_width + 2);
+    println!("{}", border(&format!("╭{rule}╮")));
+    for line in &lines {
         println!(
-            "{} {}",
+            "{} {} {}",
             border("│"),
-            content(&truncate_to_width(line, max_width))
+            content(&format!("{line:<inner_width$}")),
+            border("│")
         );
     }
-
-    match exit_code {
-        Some(code) if code == "0" => {
-            println!("{} {}", border("└─"), green(&format!("exit code: {code}")))
-        }
-        Some(code) => println!("{} {}", border("└─"), red(&format!("exit code: {code}"))),
-        None => println!("{}", border("└─")),
+    if let Some(line) = &exit_line {
+        let padded = format!("{line:<inner_width$}");
+        let colored = if exit_code == Some("0") {
+            green(&padded)
+        } else {
+            red(&padded)
+        };
+        println!("{} {} {}", border("│"), colored, border("│"));
     }
+    println!("{}", border(&format!("╰{rule}╯")));
 }
 
 /// Splits run_command's `"exit code: N\n<output>"` result shape into the
