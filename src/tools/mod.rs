@@ -25,6 +25,16 @@ use thiserror::Error;
 /// never seen.
 pub static AWAITING_CONFIRMATION: AtomicBool = AtomicBool::new(false);
 
+/// Set to true while `run_command`'s subprocess is actually executing
+/// (after the user has already confirmed it, if confirmation was needed) -
+/// distinct from `AWAITING_CONFIRMATION`, which only covers the y/N prompt
+/// itself. `run_command.execute()` runs synchronously on whatever thread is
+/// polling the agent's future, so on a multi-threaded runtime the REPL's
+/// "thinking..." spinner (its own tokio task, on another worker thread)
+/// would otherwise keep ticking the whole time too - two independent
+/// `\r`-redrawing loops racing over the same terminal line, garbling both.
+pub static COMMAND_RUNNING: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("IO error: {0}")]

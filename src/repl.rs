@@ -22,7 +22,7 @@ use crate::picker;
 use crate::server;
 use crate::style::{blue, bold, cyan, dim, green, red, yellow};
 use crate::term::{terminal_width, truncate_to_width};
-use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION};
+use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION, COMMAND_RUNNING};
 
 // Raised from 10/24/20: a multi-file task (scaffold a project, add a
 // feature, verify with clippy/tests) easily needs more tool calls than
@@ -1334,7 +1334,10 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
         // instead of redrawing over that prompt every 90ms, which would
         // hide it and make KRIS look stuck "thinking" forever while it's
         // actually just waiting on the user.
-        if waiting.load(Ordering::SeqCst) && !AWAITING_CONFIRMATION.load(Ordering::SeqCst) {
+        if waiting.load(Ordering::SeqCst)
+            && !AWAITING_CONFIRMATION.load(Ordering::SeqCst)
+            && !COMMAND_RUNNING.load(Ordering::SeqCst)
+        {
             let elapsed = started.elapsed().as_secs();
 
             // A visible running clock, not just a spinning glyph, so a

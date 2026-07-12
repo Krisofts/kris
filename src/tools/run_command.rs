@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::style::dim;
+use crate::style::{blue, dim};
+use crate::term::{terminal_width, truncate_to_width};
 
-use super::{Tool, ToolError, AWAITING_CONFIRMATION};
+use super::{Tool, ToolError, AWAITING_CONFIRMATION, COMMAND_RUNNING};
 
 const MAX_OUTPUT: usize = 4000;
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -63,9 +64,9 @@ impl Tool for RunCommandTool {
             AWAITING_CONFIRMATION.store(true, Ordering::SeqCst);
 
             print!("\r{}\r", " ".repeat(60));
-            println!("\n┌─ KRIS wants to run a command in {}:", root.display());
-            println!("│  {command}");
-            print!("└─ Run it? [y/N, or a = always for this session]: ");
+            println!();
+            print_confirmation_box(root, command);
+            print!("Run it? [y/N, or a = always for this session]: ");
             let _ = io::stdout().flush();
 
             let mut input = String::new();
@@ -104,6 +105,12 @@ impl Tool for RunCommandTool {
         let stdout_rx = spawn_reader(child.stdout.take());
         let stderr_rx = spawn_reader(child.stderr.take());
 
+        // Told to the REPL's own spinner task so it stops redrawing its
+        // "thinking..." line over this one while this blocks the thread
+        // polling the agent's future - see `COMMAND_RUNNING`'s own doc
+        // comment for why both would otherwise race over the same line.
+        COMMAND_RUNNING.store(true, Ordering::SeqCst);
+
         let start = Instant::now();
         let mut timed_out = false;
         let mut frame = 0usize;
@@ -136,6 +143,8 @@ impl Tool for RunCommandTool {
             }
         };
 
+        COMMAND_RUNNING.store(false, Ordering::SeqCst);
+
         // Clear the live status line - repl.rs prints its own "●"/boxed
         // result right after this returns, which shouldn't have to share
         // a line with a leftover spinner frame.
@@ -160,6 +169,33 @@ impl Tool for RunCommandTool {
 
         Ok(format!("exit code: {status}\n{combined}"))
     }
+}
+
+/// Closed box (╭─╮ / │ … │ / ╰─╯) around the command about to run - the
+/// same border style `print_boxed_output` in repl.rs uses for a command's
+/// result, so what's about to run and what it produced read as one
+/// consistent shape instead of two different box styles.
+fn print_confirmation_box(root: &Path, command: &str) {
+    let title = format!("KRIS wants to run a command in {}:", root.display());
+
+    let max_inner = terminal_width().saturating_sub(4).max(1);
+    let title_line = truncate_to_width(&title, max_inner);
+    let command_line = truncate_to_width(command, max_inner);
+
+    let inner_width = title_line
+        .chars()
+        .count()
+        .max(command_line.chars().count())
+        .max(1);
+    let rule = "─".repeat(inner_width + 2);
+
+    let title_padded = format!("{title_line:<inner_width$}");
+    let command_padded = dim(&format!("{command_line:<inner_width$}"));
+
+    println!("{}", blue(&format!("╭{rule}╮")));
+    println!("{} {} {}", blue("│"), title_padded, blue("│"));
+    println!("{} {} {}", blue("│"), command_padded, blue("│"));
+    println!("{}", blue(&format!("╰{rule}╯")));
 }
 
 fn spawn_reader<R>(pipe: Option<R>) -> mpsc::Receiver<String>
