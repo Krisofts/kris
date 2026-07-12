@@ -868,15 +868,24 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
     let history_len_before = session.history.len();
 
     if let Err(err) = run_turn(session, prompt, max_iterations).await {
-        // Restarting only makes sense for the local server; an online
-        // provider that drops a connection is a network/API issue a restart
-        // can't fix, so fall straight through to reporting it.
-        if looks_like_connection_error(&err) && session.settings.provider == Provider::Local {
+        if looks_like_connection_error(&err) {
+            let is_local = session.settings.provider == Provider::Local;
+
             println!();
             println!(
                 "{}",
-                yellow("Lost connection to llama-server - trying to restart it...")
+                yellow(if is_local {
+                    "Lost connection to llama-server - trying to restart it..."
+                } else {
+                    "Lost connection to the model - retrying..."
+                })
             );
+
+            // `ensure_running` manages a local llama-server; for an online
+            // provider it's a no-op check that an API key is still
+            // configured, since there's no local process to relaunch - a
+            // dropped connection there is just a network blip worth one
+            // retry.
             if server::ensure_running(&session.settings).await {
                 // Progress survived the disconnect (history grew past its
                 // pre-turn length) - nudge the model to pick up from there
@@ -892,6 +901,8 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
                 if let Err(err) = run_turn(session, resume_prompt, max_iterations).await {
                     print_turn_error(session, &err);
                 }
+            } else {
+                print_turn_error(session, &err);
             }
         } else {
             print_turn_error(session, &err);
@@ -901,7 +912,14 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
 
 fn looks_like_connection_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<reqwest::Error>()
-        .map(|err| err.is_connect() || err.is_timeout())
+        // `bytes_stream()` (what the SSE reader in client.rs polls) wraps
+        // every per-chunk read failure as `is_decode()`, even one caused by
+        // the connection dying partway through (reset, proxy hiccup) rather
+        // than any actual malformed data - confirmed on-device: a dropped
+        // OpenRouter stream surfaced this way without tripping
+        // `is_connect()`/`is_timeout()`, so it fell through to a dead end
+        // instead of being retried.
+        .map(|err| err.is_connect() || err.is_timeout() || err.is_decode())
         .unwrap_or(false)
 }
 
@@ -1533,6 +1551,45 @@ mod tests {
         counts.record("outline_file");
         counts.record("something_unknown");
         assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
+    }
+
+    #[tokio::test]
+    async fn looks_like_connection_error_treats_a_truncated_body_as_retryable() {
+        // Regression test: a stream that dies partway through (connection
+        // reset, proxy hiccup) surfaces as a reqwest "decode" error - that's
+        // just how `bytes_stream()` (what the SSE reader polls) labels every
+        // body-read failure, not necessarily a decoding/parsing problem -
+        // not a "connect" or "timeout" one. Confirmed on-device against
+        // OpenRouter, where this used to fall through to a dead end (no
+        // retry, no restart attempt) instead of being treated as the same
+        // kind of transient failure a dropped connection to llama-server is.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            // Promises far more body than it actually sends, then
+            // disappears - the same shape as an SSE stream that dies
+            // mid-response.
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nshort";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let err = reqwest::get(format!("http://{addr}"))
+            .await
+            .expect("connecting and reading headers should succeed")
+            .bytes()
+            .await
+            .expect_err("a body shorter than its own Content-Length should fail to read");
+
+        assert!(err.is_decode());
+        assert!(looks_like_connection_error(&err.into()));
     }
 
     #[test]

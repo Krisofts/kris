@@ -349,8 +349,18 @@ impl ModelClient {
         // (MessageStop) for the same reason - this brings the OpenAI-
         // compatible path (llama-server, Gemini, OpenRouter) in line with
         // it instead of trusting the transport to end things.
+        // This path is shared by llama-server, Gemini, and OpenRouter - a
+        // hardcoded "llama-server" here used to show up verbatim even when
+        // talking to an online provider, confusingly blaming the wrong
+        // backend for a dropped connection.
+        let source = if is_llama {
+            "llama-server"
+        } else {
+            "the model"
+        };
+
         'outer: while let Some(chunk) = byte_stream.next().await {
-            let chunk = chunk.context("reading stream chunk from llama-server")?;
+            let chunk = chunk.with_context(|| format!("reading stream chunk from {source}"))?;
             buffer.extend_from_slice(&chunk);
 
             for payload in drain_sse_events(&mut buffer) {
