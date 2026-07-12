@@ -957,7 +957,8 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
     let spinner_waiting = waiting.clone();
     let counts = Arc::new(SharedTurnCounts::default());
     let spinner_counts = counts.clone();
-    let spinner = tokio::spawn(spin(spinner_waiting, spinner_counts));
+    let is_local = session.settings.provider == Provider::Local;
+    let spinner = tokio::spawn(spin(spinner_waiting, spinner_counts, is_local));
 
     let history_len_before = session.history.len();
     let started = Instant::now();
@@ -1323,8 +1324,13 @@ fn spinner_verb(elapsed_secs: u64) -> &'static str {
 /// than exiting the moment `waiting` first goes false - `run_turn` flips
 /// it back to true after each tool call, so this needs to keep ticking
 /// and simply stay quiet in between, ready to resume drawing for the next
-/// wait instead of having already exited after the first one.
-async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
+/// wait instead of having already exited after the first one. `is_local`
+/// picks which long-wait note applies (see below) - a reasoning model
+/// routed through an online provider can easily spend over a minute on a
+/// hidden "thinking" trace before its first visible token, which isn't
+/// the same "may be stuck" situation a local llama-server sitting at
+/// max_tokens for that long usually is.
+async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>, is_local: bool) {
     const FRAMES: [&str; 10] = ["-", "\\", "|", "/", "-", "\\", "|", "/", "*", "+"];
     let mut i = 0;
     let started = Instant::now();
@@ -1351,14 +1357,19 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
             // padding with spaces, since this label's length changes as
             // the elapsed count grows.
             let verb = spinner_verb(elapsed);
-            let mut label = if elapsed >= 60 {
+            let mut label = if elapsed < 60 {
+                format!("{verb}... {elapsed}s")
+            } else if is_local {
                 format!(
-                    "{verb}... {elapsed}s (unusually long - if this is local/offline mode, \
-                     the model may be stuck in a repetitive generation loop; check \
-                     ~/llama-server.log, or try `config set max_tokens 256` to bound it)"
+                    "{verb}... {elapsed}s (taking a while - if the model seems stuck in a \
+                     repetitive loop, check ~/llama-server.log, or try `config set max_tokens \
+                     256` to bound it)"
                 )
             } else {
-                format!("{verb}... {elapsed}s")
+                format!(
+                    "{verb}... {elapsed}s (a reasoning model can take a while before its \
+                     first visible token - this is expected, not a hang)"
+                )
             };
 
             // Live "Read N files · Ran N commands" recap, like Claude Code
