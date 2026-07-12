@@ -1162,13 +1162,43 @@ fn format_tokens(tokens: usize) -> String {
     }
 }
 
+/// Human-friendly verb shown in the "● <label>(...)" tool-call header,
+/// in place of the raw snake_case tool name a model actually calls -
+/// consistent with the Read/Edited/Ran verbs the end-of-turn tally
+/// already uses. Falls back to the raw name for anything not listed here
+/// (a future tool that hasn't been given a label yet), so it never
+/// prints something misleadingly blank.
+fn friendly_tool_label(tool_name: &str) -> &str {
+    match tool_name {
+        "read_file" => "Read",
+        "list_directory" => "List",
+        "tree" => "Tree",
+        "find_files" => "Find",
+        "search_code" => "Search",
+        "write_file" => "Write",
+        "append_file" => "Append",
+        "edit_file" => "Edit",
+        "delete_file" | "delete_directory" => "Delete",
+        "move_file" => "Move",
+        "create_directory" => "Create",
+        "run_command" => "Run",
+        "git" => "Git",
+        "git_commit" => "Commit",
+        "outline_file" => "Outline",
+        "ask_question" => "Ask",
+        other => other,
+    }
+}
+
 fn format_tool_call(tool_name: &str, args: &Value) -> String {
+    let label = friendly_tool_label(tool_name);
+
     if tool_name == "move_file" {
         if let (Some(from), Some(to)) = (
             args.get("from").and_then(Value::as_str),
             args.get("to").and_then(Value::as_str),
         ) {
-            return format!("{tool_name}({from} -> {to})");
+            return format!("{label}({from} -> {to})");
         }
     }
 
@@ -1184,8 +1214,8 @@ fn format_tool_call(tool_name: &str, args: &Value) -> String {
     .find_map(|key| args.get(key).and_then(Value::as_str));
 
     match summary {
-        Some(summary) => format!("{tool_name}({summary})"),
-        None => format!("{tool_name}()"),
+        Some(summary) => format!("{label}({summary})"),
+        None => format!("{label}()"),
     }
 }
 
@@ -1330,6 +1360,58 @@ mod tests {
     #[test]
     fn completer_offers_nothing_for_an_unknown_prefix() {
         assert!(complete_at_end("zzz").is_empty());
+    }
+
+    #[test]
+    fn friendly_tool_label_covers_every_built_in_tool() {
+        assert_eq!(friendly_tool_label("read_file"), "Read");
+        assert_eq!(friendly_tool_label("write_file"), "Write");
+        assert_eq!(friendly_tool_label("append_file"), "Append");
+        assert_eq!(friendly_tool_label("edit_file"), "Edit");
+        assert_eq!(friendly_tool_label("delete_file"), "Delete");
+        assert_eq!(friendly_tool_label("delete_directory"), "Delete");
+        assert_eq!(friendly_tool_label("move_file"), "Move");
+        assert_eq!(friendly_tool_label("create_directory"), "Create");
+        assert_eq!(friendly_tool_label("run_command"), "Run");
+        assert_eq!(friendly_tool_label("git"), "Git");
+        assert_eq!(friendly_tool_label("git_commit"), "Commit");
+        assert_eq!(friendly_tool_label("outline_file"), "Outline");
+        assert_eq!(friendly_tool_label("ask_question"), "Ask");
+    }
+
+    #[test]
+    fn friendly_tool_label_falls_back_to_the_raw_name_for_anything_unlisted() {
+        assert_eq!(friendly_tool_label("some_future_tool"), "some_future_tool");
+    }
+
+    #[test]
+    fn format_tool_call_uses_the_friendly_label_with_its_argument() {
+        assert_eq!(
+            format_tool_call("read_file", &serde_json::json!({ "path": "a.rs" })),
+            "Read(a.rs)"
+        );
+        assert_eq!(
+            format_tool_call(
+                "run_command",
+                &serde_json::json!({ "command": "cargo test" })
+            ),
+            "Run(cargo test)"
+        );
+        assert_eq!(
+            format_tool_call("write_file", &serde_json::json!({})),
+            "Write()"
+        );
+    }
+
+    #[test]
+    fn format_tool_call_shows_move_file_as_a_friendly_arrow() {
+        assert_eq!(
+            format_tool_call(
+                "move_file",
+                &serde_json::json!({ "from": "a.rs", "to": "b.rs" })
+            ),
+            "Move(a.rs -> b.rs)"
+        );
     }
 
     #[test]
