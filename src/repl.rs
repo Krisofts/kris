@@ -1015,6 +1015,19 @@ fn print_turn_error(session: &Session, err: &anyhow::Error) {
     println!("{}", dim(&hint));
 }
 
+/// Heuristic token count for whatever's been added to `history` since
+/// `turn_start`, clamped so a `turn_start` captured before the turn began
+/// can't index past the end of `history` if it's since gotten *shorter*
+/// than that - `enforce_context_budget` can drain old turns from the
+/// front mid-turn on a long enough one, shifting every later index down.
+/// Confirmed on-device: without the clamp this panicked ("range start
+/// index out of range") and killed the whole process; clamping just
+/// under-reports this turn's token count as 0 in that specific case
+/// instead - a cosmetic footer, not worth losing the session over.
+fn tokens_since(history: &[Message], turn_start: usize) -> usize {
+    heuristic_tokens(&history[turn_start.min(history.len())..])
+}
+
 async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> Result<()> {
     let agent = session.agent();
     let root = session.root.clone();
@@ -1126,7 +1139,7 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
         // message), so doing it again would just duplicate the output.
         Ok(_answer) => {
             let elapsed = started.elapsed();
-            let tokens = heuristic_tokens(&session.history[history_len_before..]);
+            let tokens = tokens_since(&session.history, history_len_before);
             // Whole conversation so far, not just this turn's share of it -
             // a rough heuristic (same chars/4 estimate used elsewhere as a
             // fallback), but good enough to warn before the "older
@@ -1707,6 +1720,28 @@ mod tests {
     #[test]
     fn format_context_usage_handles_a_zero_budget_without_dividing_by_it() {
         assert_eq!(format_context_usage(100, 0), "context: unknown");
+    }
+
+    #[test]
+    fn tokens_since_clamps_a_stale_turn_start_instead_of_panicking() {
+        // Regression test: mid-turn context trimming (enforce_context_budget)
+        // drains old turns from the *front* of history, shifting every
+        // later index down - a `turn_start` captured before that trim can
+        // end up pointing past the end of the now-shorter history, which
+        // used to panic with "range start index out of range" and take
+        // the whole process down with it.
+        let history = vec![Message::user("hi")];
+        assert_eq!(tokens_since(&history, 5), 0);
+    }
+
+    #[test]
+    fn tokens_since_counts_normally_when_turn_start_is_in_range() {
+        let history = vec![
+            Message::user("hi"),
+            Message::assistant_text("hello there, how can I help?".to_string()),
+        ];
+        assert_eq!(tokens_since(&history, 1), heuristic_tokens(&history[1..]));
+        assert!(tokens_since(&history, 1) > 0);
     }
 
     #[tokio::test]
