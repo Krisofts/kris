@@ -174,7 +174,7 @@ Configuration (all optional, saved to `config.toml`):
 | Key                    | Default                         | Meaning                                     |
 | ---------------------- | -------------------------------- | -------------------------------------------- |
 | `provider`             | `local`                          | `local`, `gemini`, `claude`, `openrouter`, or `opper` |
-| `opper_model`          | `anthropic/claude-sonnet-5`       | model id used, e.g. `mistral/mistral-large-latest` |
+| `opper_model`          | `anthropic/claude-haiku-4-5`      | model id used, e.g. `mistral/mistral-large-latest` - defaults to the cheapest confirmed model since Opper has no dedicated free tier model |
 | `opper_api_key`        | *(empty)*                        | fallback if `OPPER_API_KEY` isn't set        |
 | `opper_context_size`   | `128000`                         | history-trim budget in Opper mode            |
 | `opper_url`            | `https://api.opper.ai/v3/compat` | OpenAI-compatible base URL                   |

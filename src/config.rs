@@ -198,7 +198,12 @@ impl Default for Settings {
             openrouter_context_size: 128_000,
             openrouter_reasoning_effort: String::new(),
             opper_url: "https://api.opper.ai/v3/compat".to_string(),
-            opper_model: "anthropic/claude-sonnet-5".to_string(),
+            // Opper has no dedicated free-tier model (unlike OpenRouter's
+            // `:free`-suffixed ones) - every model is billed against the
+            // account's credit, free or paid. Haiku 4.5 is the cheapest one
+            // confirmed via Opper's own pricing page, so it goes furthest
+            // on a new account's free starter credit.
+            opper_model: "anthropic/claude-haiku-4-5".to_string(),
             opper_api_key: String::new(),
             opper_context_size: 128_000,
             workspace: home.join("projects").display().to_string(),
