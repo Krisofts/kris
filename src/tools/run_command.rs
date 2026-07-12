@@ -9,10 +9,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::style::dim;
+
 use super::{Tool, ToolError, AWAITING_CONFIRMATION};
 
 const MAX_OUTPUT: usize = 4000;
 const TIMEOUT: Duration = Duration::from_secs(120);
+const SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
 
 pub struct RunCommandTool {
     auto_approve: Cell<bool>,
@@ -103,7 +106,13 @@ impl Tool for RunCommandTool {
 
         let start = Instant::now();
         let mut timed_out = false;
+        let mut frame = 0usize;
 
+        // KRIS's own "thinking..." spinner only covers waiting for the
+        // *model*, not this - a slow command (confirmed on-device: `cargo
+        // build` pulling dependencies) otherwise leaves the screen
+        // completely still, with no way to tell it from a genuine hang,
+        // for however long it takes to finish or hit the timeout below.
         let status_code = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.code(),
@@ -114,11 +123,24 @@ impl Tool for RunCommandTool {
                         timed_out = true;
                         break None;
                     }
+                    print!(
+                        "\r\x1b[K{} {}",
+                        dim(SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]),
+                        dim(&format!("running... {}s", start.elapsed().as_secs()))
+                    );
+                    let _ = io::stdout().flush();
+                    frame += 1;
                     thread::sleep(Duration::from_millis(150));
                 }
                 Err(_) => break None,
             }
         };
+
+        // Clear the live status line - repl.rs prints its own "●"/boxed
+        // result right after this returns, which shouldn't have to share
+        // a line with a leftover spinner frame.
+        print!("\r\x1b[K");
+        let _ = io::stdout().flush();
 
         let mut combined = stdout_rx.recv().unwrap_or_default();
         combined.push_str(&stderr_rx.recv().unwrap_or_default());
