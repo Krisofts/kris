@@ -675,6 +675,53 @@ async fn done_marker_ends_the_stream_even_if_the_connection_stays_open() {
 }
 
 #[tokio::test]
+async fn a_stream_that_goes_silent_times_out_instead_of_hanging_forever() {
+    // Regression test for an on-device symptom: a large local model
+    // decoding slowly on a phone CPU could still be making steady
+    // progress well past any reasonable "this looks stuck" cutoff - a
+    // blanket whole-request timeout used to kill it regardless, which got
+    // misread as a dropped connection and auto-retried, sending a fresh
+    // request that hit the exact same wall - visible in llama-server's own
+    // log as one cancelled task after another, forever. There must still
+    // be *some* bound, though, for a connection that goes genuinely silent
+    // (no bytes at all) rather than just slow - confirmed here with a
+    // short inactivity timeout so the test itself doesn't have to wait out
+    // the real, deliberately generous production value.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request_headers(&mut stream).await;
+
+        // Sends a real chunk (so the client knows the request succeeded
+        // and starts reading the stream), then goes completely silent -
+        // no more bytes, no close - standing in for a response that's
+        // still "in progress" from the connection's point of view but has
+        // stopped producing anything at all.
+        let body =
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"star\"}}]}\n\n";
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}");
+        let _ = stream.write_all(response.as_bytes()).await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
+    });
+
+    let base_url = format!("http://{addr}");
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None)
+        .with_stream_inactivity_timeout(Duration::from_millis(200));
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}, |_| {}),
+    )
+    .await
+    .expect("a genuinely silent stream should time out well before the test's own 5s bound")
+    .expect_err("a silent stream should surface as an error, not a successful empty reply");
+
+    assert!(err.to_string().contains("no response"));
+}
+
+#[tokio::test]
 async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
     // Regression test: previously, when the model never produced a final
     // answer within max_iterations, the "reached the maximum" notice was

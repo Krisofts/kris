@@ -30,6 +30,15 @@ pub enum Backend {
 /// Anthropic API version pinned in the required `anthropic-version` header.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// How long a streaming response is allowed to go with *no new bytes at
+/// all* before it's treated as genuinely stalled, rather than just slow.
+/// Generous on purpose: a large local model on a phone CPU can take a
+/// while between tokens without actually being stuck, and every new byte
+/// that arrives resets this - it only fires on true silence, unlike a
+/// blanket whole-request timeout that would also kill a stream making
+/// perfectly steady (if slow) progress.
+const STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Talks to an OpenAI-compatible chat-completions endpoint - either a local
 /// `llama-server` over plain HTTP (fully offline), or a remote provider like
 /// Gemini over HTTPS. The `backend` decides which endpoint-specific request
@@ -48,6 +57,12 @@ pub struct ModelClient {
     /// writing a visible answer or tool call - capping effort here leaves
     /// more of that budget for the actual response.
     reasoning_effort: Option<String>,
+    /// How long a streaming response can go with no new bytes at all
+    /// before it's treated as stalled - see `STREAM_INACTIVITY_TIMEOUT`,
+    /// which this defaults to. Only ever overridden in tests, to avoid an
+    /// automated test actually waiting out the real (deliberately
+    /// generous) production value.
+    stream_inactivity_timeout: Duration,
 }
 
 #[derive(Serialize)]
@@ -204,8 +219,22 @@ impl ModelClient {
         backend: Backend,
         api_key: Option<String>,
     ) -> Self {
+        // Deliberately no blanket `.timeout()` here - reqwest's applies to
+        // the *entire* request lifetime including streaming the response
+        // body, which used to kill a request outright once it ran past
+        // that long regardless of whether it was still making steady
+        // progress. Confirmed on-device: a 7B model generating on a phone
+        // CPU can easily need more than 10 minutes for a full response,
+        // and hitting this wall mid-stream got misread as a dropped
+        // connection - triggering the auto-retry, which sent a fresh
+        // request that then hit the exact same wall, over and over,
+        // visible in llama-server's own log as one cancelled task after
+        // another. `connect_timeout` still bounds the one phase that
+        // legitimately should be quick (establishing the TCP connection);
+        // an actually-stalled stream (no bytes at all for a while) is
+        // caught separately, per-chunk, in the read loop below instead.
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .connect_timeout(Duration::from_secs(15))
             .build()
             .unwrap_or_default();
 
@@ -216,6 +245,7 @@ impl ModelClient {
             backend,
             api_key,
             reasoning_effort: None,
+            stream_inactivity_timeout: STREAM_INACTIVITY_TIMEOUT,
         }
     }
 
@@ -225,6 +255,15 @@ impl ModelClient {
     /// since only `server::client_for`'s OpenRouter branch calls this).
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    /// Overrides how long a streaming response can sit with no new bytes
+    /// at all before it's treated as stalled - only ever used by tests, to
+    /// avoid actually waiting out the real (deliberately generous)
+    /// `STREAM_INACTIVITY_TIMEOUT` default.
+    pub fn with_stream_inactivity_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_inactivity_timeout = timeout;
         self
     }
 
@@ -375,8 +414,27 @@ impl ModelClient {
             "the model"
         };
 
-        'outer: while let Some(chunk) = byte_stream.next().await {
-            let chunk = chunk.with_context(|| format!("reading stream chunk from {source}"))?;
+        'outer: loop {
+            // Times out on total silence, not on how long the whole
+            // response takes - a slow-but-still-arriving stream (a big
+            // local model decoding slowly on a phone CPU) keeps resetting
+            // this every time a chunk arrives, however long the response
+            // as a whole ends up taking.
+            let chunk = match tokio::time::timeout(
+                self.stream_inactivity_timeout,
+                byte_stream.next(),
+            )
+            .await
+            {
+                Ok(Some(chunk)) => {
+                    chunk.with_context(|| format!("reading stream chunk from {source}"))?
+                }
+                Ok(None) => break 'outer,
+                Err(_) => anyhow::bail!(
+                    "no response from {source} for over {}s - it may be stuck",
+                    self.stream_inactivity_timeout.as_secs()
+                ),
+            };
             buffer.extend_from_slice(&chunk);
 
             for payload in drain_sse_events(&mut buffer) {
@@ -557,8 +615,23 @@ impl ModelClient {
         let mut prompt_tokens = None;
         let mut stream_error: Option<String> = None;
 
-        'outer: while let Some(chunk) = byte_stream.next().await {
-            let chunk = chunk.context("reading stream chunk from Claude")?;
+        'outer: loop {
+            // See the OpenAI-compatible path's own comment on this same
+            // pattern: times out on total silence, not on how long the
+            // whole response takes.
+            let chunk = match tokio::time::timeout(
+                self.stream_inactivity_timeout,
+                byte_stream.next(),
+            )
+            .await
+            {
+                Ok(Some(chunk)) => chunk.context("reading stream chunk from Claude")?,
+                Ok(None) => break 'outer,
+                Err(_) => anyhow::bail!(
+                    "no response from Claude for over {}s - it may be stuck",
+                    self.stream_inactivity_timeout.as_secs()
+                ),
+            };
             buffer.extend_from_slice(&chunk);
 
             for payload in drain_sse_events(&mut buffer) {
