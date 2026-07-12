@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 /// Which backend serves the model: a local `llama-server` (fully offline),
 /// an online OpenAI-compatible API (Gemini's compatibility endpoint,
-/// OpenRouter's, or Opper's), or Claude's native Messages API.
+/// OpenRouter's, Opper's, or OpenCode Zen's), or Claude's native Messages
+/// API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -15,6 +16,7 @@ pub enum Provider {
     Claude,
     OpenRouter,
     Opper,
+    Opencode,
 }
 
 impl Provider {
@@ -25,6 +27,7 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::OpenRouter => "openrouter",
             Provider::Opper => "opper",
+            Provider::Opencode => "opencode",
         }
     }
 
@@ -32,8 +35,8 @@ impl Provider {
     /// aliases the `mode` command speaks, so `config set provider online`
     /// and `mode online` land on the same value. "online" stays mapped to
     /// Gemini specifically (its long-standing meaning here) - Claude,
-    /// OpenRouter, and Opper are only ever selected by their own name(s),
-    /// not the generic alias.
+    /// OpenRouter, Opper, and OpenCode Zen are only ever selected by their
+    /// own name(s), not the generic alias.
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "local" | "offline" | "llama" => Some(Provider::Local),
@@ -41,6 +44,7 @@ impl Provider {
             "claude" | "anthropic" => Some(Provider::Claude),
             "openrouter" | "or" => Some(Provider::OpenRouter),
             "opper" => Some(Provider::Opper),
+            "opencode" | "zen" => Some(Provider::Opencode),
             _ => None,
         }
     }
@@ -133,6 +137,22 @@ pub struct Settings {
     /// reason as `gemini_context_size` - it varies a lot by whichever
     /// model is selected behind it.
     pub opper_context_size: u32,
+    /// OpenAI-compatible base URL for OpenCode Zen (opencode.ai's own
+    /// hosted model gateway, separate from the OpenCode CLI itself), which
+    /// includes a rotating handful of free models alongside paid ones.
+    pub opencode_url: String,
+    /// Model id sent in OpenCode Zen requests, e.g. `big-pickle` or
+    /// `claude-sonnet-5` - see <https://opencode.ai/docs/zen/> for the
+    /// current list (free models come and go with limited-time offers).
+    pub opencode_model: String,
+    /// API key for OpenCode Zen. Left empty by default: the
+    /// `OPENCODE_API_KEY` environment variable is preferred and checked
+    /// first, so the key need not be written to disk in plain text at all.
+    pub opencode_api_key: String,
+    /// Context-window budget for OpenCode Zen, tracked separately for the
+    /// same reason as `gemini_context_size` - it varies a lot by whichever
+    /// model is selected behind it.
+    pub opencode_context_size: u32,
     /// Parent folder holding every project - what the `project` command
     /// lists and picks from. Every project lives as a direct subfolder of
     /// this one; there is no separate single-project directory anymore.
@@ -206,6 +226,14 @@ impl Default for Settings {
             opper_model: "anthropic/claude-haiku-4-5".to_string(),
             opper_api_key: String::new(),
             opper_context_size: 128_000,
+            opencode_url: "https://opencode.ai/zen/v1".to_string(),
+            // "big-pickle" is one of OpenCode Zen's free-for-a-limited-time
+            // models (confirmed via its docs) - unlike Opper, Zen actually
+            // has models priced at $0, so this can default to a genuinely
+            // free one rather than just the cheapest paid option.
+            opencode_model: "big-pickle".to_string(),
+            opencode_api_key: String::new(),
+            opencode_context_size: 128_000,
             workspace: home.join("projects").display().to_string(),
             active_project: String::new(),
             bypass_permissions: false,
@@ -340,6 +368,16 @@ impl Settings {
                 }
                 self.opper_context_size = parsed;
             }
+            "opencode_url" => self.opencode_url = value.to_string(),
+            "opencode_model" => self.opencode_model = value.to_string(),
+            "opencode_api_key" => self.opencode_api_key = value.to_string(),
+            "opencode_context_size" => {
+                let parsed: u32 = value.parse().context("expected an integer")?;
+                if parsed == 0 {
+                    anyhow::bail!("opencode_context_size must be greater than 0");
+                }
+                self.opencode_context_size = parsed;
+            }
             "model_path" => self.model_path = value.to_string(),
             "llama_server_path" => self.llama_server_path = value.to_string(),
             "llama_url" => self.llama_url = value.to_string(),
@@ -418,6 +456,7 @@ impl Settings {
             Provider::Claude => ("ANTHROPIC_API_KEY", &self.claude_api_key),
             Provider::OpenRouter => ("OPENROUTER_API_KEY", &self.openrouter_api_key),
             Provider::Opper => ("OPPER_API_KEY", &self.opper_api_key),
+            Provider::Opencode => ("OPENCODE_API_KEY", &self.opencode_api_key),
         };
 
         if let Ok(key) = std::env::var(env_var) {
@@ -439,6 +478,7 @@ impl Settings {
             Provider::Claude => self.claude_context_size,
             Provider::OpenRouter => self.openrouter_context_size,
             Provider::Opper => self.opper_context_size,
+            Provider::Opencode => self.opencode_context_size,
         }
     }
 
@@ -487,6 +527,14 @@ impl Settings {
             warnings.push(
                 "Opper mode (provider = opper) is selected but no API key is set - export \
                  OPPER_API_KEY, or run `config set opper_api_key <key>`."
+                    .to_string(),
+            );
+        }
+
+        if self.provider == Provider::Opencode && self.resolved_api_key().is_none() {
+            warnings.push(
+                "OpenCode Zen mode (provider = opencode) is selected but no API key is set - \
+                 export OPENCODE_API_KEY, or run `config set opencode_api_key <key>`."
                     .to_string(),
             );
         }
@@ -580,6 +628,18 @@ fn toml_render_inner(settings: &Settings, redact: bool) -> String {
     out.push_str(&format!(
         "opper_context_size = {}\n",
         settings.opper_context_size
+    ));
+    out.push_str(&format!("opencode_url = {:?}\n", settings.opencode_url));
+    out.push_str(&format!("opencode_model = {:?}\n", settings.opencode_model));
+    let opencode_api_key = if redact && !settings.opencode_api_key.is_empty() {
+        "***".to_string()
+    } else {
+        settings.opencode_api_key.clone()
+    };
+    out.push_str(&format!("opencode_api_key = {opencode_api_key:?}\n"));
+    out.push_str(&format!(
+        "opencode_context_size = {}\n",
+        settings.opencode_context_size
     ));
     out.push_str(&format!("workspace = {:?}\n", settings.workspace));
     out.push_str(&format!("active_project = {:?}\n", settings.active_project));
@@ -682,6 +742,10 @@ mod tests {
         assert_eq!(settings.provider, Provider::OpenRouter);
         settings.set_field("provider", "opper").unwrap();
         assert_eq!(settings.provider, Provider::Opper);
+        settings.set_field("provider", "opencode").unwrap();
+        assert_eq!(settings.provider, Provider::Opencode);
+        settings.set_field("provider", "zen").unwrap();
+        assert_eq!(settings.provider, Provider::Opencode);
 
         assert!(settings.set_field("provider", "nonsense").is_err());
     }
@@ -709,6 +773,7 @@ mod tests {
             claude_context_size: 200_000,
             openrouter_context_size: 64_000,
             opper_context_size: 32_000,
+            opencode_context_size: 16_000,
             ..Settings::default()
         };
         assert_eq!(settings.effective_context_size(), 8192);
@@ -720,6 +785,8 @@ mod tests {
         assert_eq!(settings.effective_context_size(), 64_000);
         settings.provider = Provider::Opper;
         assert_eq!(settings.effective_context_size(), 32_000);
+        settings.provider = Provider::Opencode;
+        assert_eq!(settings.effective_context_size(), 16_000);
     }
 
     #[test]
@@ -815,6 +882,21 @@ mod tests {
     }
 
     #[test]
+    fn opencode_fields_round_trip() {
+        let settings = Settings {
+            provider: Provider::Opencode,
+            opencode_model: "big-pickle".to_string(),
+            opencode_context_size: 64_000,
+            ..Settings::default()
+        };
+
+        let parsed = toml_parse(&toml_render(&settings)).unwrap();
+        assert_eq!(parsed.provider, Provider::Opencode);
+        assert_eq!(parsed.opencode_model, "big-pickle");
+        assert_eq!(parsed.opencode_context_size, 64_000);
+    }
+
+    #[test]
     fn openrouter_reasoning_effort_round_trips_and_validates() {
         let mut settings = Settings::default();
         assert_eq!(settings.openrouter_reasoning_effort, "");
@@ -849,6 +931,7 @@ mod tests {
             claude_api_key: "another-secret".to_string(),
             openrouter_api_key: "yet-another-secret".to_string(),
             opper_api_key: "opper-secret".to_string(),
+            opencode_api_key: "opencode-secret".to_string(),
             ..Settings::default()
         };
 
@@ -857,16 +940,19 @@ mod tests {
         assert!(shown.contains("claude_api_key = \"***\""));
         assert!(shown.contains("openrouter_api_key = \"***\""));
         assert!(shown.contains("opper_api_key = \"***\""));
+        assert!(shown.contains("opencode_api_key = \"***\""));
         assert!(!shown.contains("secret-key-value"));
         assert!(!shown.contains("another-secret"));
         assert!(!shown.contains("yet-another-secret"));
         assert!(!shown.contains("opper-secret"));
+        assert!(!shown.contains("opencode-secret"));
 
         // The on-disk form (what save writes) must keep the real value.
         assert!(toml_render(&settings).contains("secret-key-value"));
         assert!(toml_render(&settings).contains("another-secret"));
         assert!(toml_render(&settings).contains("yet-another-secret"));
         assert!(toml_render(&settings).contains("opper-secret"));
+        assert!(toml_render(&settings).contains("opencode-secret"));
     }
 
     #[test]

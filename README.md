@@ -9,13 +9,13 @@ Linux/macOS box with llama.cpp installed.
 
 It can also run **online**, sending the same conversation to a cloud model
 through Google's Gemini API, Anthropic's Claude API, or a multi-model
-gateway like OpenRouter or Opper (each fronts many different providers'
-models behind one API and key) instead — useful when you want a stronger
-model than the phone can host, or when you don't have llama.cpp set up.
-Either way the tools (file edits, `run_command`, git, …) still run locally
-on your machine; only the model's "thinking" moves to the cloud. Switch at
-any time with `mode offline` / `mode online` / `mode claude` /
-`mode openrouter` / `mode opper`.
+gateway like OpenRouter, Opper, or OpenCode Zen (each fronts many different
+providers' models behind one API and key) instead — useful when you want a
+stronger model than the phone can host, or when you don't have llama.cpp
+set up. Either way the tools (file edits, `run_command`, git, …) still run
+locally on your machine; only the model's "thinking" moves to the cloud.
+Switch at any time with `mode offline` / `mode online` / `mode claude` /
+`mode openrouter` / `mode opper` / `mode opencode`.
 
 ## What it does
 
@@ -43,10 +43,10 @@ cargo build --release
 
 The binary is `target/release/kris`.
 
-## Online mode (Gemini / Claude / OpenRouter / Opper)
+## Online mode (Gemini / Claude / OpenRouter / Opper / OpenCode Zen)
 
 > **Never put an API key in source code, a commit, or anywhere inside this
-> repo.** All four online providers below read their key from an environment
+> repo.** All five online providers below read their key from an environment
 > variable first, specifically so it never has to touch disk in plain text
 > as part of a config file you might accidentally commit. If a key is ever
 > pasted somewhere it could be logged or shared (a chat, an issue, a
@@ -73,7 +73,7 @@ Configuration (all optional, saved to `config.toml`):
 
 | Key                   | Default                            | Meaning                                     |
 | --------------------- | ---------------------------------- | -------------------------------------------- |
-| `provider`            | `local`                            | `local` (offline), `gemini` (online), `claude`, `openrouter`, or `opper` |
+| `provider`            | `local`                            | `local` (offline), `gemini` (online), `claude`, `openrouter`, `opper`, or `opencode` |
 | `gemini_model`        | `gemini-2.5-flash`                 | model id used online                        |
 | `gemini_api_key`      | *(empty)*                          | fallback if `GEMINI_API_KEY` isn't set      |
 | `gemini_context_size` | `128000`                           | history-trim budget in online mode          |
@@ -108,7 +108,7 @@ Configuration (all optional, saved to `config.toml`):
 
 | Key                   | Default                     | Meaning                                   |
 | ---------------------- | --------------------------- | ----------------------------------------- |
-| `provider`             | `local`                     | `local`, `gemini`, `claude`, `openrouter`, or `opper` |
+| `provider`             | `local`                     | `local`, `gemini`, `claude`, `openrouter`, `opper`, or `opencode` |
 | `claude_model`         | `claude-sonnet-5`           | model id used, e.g. `claude-opus-4-8`     |
 | `claude_api_key`       | *(empty)*                   | fallback if `ANTHROPIC_API_KEY` isn't set |
 | `claude_context_size`  | `200000`                    | history-trim budget in Claude mode        |
@@ -140,7 +140,7 @@ Configuration (all optional, saved to `config.toml`):
 
 | Key                        | Default                         | Meaning                                     |
 | -------------------------- | -------------------------------- | -------------------------------------------- |
-| `provider`                 | `local`                          | `local`, `gemini`, `claude`, `openrouter`, or `opper` |
+| `provider`                 | `local`                          | `local`, `gemini`, `claude`, `openrouter`, `opper`, or `opencode` |
 | `openrouter_model`         | `openai/gpt-5`                   | model id used, e.g. `anthropic/claude-sonnet-5` |
 | `openrouter_api_key`       | *(empty)*                        | fallback if `OPENROUTER_API_KEY` isn't set  |
 | `openrouter_context_size`  | `128000`                         | history-trim budget in OpenRouter mode       |
@@ -173,13 +173,46 @@ Configuration (all optional, saved to `config.toml`):
 
 | Key                    | Default                         | Meaning                                     |
 | ---------------------- | -------------------------------- | -------------------------------------------- |
-| `provider`             | `local`                          | `local`, `gemini`, `claude`, `openrouter`, or `opper` |
+| `provider`             | `local`                          | `local`, `gemini`, `claude`, `openrouter`, `opper`, or `opencode` |
 | `opper_model`          | `anthropic/claude-haiku-4-5`      | model id used, e.g. `mistral/mistral-large-latest` - defaults to the cheapest confirmed model since Opper has no dedicated free tier model |
 | `opper_api_key`        | *(empty)*                        | fallback if `OPPER_API_KEY` isn't set        |
 | `opper_context_size`   | `128000`                         | history-trim budget in Opper mode            |
 | `opper_url`            | `https://api.opper.ai/v3/compat` | OpenAI-compatible base URL                   |
 
 Set any of these with e.g. `config set opper_model mistral/mistral-large-latest`.
+Same masking behavior as the other providers: the `config` command never
+prints the real key.
+
+### OpenCode Zen
+
+KRIS can also talk to [OpenCode Zen](https://opencode.ai/docs/zen/), a
+hosted model gateway from the OpenCode project (a separate CLI coding
+agent - Zen is just its model API, not that CLI) that includes a rotating
+handful of genuinely free models alongside paid ones. Get an API key from
+Zen's dashboard, then:
+
+```
+export OPENCODE_API_KEY=your-key-here     # preferred: never written to disk
+```
+
+In the REPL:
+
+```
+mode opencode        # switch to OpenCode Zen
+mode offline         # switch back to local llama.cpp
+```
+
+Configuration (all optional, saved to `config.toml`):
+
+| Key                       | Default                     | Meaning                                     |
+| ------------------------- | ---------------------------- | -------------------------------------------- |
+| `provider`                | `local`                      | `local`, `gemini`, `claude`, `openrouter`, `opper`, or `opencode` |
+| `opencode_model`          | `big-pickle`                 | model id used - a free-for-a-limited-time model; see Zen's docs for the current list |
+| `opencode_api_key`        | *(empty)*                    | fallback if `OPENCODE_API_KEY` isn't set     |
+| `opencode_context_size`   | `128000`                     | history-trim budget in OpenCode Zen mode     |
+| `opencode_url`            | `https://opencode.ai/zen/v1` | OpenAI-compatible base URL                   |
+
+Set any of these with e.g. `config set opencode_model claude-sonnet-5`.
 Same masking behavior as the other providers: the `config` command never
 prints the real key.
 

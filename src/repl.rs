@@ -490,15 +490,16 @@ fn describe_mode(settings: &Settings) -> (&'static str, String) {
         Provider::Claude => ("claude", settings.claude_model.clone()),
         Provider::OpenRouter => ("openrouter", settings.openrouter_model.clone()),
         Provider::Opper => ("opper", settings.opper_model.clone()),
+        Provider::Opencode => ("opencode", settings.opencode_model.clone()),
     }
 }
 
 /// Switches between offline (local llama-server) and an online provider
-/// (Gemini, Claude, OpenRouter, or Opper) at runtime. Clears the
+/// (Gemini, Claude, OpenRouter, Opper, or OpenCode Zen) at runtime. Clears the
 /// conversation, since backends don't share a KV cache and a history
 /// built against one model is best restarted on another. Accepts
 /// `offline`/`local`, `online`/`gemini`, `claude`/`anthropic`,
-/// `openrouter`/`or`, and `opper`.
+/// `openrouter`/`or`, `opper`, and `opencode`/`zen`.
 fn handle_mode(session: &mut Session, arg: &str) {
     if arg.is_empty() {
         let (mode, model) = describe_mode(&session.settings);
@@ -508,6 +509,7 @@ fn handle_mode(session: &mut Session, arg: &str) {
         println!("       mode claude     use the Claude API");
         println!("       mode openrouter use the OpenRouter API");
         println!("       mode opper      use the Opper API");
+        println!("       mode opencode   use the OpenCode Zen API");
         return;
     }
 
@@ -595,6 +597,23 @@ fn handle_mode(session: &mut Session, arg: &str) {
                     "{}",
                     yellow(
                         "No API key set - export OPPER_API_KEY, or `config set opper_api_key <key>`."
+                    )
+                );
+            }
+        }
+        Provider::Opencode => {
+            println!(
+                "{}",
+                green(&format!(
+                    "Switched to OpenCode Zen mode ({}).",
+                    session.settings.opencode_model
+                ))
+            );
+            if session.settings.resolved_api_key().is_none() {
+                println!(
+                    "{}",
+                    yellow(
+                        "No API key set - export OPENCODE_API_KEY, or `config set opencode_api_key <key>`."
                     )
                 );
             }
@@ -842,7 +861,7 @@ fn print_help() {
     println!("  review [notes]        review pending changes (git diff) for correctness bugs and simplification");
     println!("  security-review [notes] review pending changes (git diff) for security issues");
     println!(
-        "  mode [offline|online|claude|openrouter|opper] show/switch between local llama.cpp, Gemini, Claude, OpenRouter, and Opper"
+        "  mode [offline|online|claude|openrouter|opper|opencode] show/switch between local llama.cpp, Gemini, Claude, OpenRouter, Opper, and OpenCode Zen"
     );
     println!("  health                check whether the active backend is reachable");
     println!(
@@ -987,6 +1006,10 @@ fn print_turn_error(session: &Session, err: &anyhow::Error) {
         Provider::Opper => format!(
             "Check your network connection and that OPPER_API_KEY is valid (model {}).",
             session.settings.opper_model
+        ),
+        Provider::Opencode => format!(
+            "Check your network connection and that OPENCODE_API_KEY is valid (model {}).",
+            session.settings.opencode_model
         ),
     };
     println!("{}", dim(&hint));
