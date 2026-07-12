@@ -24,12 +24,14 @@ use crate::style::{blue, bold, cyan, dim, green, red, yellow};
 use crate::term::{terminal_width, truncate_to_width};
 use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION};
 
-// Raised from 10/24: a multi-file task (scaffold a project, add a feature,
-// verify with clippy/tests) easily needs more tool calls than that,
-// especially now that append_file encourages building a long new file as
-// several small chunks rather than one big write_file - each chunk is its
-// own iteration.
-const DEFAULT_MAX_ITERATIONS: u32 = 20;
+// Raised from 10/24/20: a multi-file task (scaffold a project, add a
+// feature, verify with clippy/tests) easily needs more tool calls than
+// that, especially now that append_file encourages building a long new
+// file as several small chunks rather than one big write_file - each
+// chunk is its own iteration. Confirmed on-device: a full-stack scaffold
+// (frontend + backend + curl smoke tests) ran past 20 well before it had
+// a final answer.
+const DEFAULT_MAX_ITERATIONS: u32 = 40;
 const FIX_MIN_ITERATIONS: u32 = 40;
 
 const MODEL_PRESETS: &[(&str, &str)] = &[
@@ -857,9 +859,14 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
 
     println!();
 
-    // `run_turn` rolls a failed turn back out of `session.history` before
-    // returning its error, so retrying with the exact same prompt here is
-    // safe - it won't leave a duplicated or dangling user message behind.
+    // If the failed request happens before any progress this turn, `run`
+    // rolls its dangling user message back out of `session.history`, so
+    // retrying with the exact same prompt is safe - it won't leave a
+    // duplicated message behind. If it happens after some tool calls
+    // already completed, `run` keeps them instead - recorded here so the
+    // retry can tell which case it's in.
+    let history_len_before = session.history.len();
+
     if let Err(err) = run_turn(session, prompt, max_iterations).await {
         // Restarting only makes sense for the local server; an online
         // provider that drops a connection is a network/API issue a restart
@@ -871,7 +878,18 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
                 yellow("Lost connection to llama-server - trying to restart it...")
             );
             if server::ensure_running(&session.settings).await {
-                if let Err(err) = run_turn(session, prompt, max_iterations).await {
+                // Progress survived the disconnect (history grew past its
+                // pre-turn length) - nudge the model to pick up from there
+                // instead of resending the whole original prompt, which
+                // would otherwise read as a request to redo the task from
+                // scratch even though most of it is already done.
+                let resume_prompt = if session.history.len() > history_len_before {
+                    "Koneksi ke model sempat putus. Lanjutkan dari yang sudah dikerjakan sejauh \
+                     ini - jangan mengulang dari awal."
+                } else {
+                    prompt
+                };
+                if let Err(err) = run_turn(session, resume_prompt, max_iterations).await {
                     print_turn_error(session, &err);
                 }
             }

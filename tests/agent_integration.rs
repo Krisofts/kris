@@ -200,6 +200,35 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Answers the first request with a normal tool call, then drops the
+/// connection with no response at all on the second - standing in for
+/// llama-server getting reaped, or a flaky network, partway through a
+/// multi-iteration turn.
+async fn spawn_tool_call_then_drop_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let chat_calls = chat_calls.clone();
+            tokio::spawn(async move {
+                let _ = read_request_headers(&mut stream).await;
+                if chat_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    respond(&mut stream, "text/event-stream", TOOL_CALL_SSE).await;
+                } else {
+                    let _ = stream.shutdown().await;
+                }
+            });
+        }
+    });
+
+    format!("http://{addr}")
+}
+
 /// A mock server that never gives a final answer - every request gets a
 /// distinct tool call (a different file path each time, so it never
 /// collides with the "same call proposed twice" early-stop check) - so
@@ -339,6 +368,53 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
     // tool result, assistant(final text) - so a follow-up turn has the
     // right context.
     assert_eq!(history.len(), 5);
+}
+
+#[tokio::test]
+async fn connection_failure_after_progress_keeps_history_instead_of_rolling_it_back() {
+    // Regression test: a request failure used to always roll the *whole*
+    // turn back out of history via `history.truncate(turn_start)` - fine
+    // when nothing had happened yet, but if llama-server got reaped (or the
+    // network dropped) after a tool call had already completed this turn,
+    // it discarded that real progress too, forcing a retry to redo the
+    // whole task from scratch instead of continuing from where it left off.
+    let base_url = spawn_tool_call_then_drop_server().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
+
+    let mut history: Vec<Message> = Vec::new();
+
+    agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "please read a.txt",
+            5,
+            |_delta| {},
+            |_name, _args, _result| {},
+        )
+        .await
+        .expect_err("the second request should fail once the connection is dropped");
+
+    // The first iteration's tool call/result must survive: system, user,
+    // assistant(tool_calls), tool result - not rolled back to empty.
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[2].role, Role::Assistant);
+    assert_eq!(history[3].role, Role::Tool);
 }
 
 #[tokio::test]

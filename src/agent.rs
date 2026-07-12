@@ -103,9 +103,10 @@ impl Agent {
             ));
         }
 
-        // Recorded so a request failure (llama-server unreachable mid-turn)
-        // can roll the whole turn back out of history instead of leaving a
-        // dangling user message a caller's retry would otherwise duplicate.
+        // Recorded so a request failure with no progress yet (just the
+        // freshly pushed user message, nothing answered) can roll that dangling
+        // message back out of history instead of a caller's retry duplicating
+        // it - see the `Err` arm below, which only truncates in that case.
         let turn_start = history.len();
         history.push(Message::user(user_input));
 
@@ -150,7 +151,15 @@ impl Agent {
             {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    history.truncate(turn_start);
+                    // Only roll back when nothing came of this turn yet - once
+                    // at least one iteration has completed (tool calls/results
+                    // already in history), keep them. Losing the connection
+                    // mid-task (llama-server reaped, a flaky network) shouldn't
+                    // throw away work already done; a caller can resume from
+                    // here instead of redoing the whole task.
+                    if history.len() == turn_start + 1 {
+                        history.truncate(turn_start);
+                    }
                     return Err(err);
                 }
             };
