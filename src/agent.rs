@@ -69,9 +69,14 @@ impl Agent {
              scaffolding command via run_command (cargo new, npm init -y, django-admin \
              startproject, go mod init, etc.) instead of creating files by hand, unless no \
              such generator exists. A shell built-in (echo, cat, ls, mkdir, ...) is not a \
-             tool by itself - run it via run_command. Verify nontrivial changes by \
-             building/testing via run_command before finishing, when the project has such a \
-             command. Only commit to git when explicitly asked, via git_commit - never \
+             tool by itself - run it via run_command. Run one distinct command per \
+             run_command call rather than chaining unrelated ones with ; or && (three \
+             separate calls for `node --version`, `npm --version`, `which npm`, not one - so \
+             each shows up as its own step) - a pipe filtering one command's own output \
+             (`cmd 2>&1 | tail -n 20`) is still a single command and fine to keep together. \
+             Verify nontrivial changes by building/testing via run_command before finishing, \
+             when the project has such a command. Only commit to git when explicitly asked, \
+             via git_commit - never \
              automatically. If a request is genuinely ambiguous between a few clear \
              approaches, use ask_question instead of guessing - not for things you could \
              reasonably decide yourself. Give your final answer as plain text."
