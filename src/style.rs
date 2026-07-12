@@ -32,3 +32,7 @@ pub fn cyan(text: &str) -> String {
 pub fn blue(text: &str) -> String {
     wrap("34", text)
 }
+
+pub fn light_blue(text: &str) -> String {
+    wrap("94", text)
+}

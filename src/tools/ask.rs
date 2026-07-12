@@ -126,7 +126,7 @@ fn build_choices(options: &[Value], recommended_index: Option<usize>) -> Vec<(St
 fn ask(question: &str, choices: &[(String, String)]) -> String {
     let display_labels: Vec<String> = choices.iter().map(|(display, _)| display.clone()).collect();
 
-    match picker::pick(question, &display_labels, None) {
+    match picker::pick_boxed(question, &display_labels, None) {
         PickOutcome::Chosen(display) => {
             let original = choices
                 .iter()
