@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -978,8 +978,15 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
     let spinner_waiting = waiting.clone();
     let counts = Arc::new(SharedTurnCounts::default());
     let spinner_counts = counts.clone();
+    let activity: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let spinner_activity = activity.clone();
     let is_local = session.settings.provider == Provider::Local;
-    let spinner = tokio::spawn(spin(spinner_waiting, spinner_counts, is_local));
+    let spinner = tokio::spawn(spin(
+        spinner_waiting,
+        spinner_counts,
+        is_local,
+        spinner_activity,
+    ));
 
     let history_len_before = session.history.len();
     let started = Instant::now();
@@ -1045,6 +1052,19 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 // own round trip, and each of those waits deserves the
                 // same "still working" feedback the first one got.
                 waiting.store(true, Ordering::SeqCst);
+                // This tool call is done, so it's no longer "being
+                // prepared" - clear it rather than let it linger and
+                // wrongly describe whatever the next iteration turns out
+                // to be.
+                if let Ok(mut current) = activity.lock() {
+                    current.clear();
+                }
+            },
+            |tool_name: &str| {
+                let label = friendly_tool_label(tool_name);
+                if let Ok(mut current) = activity.lock() {
+                    *current = label.to_string();
+                }
             },
         )
         .await;
@@ -1371,8 +1391,17 @@ fn spinner_verb(elapsed_secs: u64) -> &'static str {
 /// routed through an online provider can easily spend over a minute on a
 /// hidden "thinking" trace before its first visible token, which isn't
 /// the same "may be stuck" situation a local llama-server sitting at
-/// max_tokens for that long usually is.
-async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>, is_local: bool) {
+/// max_tokens for that long usually is. `activity` is set by
+/// `Agent::run`'s `on_activity` callback to the tool the model is
+/// currently in the middle of calling (cleared once it's actually
+/// executed or a fresh iteration starts) - shown once known instead of
+/// leaving the generic rotating verb as the only signal the whole time.
+async fn spin(
+    waiting: Arc<AtomicBool>,
+    counts: Arc<SharedTurnCounts>,
+    is_local: bool,
+    activity: Arc<Mutex<String>>,
+) {
     const FRAMES: [&str; 10] = ["-", "\\", "|", "/", "-", "\\", "|", "/", "*", "+"];
     let mut i = 0;
     let started = Instant::now();
@@ -1414,6 +1443,16 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>, is_local:
                 )
             };
 
+            // What's actually happening behind the scenes right now, once
+            // known, instead of just the decorative rotating verb - the
+            // model may be several seconds into streaming a tool call's
+            // arguments well before that tool is actually run.
+            if let Ok(current) = activity.lock() {
+                if !current.is_empty() {
+                    label = format!("{label} · preparing {}", *current);
+                }
+            }
+
             // Live "Read N files · Ran N commands" recap, like Claude Code
             // shows while a turn is still in progress - it disappears with
             // the rest of this line once the turn finishes, rather than
@@ -1450,7 +1489,6 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>, is_local:
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
-    use std::sync::Mutex;
 
     fn complete_at_end(prefix: &str) -> Vec<String> {
         let helper = KrisHelper::new();

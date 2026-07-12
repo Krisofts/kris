@@ -353,6 +353,7 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
             5,
             |delta| streamed_text.push_str(delta),
             |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
+            |_| {},
         )
         .await
         .expect("agent turn should succeed against the mock server");
@@ -368,6 +369,62 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
     // tool result, assistant(final text) - so a follow-up turn has the
     // right context.
     assert_eq!(history.len(), 5);
+}
+
+#[tokio::test]
+async fn on_activity_reports_the_tool_name_while_its_arguments_are_still_streaming() {
+    // Regression test: the REPL's spinner used to show only a generic
+    // rotating verb ("Thinking...") for the entire wait, with no signal
+    // for what the model was actually doing behind the scenes. on_activity
+    // should fire with the tool's name as soon as it's known - before
+    // on_tool_call, which only fires once the tool has actually run.
+    let base_url = spawn_mock_server().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
+
+    let mut history: Vec<Message> = Vec::new();
+    let mut activity_seen: Vec<String> = Vec::new();
+    let tool_call_seen = std::cell::Cell::new(false);
+
+    agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "please read a.txt",
+            5,
+            |_delta| {},
+            |_name, _args, _result| {
+                tool_call_seen.set(true);
+            },
+            |name| {
+                // Confirms on_activity fires before the tool actually runs,
+                // not just alongside/after it.
+                assert!(
+                    !tool_call_seen.get(),
+                    "on_activity should fire before on_tool_call"
+                );
+                activity_seen.push(name.to_string());
+            },
+        )
+        .await
+        .expect("agent turn should succeed against the mock server");
+
+    assert!(activity_seen.iter().any(|name| name == "read_file"));
+    assert!(tool_call_seen.get());
 }
 
 #[tokio::test]
@@ -406,6 +463,7 @@ async fn connection_failure_after_progress_keeps_history_instead_of_rolling_it_b
             5,
             |_delta| {},
             |_name, _args, _result| {},
+            |_| {},
         )
         .await
         .expect_err("the second request should fail once the connection is dropped");
@@ -454,6 +512,7 @@ async fn agent_streams_a_tool_call_then_a_final_answer_via_claude() {
             5,
             |delta| streamed_text.push_str(delta),
             |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
+            |_| {},
         )
         .await
         .expect("agent turn should succeed against the mock Claude server");
@@ -485,7 +544,7 @@ async fn a_rejected_request_surfaces_the_provider_error_body() {
     );
 
     let err = client
-        .chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {})
+        .chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}, |_| {})
         .await
         .expect_err("a 400 response should surface as an error");
 
@@ -514,9 +573,14 @@ async fn truncated_reasoning_reply_surfaces_a_diagnostic_instead_of_silence() {
 
     let mut streamed = String::new();
     let outcome = client
-        .chat_stream(&[Message::user("hi")], None, 0.2, 16, |delta| {
-            streamed.push_str(delta)
-        })
+        .chat_stream(
+            &[Message::user("hi")],
+            None,
+            0.2,
+            16,
+            |delta| streamed.push_str(delta),
+            |_| {},
+        )
         .await
         .expect("a truncated-with-no-content stream should still succeed");
 
@@ -547,9 +611,14 @@ async fn reasoning_trace_is_not_dumped_to_the_terminal() {
 
     let mut streamed = String::new();
     let outcome = client
-        .chat_stream(&[Message::user("hi")], None, 0.2, 512, |delta| {
-            streamed.push_str(delta)
-        })
+        .chat_stream(
+            &[Message::user("hi")],
+            None,
+            0.2,
+            512,
+            |delta| streamed.push_str(delta),
+            |_| {},
+        )
         .await
         .expect("stream should succeed");
 
@@ -593,7 +662,7 @@ async fn done_marker_ends_the_stream_even_if_the_connection_stays_open() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        client.chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}),
+        client.chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}, |_| {}),
     )
     .await
     .expect(
@@ -639,6 +708,7 @@ async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
             3,
             |_delta| {},
             |_name, _args, _result| {},
+            |_| {},
         )
         .await
         .expect("hitting max_iterations should still be a successful turn, not an error");
@@ -686,6 +756,7 @@ async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
             5,
             |_delta| {},
             |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
+            |_| {},
         )
         .await
         .expect("agent turn should succeed even with a hallucinated tool name");

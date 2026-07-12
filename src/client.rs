@@ -260,15 +260,30 @@ impl ModelClient {
         temperature: f32,
         max_tokens: u32,
         on_delta: impl FnMut(&str),
+        on_activity: impl FnMut(&str),
     ) -> Result<StreamOutcome> {
         match self.backend {
             Backend::Llama | Backend::OpenAiCompat => {
-                self.chat_stream_openai(messages, tools, temperature, max_tokens, on_delta)
-                    .await
+                self.chat_stream_openai(
+                    messages,
+                    tools,
+                    temperature,
+                    max_tokens,
+                    on_delta,
+                    on_activity,
+                )
+                .await
             }
             Backend::Anthropic => {
-                self.chat_stream_anthropic(messages, tools, temperature, max_tokens, on_delta)
-                    .await
+                self.chat_stream_anthropic(
+                    messages,
+                    tools,
+                    temperature,
+                    max_tokens,
+                    on_delta,
+                    on_activity,
+                )
+                .await
             }
         }
     }
@@ -283,6 +298,7 @@ impl ModelClient {
         temperature: f32,
         max_tokens: u32,
         mut on_delta: impl FnMut(&str),
+        mut on_activity: impl FnMut(&str),
     ) -> Result<StreamOutcome> {
         let url = self.chat_url();
 
@@ -402,7 +418,18 @@ impl ModelClient {
 
                     if let Some(deltas) = choice.delta.tool_calls {
                         for delta in deltas {
+                            let index = delta.index;
                             accumulator.apply(delta);
+                            // Tells the caller which tool the model is in
+                            // the middle of calling well before it's
+                            // actually executed - the name usually arrives
+                            // whole in one delta, but arguments keep
+                            // streaming in after it, so this fires on
+                            // every one of those too (harmless: same name,
+                            // just re-reported).
+                            if let Some(name) = accumulator.current_name(index) {
+                                on_activity(name);
+                            }
                         }
                     }
 
@@ -481,6 +508,7 @@ impl ModelClient {
         temperature: f32,
         max_tokens: u32,
         mut on_delta: impl FnMut(&str),
+        mut on_activity: impl FnMut(&str),
     ) -> Result<StreamOutcome> {
         let url = self.chat_url();
         let (system, anthropic_messages) = to_anthropic_messages(messages);
@@ -549,6 +577,10 @@ impl ModelClient {
                         index,
                         content_block: AnthropicContentBlockStart::ToolUse { id, name },
                     } => {
+                        // Unlike the OpenAI-compatible path, Anthropic always
+                        // sends the whole tool name in this one event rather
+                        // than fragmenting it - safe to report right away.
+                        on_activity(&name);
                         accumulator.apply(ToolCallDelta {
                             index,
                             id: Some(id),
@@ -949,6 +981,18 @@ struct PartialToolCall {
 }
 
 impl ToolCallAccumulator {
+    /// The tool name accumulated so far for `index`, if any - used to tell
+    /// the caller which tool the model is in the middle of calling while
+    /// its arguments are still streaming in, well before it's actually
+    /// executed.
+    fn current_name(&self, index: usize) -> Option<&str> {
+        self.slots
+            .get(index)?
+            .as_ref()
+            .filter(|slot| !slot.name.is_empty())
+            .map(|slot| slot.name.as_str())
+    }
+
     fn apply(&mut self, delta: ToolCallDelta) {
         if self.slots.len() <= delta.index {
             self.slots.resize_with(delta.index + 1, || None);

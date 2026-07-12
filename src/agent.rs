@@ -87,7 +87,12 @@ impl Agent {
 
     /// Runs one user turn to completion, calling tools as needed, streaming
     /// assistant text live via `on_delta`, and returns the final
-    /// natural-language answer.
+    /// natural-language answer. `on_activity` fires with a tool's raw name
+    /// as soon as the model starts calling it - well before it's actually
+    /// executed (`on_tool_call`, once the arguments have fully arrived and
+    /// it's run) - so a caller can show what's being prepared instead of
+    /// just a generic "still waiting" status for that whole stretch.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         history: &mut Vec<Message>,
@@ -96,6 +101,7 @@ impl Agent {
         max_iterations: u32,
         mut on_delta: impl FnMut(&str),
         mut on_tool_call: impl FnMut(&str, &Value, &str),
+        mut on_activity: impl FnMut(&str),
     ) -> Result<String> {
         let root = project.root;
 
@@ -148,6 +154,7 @@ impl Agent {
                     self.temperature,
                     self.max_tokens,
                     &mut on_delta,
+                    &mut on_activity,
                 )
                 .await
             {
