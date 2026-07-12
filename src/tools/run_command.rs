@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,17 @@ use super::{Tool, ToolError, AWAITING_CONFIRMATION, COMMAND_RUNNING};
 
 const MAX_OUTPUT: usize = 4000;
 const TIMEOUT: Duration = Duration::from_secs(120);
+// How long execute() gives the reader threads to drain whatever's already
+// sitting in the OS pipe buffer *after* the shell itself has already
+// exited, before giving up and reading a snapshot of however much arrived
+// - confirmed on-device to otherwise hang forever: `sh -c` returns
+// immediately once it backgrounds a process (`cmd &`, `cmd | tee log`,
+// ...), but that process inherits the same piped stdout/stderr and keeps
+// them open for as long as it keeps running (a dev server, typically
+// forever), so the reader threads never see EOF. A short bound is safe:
+// the shell has already exited, so any of its own output is already
+// sitting fully in the pipe buffer, readable near-instantly.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
 
 pub struct RunCommandTool {
@@ -39,9 +50,11 @@ impl Tool for RunCommandTool {
         "Run a shell command inside the project root (e.g. `cargo build`, `cargo test`, \
          `npm install`). Asks the user for a y/n confirmation before executing anything. \
          Output is captured and truncated if long. Killed after 2 minutes if it hasn't \
-         finished - for a process that should keep running (a dev server), background it \
-         yourself instead, e.g. `tmux new-session -d -s preview 'npm run dev'`, which \
-         returns immediately."
+         finished - for a process that should keep running (a dev server), redirect its \
+         output to a file and background it with `&` instead, e.g. `npm run dev > \
+         dev.log 2>&1 &`, which returns immediately; don't rely on `tmux` being installed. \
+         Check on it afterward by reading that log file, not by re-running the same \
+         command."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -102,8 +115,8 @@ impl Tool for RunCommandTool {
             .spawn()
             .map_err(|err| ToolError::Tool(format!("failed to run command: {err}")))?;
 
-        let stdout_rx = spawn_reader(child.stdout.take());
-        let stderr_rx = spawn_reader(child.stderr.take());
+        let stdout_capture = spawn_reader(child.stdout.take());
+        let stderr_capture = spawn_reader(child.stderr.take());
 
         // Told to the REPL's own spinner task so it stops redrawing its
         // "thinking..." line over this one while this blocks the thread
@@ -151,8 +164,32 @@ impl Tool for RunCommandTool {
         print!("\r\x1b[K");
         let _ = io::stdout().flush();
 
-        let mut combined = stdout_rx.recv().unwrap_or_default();
-        combined.push_str(&stderr_rx.recv().unwrap_or_default());
+        // Give the reader threads a brief, bounded chance to drain whatever
+        // arrived - most commands have already finished by this point (see
+        // OUTPUT_DRAIN_TIMEOUT's own comment), so this is a quick poll
+        // rather than an unconditional sleep, and only actually waits the
+        // full timeout for the backgrounded-process case it exists for.
+        let drain_deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
+        while Instant::now() < drain_deadline
+            && !(stdout_capture.finished.load(Ordering::SeqCst)
+                && stderr_capture.finished.load(Ordering::SeqCst))
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Snapshotting the shared buffers directly (rather than waiting on
+        // a channel the reader threads only send over once they see EOF)
+        // means whatever a still-running backgrounded process already
+        // wrote before we stopped waiting is kept, instead of being
+        // silently discarded just because the pipe never formally closed.
+        let mut combined =
+            String::from_utf8_lossy(&stdout_capture.buf.lock().unwrap()).into_owned();
+        combined.push_str(&String::from_utf8_lossy(
+            &stderr_capture.buf.lock().unwrap(),
+        ));
+
+        let incomplete_capture = !stdout_capture.finished.load(Ordering::SeqCst)
+            || !stderr_capture.finished.load(Ordering::SeqCst);
 
         if combined.len() > MAX_OUTPUT {
             combined.truncate(MAX_OUTPUT);
@@ -161,6 +198,15 @@ impl Tool for RunCommandTool {
 
         if timed_out {
             combined.push_str("\n(killed after 120s timeout)");
+        }
+
+        if incomplete_capture {
+            combined.push_str(
+                "\n(output capture incomplete - this command likely started a background \
+                 process that's still holding stdout/stderr open, e.g. via `&` or `| tee`. \
+                 Redirect its output to a file instead, e.g. `cmd > out.log 2>&1 &`, then \
+                 read that file separately to check on it.)",
+            );
         }
 
         let status = status_code
@@ -198,19 +244,86 @@ fn print_confirmation_box(root: &Path, command: &str) {
     println!("{}", blue(&format!("╰{rule}╯")));
 }
 
-fn spawn_reader<R>(pipe: Option<R>) -> mpsc::Receiver<String>
+/// A pipe drained on its own thread into a shared buffer, plus whether
+/// that thread has actually seen EOF yet - checking `finished` lets the
+/// caller take a snapshot of `buf` without having to wait for it, which
+/// matters when the pipe's write end outlives the command that opened it
+/// (a backgrounded child process inheriting the same stdout/stderr).
+struct StreamCapture {
+    buf: Arc<Mutex<Vec<u8>>>,
+    finished: Arc<AtomicBool>,
+}
+
+fn spawn_reader<R>(pipe: Option<R>) -> StreamCapture
 where
     R: Read + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel();
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let finished = Arc::new(AtomicBool::new(false));
+    let capture = StreamCapture {
+        buf: buf.clone(),
+        finished: finished.clone(),
+    };
 
     thread::spawn(move || {
-        let mut buf = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+            let mut chunk = [0u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut guard) = buf.lock() {
+                            guard.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            }
         }
-        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        finished.store(true, Ordering::SeqCst);
     });
 
-    rx
+    capture
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn a_backgrounded_child_holding_stdout_open_does_not_hang_forever() {
+        // Regression test: `sh -c "cmd &"` returns almost immediately once
+        // it backgrounds a process, but that process inherits the same
+        // piped stdout/stderr and can hold them open indefinitely (a dev
+        // server, in practice forever) - confirmed on-device to hang the
+        // whole agent loop forever with no error and no visible spinner,
+        // since the old code waited on a channel the reader thread only
+        // ever sent over after seeing EOF. execute() runs on its own
+        // thread here so the test can bound how long it waits, rather than
+        // hanging the whole suite if this regresses.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool::new(true);
+        let root = dir.path().to_path_buf();
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = tool.execute(
+                &root,
+                &json!({ "command": "echo before; (sleep 30 &); echo after" }),
+            );
+            let _ = tx.send(result);
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("execute() should return well within 10s, not hang forever")
+            .expect("execute() should succeed");
+
+        // Whatever was written before the backgrounded process took over
+        // the pipe must still show up - not silently dropped just because
+        // the pipe itself never formally closed.
+        assert!(result.contains("before"));
+        assert!(result.contains("after"));
+        assert!(result.contains("output capture incomplete"));
+    }
 }
