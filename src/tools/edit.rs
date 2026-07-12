@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use serde_json::{json, Value};
 
 use crate::diff::{diff_stat, render_unified_diff};
-use crate::style::cyan;
+use crate::style::{blue, cyan};
 
 use super::{Tool, ToolError, AWAITING_CONFIRMATION};
 
@@ -16,7 +16,14 @@ use super::{Tool, ToolError, AWAITING_CONFIRMATION};
 /// showing the diff/summary the caller already printed. Shared across all
 /// edit tools via one `Rc<Cell<bool>>` so choosing "always" once covers
 /// writes, edits, deletes, and moves for the rest of the session, not just
-/// the specific tool that happened to ask first.
+/// the specific tool that happened to ask first. The closing corner is the
+/// same blue rounded "╰─" `run_command`'s confirmation box uses, so the two
+/// prompts read as one consistent style rather than two different ones - a
+/// diff can be arbitrarily wide (a long code line), though, so unlike
+/// run_command's this isn't a fully closed box: doing that would mean
+/// either truncating diff lines to fit a right border or padding every
+/// line out to the width of the longest one, both worse for actually
+/// reading the diff than leaving it to wrap naturally.
 fn confirm(auto_approve: &Cell<bool>) -> bool {
     if auto_approve.get() {
         return true;
@@ -24,7 +31,10 @@ fn confirm(auto_approve: &Cell<bool>) -> bool {
 
     AWAITING_CONFIRMATION.store(true, Ordering::SeqCst);
 
-    print!("└─ Apply this change? [y/N, or a = always for this session]: ");
+    print!(
+        "{} Apply this change? [y/N, or a = always for this session]: ",
+        blue("╰─")
+    );
     let _ = io::stdout().flush();
 
     let mut input = String::new();

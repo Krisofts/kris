@@ -846,10 +846,17 @@ async fn ask(session: &mut Session, prompt: &str) {
     ask_with_iterations(session, prompt, DEFAULT_MAX_ITERATIONS).await;
 }
 
-/// Runs one turn, retrying once via `server::ensure_running` if the request
-/// fails with what looks like a connection error - covers the case where
-/// llama-server got killed (backgrounded process reaped, phone low on
-/// memory, etc.) while KRIS was idle between turns.
+/// Bounds how many times a single turn will retry after a connection-
+/// looking failure (2 retries on top of the first attempt) - enough to
+/// ride out a flaky mobile connection or a free-tier provider's brief
+/// hiccup without retrying forever against something actually broken.
+const MAX_CONNECTION_RETRIES: u32 = 2;
+
+/// Runs one turn, retrying (via `server::ensure_running`) up to
+/// `MAX_CONNECTION_RETRIES` times if the request fails with what looks
+/// like a connection error - covers both llama-server getting killed
+/// (backgrounded process reaped, phone low on memory, etc.) while KRIS
+/// was idle between turns, and a flaky connection to an online provider.
 async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations: u32) {
     if !server::check_health(&session.settings).await
         && !server::ensure_running(&session.settings).await
@@ -863,50 +870,64 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
     // rolls its dangling user message back out of `session.history`, so
     // retrying with the exact same prompt is safe - it won't leave a
     // duplicated message behind. If it happens after some tool calls
-    // already completed, `run` keeps them instead - recorded here so the
+    // already completed, `run` keeps them instead - recorded here so each
     // retry can tell which case it's in.
     let history_len_before = session.history.len();
+    let is_local = session.settings.provider == Provider::Local;
+    let mut current_prompt = prompt.to_string();
 
-    if let Err(err) = run_turn(session, prompt, max_iterations).await {
-        if looks_like_connection_error(&err) {
-            let is_local = session.settings.provider == Provider::Local;
+    for attempt in 0..=MAX_CONNECTION_RETRIES {
+        let err = match run_turn(session, &current_prompt, max_iterations).await {
+            Ok(()) => return,
+            Err(err) => err,
+        };
 
-            println!();
-            println!(
-                "{}",
-                yellow(if is_local {
-                    "Lost connection to llama-server - trying to restart it..."
-                } else {
-                    "Lost connection to the model - retrying..."
-                })
-            );
-
-            // `ensure_running` manages a local llama-server; for an online
-            // provider it's a no-op check that an API key is still
-            // configured, since there's no local process to relaunch - a
-            // dropped connection there is just a network blip worth one
-            // retry.
-            if server::ensure_running(&session.settings).await {
-                // Progress survived the disconnect (history grew past its
-                // pre-turn length) - nudge the model to pick up from there
-                // instead of resending the whole original prompt, which
-                // would otherwise read as a request to redo the task from
-                // scratch even though most of it is already done.
-                let resume_prompt = if session.history.len() > history_len_before {
-                    "Koneksi ke model sempat putus. Lanjutkan dari yang sudah dikerjakan sejauh \
-                     ini - jangan mengulang dari awal."
-                } else {
-                    prompt
-                };
-                if let Err(err) = run_turn(session, resume_prompt, max_iterations).await {
-                    print_turn_error(session, &err);
-                }
-            } else {
-                print_turn_error(session, &err);
-            }
-        } else {
+        if !looks_like_connection_error(&err) || attempt == MAX_CONNECTION_RETRIES {
             print_turn_error(session, &err);
+            return;
         }
+
+        let message = if is_local {
+            "Lost connection to llama-server - trying to restart it...".to_string()
+        } else {
+            format!(
+                "Lost connection to the model - retrying ({}/{MAX_CONNECTION_RETRIES})...",
+                attempt + 1
+            )
+        };
+        println!();
+        println!("{}", yellow(&message));
+
+        // `ensure_running` manages a local llama-server (including waiting
+        // up to 60s for it to come back up); for an online provider it's
+        // just a check that an API key is still configured, since there's
+        // no local process to relaunch.
+        if !server::ensure_running(&session.settings).await {
+            print_turn_error(session, &err);
+            return;
+        }
+
+        if !is_local {
+            // A local retry already waited inside `ensure_running` for the
+            // server to come back; an online endpoint gets a short,
+            // growing backoff instead of being hit again immediately,
+            // mirroring the client's own retry pacing for the initial
+            // connect (client.rs's MAX_ATTEMPTS loop).
+            tokio::time::sleep(Duration::from_secs(2 * (attempt as u64 + 1))).await;
+        }
+
+        // Progress survived the disconnect (history grew past its pre-turn
+        // length) - nudge the model to pick up from there instead of
+        // resending the whole original prompt, which would otherwise read
+        // as a request to redo the task from scratch even though most of
+        // it is already done.
+        current_prompt = if session.history.len() > history_len_before {
+            "Koneksi ke model sempat putus. Lanjutkan dari yang sudah dikerjakan sejauh ini - \
+             jangan mengulang dari awal."
+                .to_string()
+        } else {
+            prompt.to_string()
+        };
     }
 }
 
@@ -1039,6 +1060,12 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
         Ok(_answer) => {
             let elapsed = started.elapsed();
             let tokens = heuristic_tokens(&session.history[history_len_before..]);
+            // Whole conversation so far, not just this turn's share of it -
+            // a rough heuristic (same chars/4 estimate used elsewhere as a
+            // fallback), but good enough to warn before the "older
+            // conversation history trimmed" notice shows up out of nowhere.
+            let context_used = heuristic_tokens(&session.history);
+            let context_budget = session.settings.effective_context_size();
             println!();
             // The "Read N files · Ran N commands" tally lived only in the
             // spinner label above while the turn was in progress - like
@@ -1046,9 +1073,10 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
             println!(
                 "{}",
                 dim(&format!(
-                    "{} · {}",
+                    "{} · {} · {}",
                     format_elapsed(elapsed),
-                    format_tokens(tokens)
+                    format_tokens(tokens),
+                    format_context_usage(context_used, context_budget)
                 ))
             );
             Ok(())
@@ -1227,6 +1255,20 @@ fn format_tokens(tokens: usize) -> String {
     } else {
         format!("~{tokens} tokens")
     }
+}
+
+/// Rough percentage of the active provider's context budget the whole
+/// conversation is currently using - shown so a trim (or a provider
+/// rejecting an oversized request) is never a surprise. `budget` of 0
+/// would divide by zero; treated as "unknown" instead of panicking, even
+/// though `Settings::set_field` already refuses to save a zero context
+/// size in practice.
+fn format_context_usage(used: usize, budget: u32) -> String {
+    if budget == 0 {
+        return "context: unknown".to_string();
+    }
+    let pct = (used as f64 / budget as f64 * 100.0).round() as u64;
+    format!("{pct}% context")
 }
 
 /// Human-friendly verb shown in the "● <label>(...)" tool-call header,
@@ -1565,6 +1607,21 @@ mod tests {
         counts.record("outline_file");
         counts.record("something_unknown");
         assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
+    }
+
+    #[test]
+    fn format_context_usage_rounds_to_a_percentage() {
+        assert_eq!(format_context_usage(0, 8192), "0% context");
+        assert_eq!(format_context_usage(4096, 8192), "50% context");
+        assert_eq!(format_context_usage(8192, 8192), "100% context");
+        // Over budget (a request the next call would trim) still reports
+        // honestly rather than clamping at 100%.
+        assert_eq!(format_context_usage(9000, 8192), "110% context");
+    }
+
+    #[test]
+    fn format_context_usage_handles_a_zero_budget_without_dividing_by_it() {
+        assert_eq!(format_context_usage(100, 0), "context: unknown");
     }
 
     #[tokio::test]
