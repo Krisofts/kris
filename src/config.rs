@@ -179,7 +179,7 @@ impl Default for Settings {
             openrouter_api_key: String::new(),
             openrouter_context_size: 128_000,
             openrouter_reasoning_effort: String::new(),
-            workspace: home.join("workspace").display().to_string(),
+            workspace: home.join("projects").display().to_string(),
             active_project: String::new(),
             bypass_permissions: false,
             auto_approve_edits: false,

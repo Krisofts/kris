@@ -50,7 +50,6 @@ const KNOWN_COMMANDS: &[&str] = &[
     "serve",
     "mode",
     "model",
-    "workspace",
     "project",
     "config",
     "fix",
@@ -327,7 +326,7 @@ fn print_banner(session: &Session) {
     println!(
         "{}",
         dim(&format!(
-            "workspace: {}  |  project: {}  |  {mode}: {model}",
+            "projects: {}  |  project: {}  |  {mode}: {model}",
             session.settings.workspace,
             if session.has_active_project() {
                 session.project_name.clone()
@@ -391,7 +390,6 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
         }
         "mode" => handle_mode(session, rest),
         "model" => handle_model(session, rest),
-        "workspace" => handle_workspace(session, rest),
         "project" => handle_project(session, rest),
         "config" => handle_config(session, rest),
         "fix" => {
@@ -631,18 +629,57 @@ fn handle_model(session: &mut Session, arg: &str) {
     }
 }
 
-/// Switches which folder acts as the workspace - the parent that holds
-/// every project - as opposed to `project <name>`, which picks a project
-/// inside it. Creates the folder if it doesn't exist yet, since it's
-/// just a container. With no argument, launches the interactive project
-/// picker for the (possibly just-created) workspace folder.
-fn handle_workspace(session: &mut Session, arg: &str) {
+/// With no argument, launches the interactive picker over projects living
+/// directly under the projects folder. `project <name>` skips the picker
+/// and switches straight to that project. `project <path>` (anything
+/// containing a `/` or starting with `~`, so it can't be mistaken for a
+/// plain project name) instead changes the projects folder itself - this
+/// used to be a separate `workspace` command, folded in here since the two
+/// concepts confused more than they helped kept apart. Switching to a
+/// project persists as the new `active_project`, so it's what KRIS opens
+/// next time too - "picking a project" and "setting the default" are the
+/// same action here.
+fn handle_project(session: &mut Session, arg: &str) {
+    let projects_dir = PathBuf::from(&session.settings.workspace);
+    fs::create_dir_all(&projects_dir).ok();
+
     if arg.is_empty() {
-        println!("Current workspace: {}", session.settings.workspace);
+        println!("Projects folder: {}", projects_dir.display());
         interactive_pick_project(session);
         return;
     }
 
+    if looks_like_a_path(arg) {
+        change_projects_folder(session, arg);
+        return;
+    }
+
+    let path = projects_dir.join(arg);
+    if !path.is_dir() {
+        println!(
+            "{}",
+            red(&format!(
+                "No project \"{arg}\" in {}",
+                projects_dir.display()
+            ))
+        );
+        return;
+    }
+
+    apply_project_switch(session, arg);
+}
+
+/// Distinguishes `project <path>` (change the projects folder itself)
+/// from `project <name>` (switch to a project inside it) - a path-like
+/// argument contains a `/` or starts with `~`, neither of which is valid
+/// in a plain project (sub)folder name.
+fn looks_like_a_path(arg: &str) -> bool {
+    arg.contains('/') || arg.starts_with('~')
+}
+
+/// Changes which folder holds every project. Creates it if it doesn't
+/// exist yet, since it's just a container.
+fn change_projects_folder(session: &mut Session, arg: &str) {
     // Routed through `set_field` so relative input is anchored at the home
     // directory rather than wherever the `kris` process happens to be
     // running from (e.g. inside its own cloned source repo) - see
@@ -663,7 +700,7 @@ fn handle_workspace(session: &mut Session, arg: &str) {
     }
     println!(
         "{}",
-        green(&format!("Switched workspace to {}", path.display()))
+        green(&format!("Projects folder set to {}", path.display()))
     );
     if !session.has_active_project() {
         println!(
@@ -671,34 +708,6 @@ fn handle_workspace(session: &mut Session, arg: &str) {
             dim("Belum ada project - `project` untuk lihat daftar.")
         );
     }
-}
-
-/// With no argument, launches the interactive picker over projects
-/// living directly under the workspace folder. `project <name>` skips
-/// the picker and switches straight to that project, as opposed to
-/// `workspace <path>`, which changes the workspace folder itself.
-/// Switching (either way) persists as the new `active_project`, so it's
-/// what KRIS opens next time too - "picking a project" and "setting the
-/// default" are the same action here.
-fn handle_project(session: &mut Session, arg: &str) {
-    let workspace = PathBuf::from(&session.settings.workspace);
-    fs::create_dir_all(&workspace).ok();
-
-    if arg.is_empty() {
-        interactive_pick_project(session);
-        return;
-    }
-
-    let path = workspace.join(arg);
-    if !path.is_dir() {
-        println!(
-            "{}",
-            red(&format!("No project \"{arg}\" in {}", workspace.display()))
-        );
-        return;
-    }
-
-    apply_project_switch(session, arg);
 }
 
 /// Shows the arrow-key project picker over the current workspace folder
@@ -818,8 +827,7 @@ fn print_help() {
         "  serve                 start llama-server in the background if needed (offline mode)"
     );
     println!("  model [preset]        show/switch the local Qwen2.5-Coder model (1.5b/3b/7b)");
-    println!("  workspace [path]      show workspace / pick a project with arrow keys, or switch to a different workspace folder");
-    println!("  project [name]        pick a project with arrow keys, or switch straight to <name> - also becomes the new default");
+    println!("  project [name|path]   pick a project with arrow keys, switch straight to <name>, or pass a <path> (e.g. ~/projects) to change the projects folder itself");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
     println!("  clear                 clear conversation history and the screen");
     println!("  !<command>            run a raw shell command directly");
@@ -1328,6 +1336,7 @@ async fn spin(waiting: Arc<AtomicBool>, counts: Arc<SharedTurnCounts>) {
 mod tests {
     use super::*;
     use rustyline::history::DefaultHistory;
+    use std::sync::Mutex;
 
     fn complete_at_end(prefix: &str) -> Vec<String> {
         let helper = KrisHelper::new();
@@ -1484,5 +1493,86 @@ mod tests {
         counts.record("outline_file");
         counts.record("something_unknown");
         assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
+    }
+
+    #[test]
+    fn looks_like_a_path_recognizes_paths_but_not_plain_names() {
+        assert!(looks_like_a_path("~/projects"));
+        assert!(looks_like_a_path("../elsewhere"));
+        assert!(looks_like_a_path("/data/projects"));
+        assert!(looks_like_a_path("sub/dir"));
+
+        assert!(!looks_like_a_path("tridjaya"));
+        assert!(!looks_like_a_path("my-project"));
+        assert!(!looks_like_a_path(""));
+    }
+
+    // `handle_project` saves settings to `$HOME/.config/kris/config.toml`
+    // as a side effect - these two tests point `$HOME` at a scratch
+    // tempdir for their duration so they can't ever touch a real config
+    // file, and share a lock since env vars are process-global and tests
+    // run concurrently by default.
+    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_scratch_home<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = HOME_ENV_LOCK.lock().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", tmp.path());
+
+        let result = f(tmp.path());
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        result
+    }
+
+    #[test]
+    fn project_command_with_a_bare_name_switches_within_the_projects_folder() {
+        with_scratch_home(|home| {
+            let projects_dir = home.join("projects");
+            fs::create_dir_all(projects_dir.join("tridjaya")).unwrap();
+
+            let settings = Settings {
+                workspace: projects_dir.display().to_string(),
+                ..Settings::default()
+            };
+            let mut session = Session::new(settings);
+
+            handle_project(&mut session, "tridjaya");
+
+            assert_eq!(session.settings.active_project, "tridjaya");
+            assert_eq!(
+                session.settings.workspace,
+                projects_dir.display().to_string()
+            );
+        });
+    }
+
+    #[test]
+    fn project_command_with_a_path_changes_the_projects_folder_instead() {
+        with_scratch_home(|home| {
+            let old_projects_dir = home.join("projects");
+            fs::create_dir_all(&old_projects_dir).unwrap();
+            let new_projects_dir = home.join("elsewhere");
+
+            let settings = Settings {
+                workspace: old_projects_dir.display().to_string(),
+                active_project: "stale".to_string(),
+                ..Settings::default()
+            };
+            let mut session = Session::new(settings);
+
+            handle_project(&mut session, new_projects_dir.to_str().unwrap());
+
+            assert_eq!(
+                session.settings.workspace,
+                new_projects_dir.display().to_string()
+            );
+            assert!(new_projects_dir.is_dir());
+            assert!(session.settings.active_project.is_empty());
+        });
     }
 }

@@ -178,8 +178,9 @@ bash scripts/setup-termux.sh 7b     # bigger/slower, for phones with plenty of R
 This installs the required packages, builds `llama-server` (with the
 `libandroid-spawn` fix applied, and `--jinja` support so tool-calling
 works), downloads the GGUF model, starts `llama-server` in the background,
-creates `~/project` (KRIS's default workspace — put the code you want it
-to work on there), builds KRIS, symlinks it as `kris` on your `PATH`, and
+creates `~/projects` (KRIS's default projects folder — put the code you
+want it to work on there, one subfolder per project), builds KRIS,
+symlinks it as `kris` on your `PATH`, and
 drops you into the KRIS REPL. It's safe to re-run — steps that already
 finished are skipped. The server keeps running in the background
 afterwards, so next time you just type `kris` from anywhere.
@@ -263,9 +264,9 @@ afterwards, so next time you just type `kris` from anywhere.
    flash_attn = true
    cache_type_k = "q8_0"
    cache_type_v = "q8_0"
-   workspace = "/data/data/com.termux/files/home/project"
+   workspace = "/data/data/com.termux/files/home/projects"
    EOF
-   mkdir -p ~/project
+   mkdir -p ~/projects
    ./target/release/kris
    ```
 
@@ -280,7 +281,7 @@ and prompts you to set `model_path` if it isn't configured yet.
 ## Using KRIS
 
 ```
-kris                    # interactive REPL in the configured workspace
+kris                    # interactive REPL in the current project
 kris "explain main.rs"  # one-shot: ask, print the answer, exit
 ```
 
@@ -296,7 +297,7 @@ Inside the REPL:
 | `health` | check whether llama-server is reachable |
 | `serve` | start llama-server in the background if it isn't running |
 | `model [preset]` | show/switch the Qwen2.5-Coder model (`1.5b`/`3b`/`7b`) |
-| `workspace [path]` | show/switch the project KRIS is working in |
+| `project [name\|path]` | pick a project with arrow keys, switch straight to `<name>`, or pass a `<path>` to change the projects folder itself |
 | `config [set key value]` | show or change settings (saved to `config.toml`) |
 | `clear` | clear conversation history and the screen |
 | `!<command>` | run a raw shell command directly, bypassing the model |
