@@ -142,8 +142,31 @@ impl Agent {
         let mut measured: Option<(usize, u32)> = None;
 
         for _ in 0..max_iterations {
-            self.enforce_context_budget(history, &mut measured, &mut on_delta)
-                .await;
+            if self
+                .enforce_context_budget(history, &mut measured, &mut on_delta)
+                .await
+            {
+                // Trimmed every older turn it's allowed to and it still
+                // isn't enough - the current, in-progress turn's own tool
+                // calls/results (which trimming never touches, by design)
+                // have grown past the budget on their own. Sending the
+                // request anyway would just get rejected by the provider
+                // with its own, far less clear, context-length error -
+                // confirmed on-device against OpenRouter's
+                // tencent/hy3:free, which does exactly that after a long
+                // run of tool calls within one turn.
+                let notice = format!(
+                    "This turn has produced more tool output than fits in the model's \
+                     context window (~{} tokens) and there's no older conversation left \
+                     to trim - it's grown too large within a single turn. Ask KRIS to \
+                     continue with a smaller, more focused next step instead of \
+                     extending this one further.",
+                    self.context_size
+                );
+                on_delta(&notice);
+                history.push(Message::assistant_text(notice.clone()));
+                return Ok(notice);
+            }
 
             let sent_len = history.len();
             let outcome = match self
@@ -285,7 +308,12 @@ impl Agent {
     /// Decides whether the prompt is close enough to `context_size` to need
     /// trimming, then drops the oldest whole turns (a turn = a user message
     /// through to just before the next one) until back under budget, always
-    /// keeping the current, unanswered turn.
+    /// keeping the current, unanswered turn. Returns `true` if it's still
+    /// over budget after trimming everything it's allowed to - meaning the
+    /// current, in-progress turn's own tool calls/results (never touched by
+    /// trimming) have grown past the budget on their own, and the caller
+    /// should stop rather than send a request doomed to be rejected by the
+    /// provider anyway.
     ///
     /// The size estimate is cheap: when llama-server has already reported an
     /// exact `prompt_tokens` for an earlier request this turn (`measured`),
@@ -298,7 +326,7 @@ impl Agent {
         history: &mut Vec<Message>,
         measured: &mut Option<(usize, u32)>,
         on_delta: &mut impl FnMut(&str),
-    ) {
+    ) -> bool {
         let soft_limit = (self.context_size as f64 * 0.9) as usize;
 
         let estimate = match *measured {
@@ -309,7 +337,7 @@ impl Agent {
             None => {
                 let heuristic = heuristic_tokens(history);
                 if heuristic < soft_limit * 3 / 4 {
-                    return;
+                    return false;
                 }
                 let joined = joined_text(history);
                 self.client.tokenize(&joined).await.unwrap_or(heuristic)
@@ -317,7 +345,7 @@ impl Agent {
         };
 
         if estimate <= soft_limit {
-            return;
+            return false;
         }
 
         let mut dropped_turns = 0;
@@ -361,6 +389,8 @@ impl Agent {
             );
             on_delta(&notice);
         }
+
+        heuristic_tokens(history) > soft_limit
     }
 }
 
@@ -538,5 +568,71 @@ mod tests {
     fn heuristic_tokens_counts_content_and_tool_calls() {
         let history = vec![Message::user("hello world")];
         assert_eq!(heuristic_tokens(&history), "hello world".len() / 4);
+    }
+
+    fn test_agent(context_size: u32) -> Agent {
+        // `Backend::OpenAiCompat` so `tokenize()` bails out immediately
+        // (it only works against a real local llama-server) and falls back
+        // to the heuristic without any network I/O - the base URL is never
+        // actually reached.
+        let client = ModelClient::new(
+            "http://localhost".to_string(),
+            "test-model".to_string(),
+            Backend::OpenAiCompat,
+            None,
+        );
+        Agent::new(
+            client,
+            ToolRegistry::with_defaults(false, false),
+            0.2,
+            512,
+            context_size,
+        )
+    }
+
+    #[tokio::test]
+    async fn enforce_context_budget_signals_when_the_current_turn_alone_is_too_big() {
+        // Regression test: a long-running turn's own accumulated tool
+        // calls/results can outgrow the context budget on their own -
+        // trimming only ever drops *older*, completed turns, so once
+        // there's nothing left before the current one, there's no way to
+        // get back under budget. Confirmed on-device against OpenRouter's
+        // tencent/hy3:free: sending the oversized request anyway got
+        // rejected with the provider's own confusing 400 "maximum context
+        // length" error instead of a clear message from KRIS itself.
+        let agent = test_agent(100);
+        let mut history = vec![
+            Message::user("hi"),
+            Message::assistant_text("x".repeat(2000)),
+        ];
+        let mut measured = None;
+
+        let over_budget = agent
+            .enforce_context_budget(&mut history, &mut measured, &mut |_| {})
+            .await;
+
+        assert!(over_budget);
+    }
+
+    #[tokio::test]
+    async fn enforce_context_budget_drops_older_turns_and_returns_false_once_under_budget() {
+        let agent = test_agent(100);
+        let mut history = vec![
+            Message::system("system prompt"),
+            Message::user("old turn"),
+            Message::assistant_text("x".repeat(2000)),
+            Message::user("hi"),
+        ];
+        let mut measured = None;
+
+        let over_budget = agent
+            .enforce_context_budget(&mut history, &mut measured, &mut |_| {})
+            .await;
+
+        assert!(!over_budget);
+        // The bulky old turn should be gone, leaving just the system
+        // prompt and the small current turn.
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].content.as_deref(), Some("hi"));
     }
 }
