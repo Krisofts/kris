@@ -669,15 +669,52 @@ fn toml_parse(raw: &str) -> Result<Settings> {
 
         let key = key.trim();
         let value = value.trim();
-        let unquoted = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .unwrap_or(value);
+        let unquoted = match value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            Some(inner) => unescape_toml_string(inner),
+            None => value.to_string(),
+        };
 
-        settings.set_field(key, unquoted)?;
+        settings.set_field(key, &unquoted)?;
     }
 
     Ok(settings)
+}
+
+/// Reverses the escaping `{:?}` (Rust's `Debug` for `str`, what
+/// `toml_render_inner` writes every string field with) applies to a quote,
+/// backslash, or control character inside a value. `toml_parse` used to
+/// only strip the surrounding quote characters, leaving an escape sequence
+/// like `\"` or `\\` literally as those two characters instead of the one
+/// they stood for - silently corrupting any config value that happens to
+/// contain a `"` or `\` (an unusual but real API key, or a path with one of
+/// either) the very next time it's saved and reloaded.
+fn unescape_toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            // Not one of the escapes `toml_render_inner` ever actually
+            // produces - keep it verbatim rather than guessing.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -953,6 +990,22 @@ mod tests {
         assert!(toml_render(&settings).contains("yet-another-secret"));
         assert!(toml_render(&settings).contains("opper-secret"));
         assert!(toml_render(&settings).contains("opencode-secret"));
+    }
+
+    #[test]
+    fn a_value_containing_a_quote_or_backslash_round_trips_intact() {
+        // Regression test: toml_render_inner writes every string field via
+        // Rust's `{:?}` Debug formatting, which escapes an internal `"` as
+        // `\"` and a `\` as `\\` - toml_parse used to only strip the outer
+        // quote characters, leaving those escape sequences un-reversed and
+        // silently corrupting the value on the very next load.
+        let settings = Settings {
+            gemini_api_key: "sk-\"quoted\"-key\\with\\backslashes".to_string(),
+            ..Settings::default()
+        };
+
+        let parsed = toml_parse(&toml_render(&settings)).unwrap();
+        assert_eq!(parsed.gemini_api_key, settings.gemini_api_key);
     }
 
     #[test]
