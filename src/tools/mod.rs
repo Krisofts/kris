@@ -35,6 +35,21 @@ pub static AWAITING_CONFIRMATION: AtomicBool = AtomicBool::new(false);
 /// `\r`-redrawing loops racing over the same terminal line, garbling both.
 pub static COMMAND_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Truncates `s` to at most `max_len` bytes, backing off to the nearest
+/// earlier UTF-8 char boundary rather than cutting mid-character. Plain
+/// `String::truncate(max_len)` panics whenever `max_len` doesn't land on a
+/// char boundary - command/git output routinely contains multi-byte UTF-8
+/// (unicode arrows in diffs, emoji, non-ASCII text) that can straddle
+/// exactly that byte offset, which crashed the whole process the moment it
+/// did.
+pub(crate) fn truncate_to_byte_limit(s: &mut String, max_len: usize) {
+    let mut cut = max_len.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+}
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("IO error: {0}")]
@@ -355,5 +370,30 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ToolError::UnknownTool(_)));
+    }
+
+    #[test]
+    fn truncate_to_byte_limit_backs_off_from_a_split_multibyte_char() {
+        // Regression test: plain `String::truncate(n)` panics outright if
+        // `n` doesn't land on a UTF-8 char boundary - command/git output
+        // routinely has a multi-byte character (accented text, emoji,
+        // unicode arrows in a diff) straddling exactly the byte offset
+        // run_command.rs/git.rs cut at, which used to crash the whole
+        // process instead of just truncating the output.
+        let mut s = "a".repeat(9);
+        s.push('é'); // 2-byte UTF-8 character; s.len() is now 11
+        s.push_str(&"b".repeat(5));
+
+        truncate_to_byte_limit(&mut s, 10);
+
+        assert_eq!(s, "a".repeat(9));
+        assert!(s.is_char_boundary(s.len()));
+    }
+
+    #[test]
+    fn truncate_to_byte_limit_is_a_no_op_when_already_under_the_limit() {
+        let mut s = "short".to_string();
+        truncate_to_byte_limit(&mut s, 100);
+        assert_eq!(s, "short");
     }
 }

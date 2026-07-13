@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::style::{blue, dim};
 use crate::term::{terminal_width, truncate_to_width};
 
-use super::{Tool, ToolError, AWAITING_CONFIRMATION, COMMAND_RUNNING};
+use super::{truncate_to_byte_limit, Tool, ToolError, AWAITING_CONFIRMATION, COMMAND_RUNNING};
 
 const MAX_OUTPUT: usize = 4000;
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -192,7 +192,7 @@ impl Tool for RunCommandTool {
             || !stderr_capture.finished.load(Ordering::SeqCst);
 
         if combined.len() > MAX_OUTPUT {
-            combined.truncate(MAX_OUTPUT);
+            truncate_to_byte_limit(&mut combined, MAX_OUTPUT);
             combined.push_str("\n...(output truncated)");
         }
 

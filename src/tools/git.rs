@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use serde_json::{json, Value};
 
-use super::{Tool, ToolError, AWAITING_CONFIRMATION};
+use super::{truncate_to_byte_limit, Tool, ToolError, AWAITING_CONFIRMATION};
 
 const MAX_OUTPUT: usize = 4000;
 const ALLOWED: [&str; 5] = ["status", "diff", "log", "show", "branch"];
@@ -77,7 +77,7 @@ impl Tool for GitTool {
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
 
         if combined.len() > MAX_OUTPUT {
-            combined.truncate(MAX_OUTPUT);
+            truncate_to_byte_limit(&mut combined, MAX_OUTPUT);
             combined.push_str("\n...(output truncated)");
         }
 
