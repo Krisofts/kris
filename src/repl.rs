@@ -20,6 +20,7 @@ use crate::config::{Provider, Settings};
 use crate::message::Message;
 use crate::picker;
 use crate::server;
+use crate::session_store;
 use crate::style::{blue, bold, cyan, dim, green, red, yellow};
 use crate::term::{terminal_width, truncate_to_width};
 use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION, COMMAND_RUNNING};
@@ -137,13 +138,14 @@ impl Session {
     fn new(settings: Settings) -> Self {
         let root = resolve_root(&settings.workspace, &settings.active_project);
         let (project_name, project_type_hint) = project_hint(&root);
+        let history = session_store::load(&root);
 
         Self {
             settings,
             root,
             project_name,
             project_type_hint,
-            history: Vec::new(),
+            history,
         }
     }
 
@@ -158,12 +160,17 @@ impl Session {
                 .is_dir()
     }
 
+    /// Switches to whatever `root` now resolves to and loads *that*
+    /// project's own persisted session (empty if it's never had one) -
+    /// rather than always starting blank, so flipping between two
+    /// projects resumes each one's own last conversation instead of
+    /// losing it the moment you switch away.
     fn refresh_root(&mut self) {
         self.root = resolve_root(&self.settings.workspace, &self.settings.active_project);
         let (name, hint) = project_hint(&self.root);
         self.project_name = name;
         self.project_type_hint = hint;
-        self.history.clear();
+        self.history = session_store::load(&self.root);
     }
 
     /// Switches which folder acts as the workspace (the parent holding
@@ -363,6 +370,7 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
         "version" => println!("kris {}", env!("CARGO_PKG_VERSION")),
         "clear" => {
             session.history.clear();
+            session_store::clear(&session.root);
             print!("\x1b[2J\x1b[H");
             let _ = std::io::stdout().flush();
             println!("{}", dim("Conversation history cleared."));
@@ -1132,6 +1140,18 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
     spinner.abort();
     clear_line();
 
+    // Persisted regardless of Ok/Err - agent.run() keeps whatever tool
+    // calls/results already completed even when the turn itself ends in
+    // an error (a dropped connection mid-task shouldn't throw away
+    // progress), so the session file should reflect that too rather than
+    // only ever saving on a clean finish.
+    if let Err(save_err) = session_store::save(&session.root, &session.history) {
+        println!(
+            "{}",
+            yellow(&format!("(couldn't save session to disk: {save_err})"))
+        );
+    }
+
     match result {
         // `answer` isn't reprinted here - agent.run() has already streamed
         // it in full via the `on_delta` callback above (live as tokens
@@ -1796,14 +1816,18 @@ mod tests {
     }
 
     // `handle_project` saves settings to `$HOME/.config/kris/config.toml`
-    // as a side effect - these two tests point `$HOME` at a scratch
-    // tempdir for their duration so they can't ever touch a real config
-    // file, and share a lock since env vars are process-global and tests
-    // run concurrently by default.
-    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    // (and now also loads/saves session files under `$HOME/.config/kris/
+    // sessions/`) as a side effect - these tests point `$HOME` at a
+    // scratch tempdir for their duration so they can't ever touch a real
+    // config file. Shares `crate::test_support::HOME_ENV_LOCK` with every
+    // other module's `with_scratch_home`, not a lock of its own - env vars
+    // are process-global, so a per-module lock alone doesn't stop this
+    // module's test from racing a *different* module's test over the same
+    // `$HOME` when both run concurrently on separate threads (confirmed:
+    // this was an actual flaky failure once session_store.rs grew its own
+    // separate lock).
     fn with_scratch_home<T>(f: impl FnOnce(&Path) -> T) -> T {
-        let _guard = HOME_ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_support::HOME_ENV_LOCK.lock().unwrap();
         let original_home = std::env::var("HOME").ok();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", tmp.path());
@@ -1835,6 +1859,50 @@ mod tests {
             assert_eq!(
                 session.settings.workspace,
                 projects_dir.display().to_string()
+            );
+        });
+    }
+
+    #[test]
+    fn switching_projects_resumes_each_projects_own_persisted_session() {
+        // Regression coverage for session persistence: switching away from
+        // a project used to just clear `history` outright (`refresh_root`
+        // called `self.history.clear()`), so a KRIS restart or a `project`
+        // switch and back lost the conversation entirely. It should now
+        // resume whatever was last saved for that specific project root.
+        with_scratch_home(|home| {
+            let projects_dir = home.join("projects");
+            fs::create_dir_all(projects_dir.join("alpha")).unwrap();
+            fs::create_dir_all(projects_dir.join("beta")).unwrap();
+
+            let settings = Settings {
+                workspace: projects_dir.display().to_string(),
+                ..Settings::default()
+            };
+            let mut session = Session::new(settings);
+
+            handle_project(&mut session, "alpha");
+            session.history.push(Message::user("working on alpha"));
+            session_store::save(&session.root, &session.history).unwrap();
+
+            handle_project(&mut session, "beta");
+            assert!(
+                session.history.is_empty(),
+                "beta has never been saved, so it should start empty"
+            );
+            session.history.push(Message::user("working on beta"));
+            session_store::save(&session.root, &session.history).unwrap();
+
+            handle_project(&mut session, "alpha");
+            assert_eq!(
+                session.history.last().and_then(|m| m.content.as_deref()),
+                Some("working on alpha")
+            );
+
+            handle_project(&mut session, "beta");
+            assert_eq!(
+                session.history.last().and_then(|m| m.content.as_deref()),
+                Some("working on beta")
             );
         });
     }

@@ -34,6 +34,11 @@ Switch at any time with `mode offline` / `mode online` / `mode claude` /
   erroring out mid-conversation — without a spare round trip per turn.
 - Self-heals: if llama-server was killed while KRIS was idle, it's
   restarted automatically on the next request.
+- Persists each project's conversation to disk after every turn, so
+  closing KRIS (or having it killed - a backgrounded Termux app reaped, a
+  crash) doesn't lose it. Switching projects with `project <name>` resumes
+  *that* project's own last conversation instead of starting blank; `clear`
+  wipes it for good.
 
 ## Build
 
