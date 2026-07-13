@@ -2,6 +2,7 @@ pub mod agent;
 pub mod client;
 pub mod config;
 pub mod diff;
+pub mod export;
 pub mod message;
 pub mod picker;
 pub mod repl;

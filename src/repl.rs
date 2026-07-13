@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::agent::{heuristic_tokens, Agent, Project};
 use crate::config::{Provider, Settings};
+use crate::export;
 use crate::message::Message;
 use crate::picker;
 use crate::server;
@@ -54,6 +55,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "mode",
     "model",
     "project",
+    "resume",
+    "export",
     "config",
     "fix",
     "init",
@@ -188,6 +191,23 @@ impl Session {
     /// exists.
     fn switch_project(&mut self, name: &str) {
         self.settings.active_project = name.to_string();
+        self.refresh_root();
+    }
+
+    /// Switches straight to an arbitrary project root, wherever it lives -
+    /// used by `resume`, since a saved session's project isn't necessarily
+    /// a subfolder of the *current* workspace the way `switch_project`
+    /// assumes. Sets `workspace` to `root`'s parent and `active_project` to
+    /// its own folder name, so it behaves exactly like having switched
+    /// workspace and picked that project in one step.
+    fn switch_to_root(&mut self, root: &Path) {
+        if let Some(parent) = root.parent() {
+            self.settings.workspace = parent.display().to_string();
+        }
+        self.settings.active_project = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         self.refresh_root();
     }
 
@@ -401,6 +421,8 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
         "mode" => handle_mode(session, rest),
         "model" => handle_model(session, rest),
         "project" => handle_project(session, rest),
+        "resume" => handle_resume(session),
+        "export" => handle_export(session, rest),
         "config" => handle_config(session, rest),
         "fix" => {
             let prompt = format!(
@@ -834,6 +856,126 @@ fn apply_project_switch(session: &mut Session, name: &str) {
     );
 }
 
+/// KRIS's counterpart to Claude Code's own `/resume`: shows a picker of
+/// every project with a saved conversation (most recently used first,
+/// across the whole machine rather than scoped to the current workspace -
+/// KRIS has no notion of "worktree" to scope by) and switches straight to
+/// whichever one is chosen, loading its session in the process.
+fn handle_resume(session: &mut Session) {
+    let sessions = session_store::list_sessions();
+
+    if sessions.is_empty() {
+        println!("{}", yellow("Belum ada sesi tersimpan untuk dilanjutkan."));
+        return;
+    }
+
+    let labels: Vec<String> = sessions
+        .iter()
+        .map(|s| {
+            let name = s
+                .root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| s.root.display().to_string());
+            let ago = format_time_ago(s.modified.elapsed().unwrap_or_default());
+            format!(
+                "{name} ({}) - {} pesan - {ago}",
+                s.root.display(),
+                s.message_count
+            )
+        })
+        .collect();
+
+    let prompt =
+        "Pilih sesi untuk dilanjutkan (\u{2191}/\u{2193} pilih, Enter konfirmasi, Esc batal):";
+
+    match picker::pick(prompt, &labels, None) {
+        picker::PickOutcome::Chosen(label) => {
+            let index = labels.iter().position(|l| *l == label).unwrap();
+            let root = sessions[index].root.clone();
+            session.switch_to_root(&root);
+            if let Err(err) = session.settings.save() {
+                println!("{}", red(&format!("Failed to save config: {err}")));
+            }
+            println!(
+                "{}",
+                green(&format!(
+                    "Melanjutkan sesi di {} ({} pesan)",
+                    session.root.display(),
+                    session.history.len()
+                ))
+            );
+        }
+        picker::PickOutcome::Cancelled => {}
+        picker::PickOutcome::Unavailable => {
+            println!("Sesi tersimpan:");
+            for (i, label) in labels.iter().enumerate() {
+                println!("  {}) {label}", i + 1);
+            }
+            println!("{}", dim("Terminal ini tidak mendukung picker interaktif."));
+        }
+    }
+}
+
+/// Rough "N ago" label for the `resume` picker - bucketed coarsely (not
+/// exact calendar math) since it only needs to convey "recent" vs "a while
+/// back", the same spirit as `format_elapsed`'s own rough rounding.
+fn format_time_ago(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "baru saja".to_string()
+    } else if secs < 3600 {
+        format!("{} menit lalu", secs / 60)
+    } else if secs < 86400 {
+        format!("{} jam lalu", secs / 3600)
+    } else {
+        format!("{} hari lalu", secs / 86400)
+    }
+}
+
+/// KRIS's counterpart to Claude Code's own `/export`: writes the current
+/// conversation out as readable Markdown (unlike the JSON `session_store`
+/// persists purely for KRIS itself to reload) so it can be read, shared,
+/// or handed off to someone else. `arg` is an optional filename (relative
+/// to the project root); defaults to a name that won't collide with a
+/// previous export in the same project.
+fn handle_export(session: &Session, arg: &str) {
+    if session.history.is_empty() {
+        println!(
+            "{}",
+            yellow("Belum ada percakapan untuk diekspor di project ini.")
+        );
+        return;
+    }
+
+    let filename = if arg.is_empty() {
+        default_export_filename()
+    } else {
+        arg.to_string()
+    };
+    let path = session.root.join(&filename);
+    let content = export::render_export(&session.history);
+
+    match fs::write(&path, content) {
+        Ok(()) => println!(
+            "{}",
+            green(&format!("Percakapan diekspor ke {}", path.display()))
+        ),
+        Err(err) => println!(
+            "{}",
+            red(&format!("Gagal menulis {}: {err}", path.display()))
+        ),
+    }
+}
+
+fn default_export_filename() -> String {
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("kris-export-{epoch_secs}.md")
+}
+
 fn handle_config(session: &mut Session, rest: &str) {
     if rest.is_empty() {
         println!("{}", session.settings.describe());
@@ -877,6 +1019,8 @@ fn print_help() {
     );
     println!("  model [preset]        show/switch the local Qwen2.5-Coder model (1.5b/3b/7b)");
     println!("  project [name|path]   pick a project with arrow keys, switch straight to <name>, or pass a <path> (e.g. ~/projects) to change the projects folder itself");
+    println!("  resume                pick a saved session (any project) with arrow keys and switch straight to it");
+    println!("  export [filename]     save the current conversation as readable Markdown");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
     println!("  clear                 clear conversation history and the screen");
     println!("  !<command>            run a raw shell command directly");
@@ -1905,6 +2049,91 @@ mod tests {
                 Some("working on beta")
             );
         });
+    }
+
+    #[test]
+    fn switch_to_root_updates_workspace_and_active_project_and_loads_its_history() {
+        // `resume` can land on a project that isn't under the *current*
+        // workspace at all (a session saved while a different workspace
+        // folder was active) - switch_to_root has to repoint `workspace`
+        // itself, not just `active_project`, and pick up that project's
+        // own persisted session in the process.
+        with_scratch_home(|home| {
+            let other_workspace = home.join("elsewhere");
+            let root = other_workspace.join("tridjaya");
+            fs::create_dir_all(&root).unwrap();
+            session_store::save(&root, &[Message::user("resumed from elsewhere")]).unwrap();
+
+            let settings = Settings {
+                workspace: home.join("projects").display().to_string(),
+                ..Settings::default()
+            };
+            let mut session = Session::new(settings);
+
+            session.switch_to_root(&root);
+
+            assert_eq!(
+                session.settings.workspace,
+                other_workspace.display().to_string()
+            );
+            assert_eq!(session.settings.active_project, "tridjaya");
+            assert_eq!(session.root, root);
+            assert_eq!(
+                session.history.last().and_then(|m| m.content.as_deref()),
+                Some("resumed from elsewhere")
+            );
+        });
+    }
+
+    #[test]
+    fn handle_export_writes_readable_markdown_to_the_project_root() {
+        with_scratch_home(|home| {
+            let projects_dir = home.join("projects");
+            fs::create_dir_all(&projects_dir).unwrap();
+            let settings = Settings {
+                workspace: projects_dir.display().to_string(),
+                ..Settings::default()
+            };
+            let mut session = Session::new(settings);
+            session.history.push(Message::user("halo"));
+            session.history.push(Message::assistant_text("halo juga!"));
+
+            handle_export(&session, "export-test.md");
+
+            let content = fs::read_to_string(projects_dir.join("export-test.md")).unwrap();
+            assert!(content.contains("## You"));
+            assert!(content.contains("halo"));
+            assert!(content.contains("## KRIS"));
+            assert!(content.contains("halo juga!"));
+        });
+    }
+
+    #[test]
+    fn handle_export_writes_nothing_when_history_is_empty() {
+        with_scratch_home(|home| {
+            let projects_dir = home.join("projects");
+            fs::create_dir_all(&projects_dir).unwrap();
+            let settings = Settings {
+                workspace: projects_dir.display().to_string(),
+                ..Settings::default()
+            };
+            let session = Session::new(settings);
+
+            handle_export(&session, "should-not-exist.md");
+
+            assert!(!projects_dir.join("should-not-exist.md").exists());
+        });
+    }
+
+    #[test]
+    fn format_time_ago_buckets_by_rough_scale() {
+        assert_eq!(format_time_ago(Duration::from_secs(5)), "baru saja");
+        assert_eq!(format_time_ago(Duration::from_secs(120)), "2 menit lalu");
+        assert_eq!(format_time_ago(Duration::from_secs(3 * 3600)), "3 jam lalu");
+        assert_eq!(
+            format_time_ago(Duration::from_secs(2 * 86400)),
+            "2 hari lalu"
+        );
     }
 
     #[test]

@@ -4,16 +4,36 @@
 //! something. One JSON file per project root under
 //! `~/.config/kris/sessions/`, keyed by the root's own path so switching
 //! between projects resumes each one's own last conversation instead of
-//! all projects sharing a single history.
+//! all projects sharing a single history. Each file also carries its own
+//! `root` so `list_sessions` (KRIS's counterpart to Claude Code's `/resume`
+//! picker) can tell which project a session belongs to without having to
+//! reverse the sanitized filename back into a path.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::message::Message;
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    root: PathBuf,
+    history: Vec<Message>,
+}
+
+/// One saved session as surfaced to the `resume` command's picker - just
+/// enough to label a choice and switch to it, not the full history (which
+/// only actually gets loaded once a choice is made).
+pub struct SessionSummary {
+    pub root: PathBuf,
+    pub message_count: usize,
+    pub modified: SystemTime,
+}
 
 /// Filesystem-safe, human-recognizable-enough name for a project root's
 /// session file: the path with anything not alphanumeric replaced by `_`,
@@ -33,13 +53,13 @@ fn session_filename(root: &Path) -> String {
     format!("{sanitized}-{:016x}.json", hasher.finish())
 }
 
-fn session_path(root: &Path) -> Result<PathBuf> {
+fn sessions_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not determine home directory")?;
-    Ok(home
-        .join(".config")
-        .join("kris")
-        .join("sessions")
-        .join(session_filename(root)))
+    Ok(home.join(".config").join("kris").join("sessions"))
+}
+
+fn session_path(root: &Path) -> Result<PathBuf> {
+    Ok(sessions_dir()?.join(session_filename(root)))
 }
 
 /// Loads the persisted history for `root`, or an empty history if none was
@@ -53,7 +73,9 @@ pub fn load(root: &Path) -> Vec<Message> {
     let Ok(raw) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    serde_json::from_str(&raw).unwrap_or_default()
+    serde_json::from_str::<PersistedSession>(&raw)
+        .map(|p| p.history)
+        .unwrap_or_default()
 }
 
 /// Persists `history` for `root`, overwriting whatever was saved before.
@@ -62,7 +84,11 @@ pub fn save(root: &Path, history: &[Message]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let raw = serde_json::to_string(history).context("serializing session history")?;
+    let envelope = PersistedSession {
+        root: root.to_path_buf(),
+        history: history.to_vec(),
+    };
+    let raw = serde_json::to_string(&envelope).context("serializing session history")?;
     fs::write(&path, raw).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -74,6 +100,43 @@ pub fn clear(root: &Path) {
     if let Ok(path) = session_path(root) {
         let _ = fs::remove_file(path);
     }
+}
+
+/// Every saved session with a non-empty history, most recently modified
+/// first - what the `resume` command shows in its picker. Silently returns
+/// an empty list if the sessions directory can't be read at all (a fresh
+/// install with nothing saved yet), rather than treating that as an error.
+pub fn list_sessions() -> Vec<SessionSummary> {
+    let Ok(dir) = sessions_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut sessions: Vec<SessionSummary> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|entry| {
+            let raw = fs::read_to_string(entry.path()).ok()?;
+            let envelope: PersistedSession = serde_json::from_str(&raw).ok()?;
+            if envelope.history.is_empty() {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            Some(SessionSummary {
+                root: envelope.root,
+                message_count: envelope.history.len(),
+                modified,
+            })
+        })
+        .collect();
+
+    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions
 }
 
 #[cfg(test)]
@@ -168,6 +231,52 @@ mod tests {
             fs::write(&path, "not valid json").unwrap();
 
             assert!(load(&root).is_empty());
+        });
+    }
+
+    #[test]
+    fn list_sessions_reports_every_saved_project_with_its_root_and_count() {
+        with_scratch_home(|| {
+            let a = PathBuf::from("/projects/a");
+            let b = PathBuf::from("/projects/b");
+
+            save(&a, &[Message::user("hi")]).unwrap();
+            save(&b, &[Message::user("hi"), Message::assistant_text("hello")]).unwrap();
+
+            let mut sessions = list_sessions();
+            sessions.sort_by(|x, y| x.root.cmp(&y.root));
+
+            assert_eq!(sessions.len(), 2);
+            assert_eq!(sessions[0].root, a);
+            assert_eq!(sessions[0].message_count, 1);
+            assert_eq!(sessions[1].root, b);
+            assert_eq!(sessions[1].message_count, 2);
+        });
+    }
+
+    #[test]
+    fn list_sessions_skips_sessions_with_empty_history() {
+        with_scratch_home(|| {
+            let empty = PathBuf::from("/projects/never-actually-used");
+            save(&empty, &[]).unwrap();
+
+            assert!(list_sessions().is_empty());
+        });
+    }
+
+    #[test]
+    fn list_sessions_orders_most_recently_modified_first() {
+        with_scratch_home(|| {
+            let older = PathBuf::from("/projects/older");
+            let newer = PathBuf::from("/projects/newer");
+
+            save(&older, &[Message::user("first")]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            save(&newer, &[Message::user("second")]).unwrap();
+
+            let sessions = list_sessions();
+            assert_eq!(sessions[0].root, newer);
+            assert_eq!(sessions[1].root, older);
         });
     }
 }

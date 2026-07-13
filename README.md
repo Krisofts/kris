@@ -369,8 +369,10 @@ Inside the REPL:
 | `serve` | start llama-server in the background if it isn't running |
 | `model [preset]` | show/switch the Qwen2.5-Coder model (`1.5b`/`3b`/`7b`) |
 | `project [name\|path]` | pick a project with arrow keys, switch straight to `<name>`, or pass a `<path>` to change the projects folder itself |
+| `resume` | pick a saved session (any project, most recently used first) with arrow keys and switch straight to it |
+| `export [filename]` | save the current conversation as readable Markdown (defaults to `kris-export-<timestamp>.md` in the project root) |
 | `config [set key value]` | show or change settings (saved to `config.toml`) |
-| `clear` | clear conversation history and the screen |
+| `clear` | clear conversation history and the screen (and its saved session on disk) |
 | `!<command>` | run a raw shell command directly, bypassing the model |
 | `help` | show the command list |
 | `exit` / `quit` | leave KRIS |
