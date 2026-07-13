@@ -126,8 +126,18 @@ impl Tool for TreeTool {
     fn execute(&self, root: &Path, _args: &Value) -> Result<String, ToolError> {
         let mut lines = vec![".".to_string()];
 
+        // `.hidden(false)` deliberately surfaces other dotfiles/dotdirs
+        // that are actually useful to see (.github/, .eslintrc, ...), but
+        // that also un-hides `.git` itself, which isn't covered by
+        // .gitignore rules (a repo's own .gitignore doesn't need to
+        // mention .git) - without `filter_entry` explicitly skipping it,
+        // this walked straight into .git's internal object database,
+        // confirmed on-device to explode a single `tree` call into
+        // hundreds of thousands of tokens on an ordinary repo and blow
+        // straight through the context budget on the very first turn.
         let mut entries: Vec<_> = WalkBuilder::new(root)
             .hidden(false)
+            .filter_entry(|entry| entry.file_name() != ".git")
             .min_depth(Some(1))
             .build()
             .filter_map(Result::ok)
@@ -263,6 +273,51 @@ impl Tool for SearchCodeTool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn tree_shows_other_dotfiles_but_never_descends_into_git() {
+        // Regression test: TreeTool passes `.hidden(false)` to show useful
+        // dotfiles like `.github/`, but a repo's own `.gitignore` never
+        // mentions `.git` itself, so without an explicit filter this also
+        // walked straight into .git's internal object database - on-device,
+        // that exploded a single `tree` call into hundreds of thousands of
+        // tokens on an ordinary repo, blowing through the context budget
+        // on the very first turn of a session.
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=a@a.com",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+
+        let tool = TreeTool;
+        let out = tool.execute(dir.path(), &json!({})).unwrap();
+
+        assert!(out.contains("a.rs"));
+        assert!(out.contains(".env"), "other dotfiles should still show up");
+        assert!(!out.contains(".git"), "must never descend into .git");
+    }
 
     #[test]
     fn read_file_truncates_and_reports_range() {
