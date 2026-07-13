@@ -29,6 +29,11 @@ const FINAL_ANSWER_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+const SUMMARY_SSE: &str = concat!(
+    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Summary: did X, next is Y.\"}}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
 // Mirrors a real, on-device observation: without a working tool-calling
 // grammar, a model can hallucinate a call to a tool name that was never
 // registered (here, "hello" - echoing back the user's greeting) instead of
@@ -815,5 +820,36 @@ async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
     assert!(
         answer.contains("hello"),
         "the model's raw text should still be shown as the answer: {answer}"
+    );
+}
+
+#[tokio::test]
+async fn summarize_returns_the_models_plain_text_recap_for_the_compact_command() {
+    let base_url = spawn_single_response_server(SUMMARY_SSE).await;
+
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
+
+    let history = vec![
+        Message::user("tolong perbaiki bug X"),
+        Message::assistant_text("sudah diperbaiki"),
+    ];
+    let mut streamed = String::new();
+
+    let summary = agent
+        .summarize(&history, "", |delta: &str| streamed.push_str(delta))
+        .await
+        .expect("summarize should succeed against a normal plain-text reply");
+
+    assert_eq!(summary, "Summary: did X, next is Y.");
+    assert_eq!(
+        streamed, summary,
+        "the recap should stream live via on_delta just like a normal answer"
     );
 }

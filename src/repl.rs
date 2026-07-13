@@ -57,6 +57,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "project",
     "resume",
     "export",
+    "compact",
     "config",
     "fix",
     "init",
@@ -423,6 +424,7 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
         "project" => handle_project(session, rest),
         "resume" => handle_resume(session),
         "export" => handle_export(session, rest),
+        "compact" => handle_compact(session, rest).await,
         "config" => handle_config(session, rest),
         "fix" => {
             let prompt = format!(
@@ -976,6 +978,83 @@ fn default_export_filename() -> String {
     format!("kris-export-{epoch_secs}.md")
 }
 
+/// KRIS's counterpart to Claude Code's own `/compact`: asks the model to
+/// summarize the conversation so far, then replaces `history` with just
+/// that recap instead of KRIS's usual context-budget trimming
+/// (`enforce_context_budget`), which only ever drops old turns outright.
+/// Leaves the original conversation untouched if summarizing fails, so a
+/// network hiccup never destroys history in exchange for nothing.
+async fn handle_compact(session: &mut Session, extra: &str) {
+    if session.history.is_empty() {
+        println!("{}", yellow("Belum ada percakapan untuk diringkas."));
+        return;
+    }
+
+    if !server::check_health(&session.settings).await
+        && !server::ensure_running(&session.settings).await
+    {
+        return;
+    }
+
+    let agent = session.agent();
+    let system_prompt = agent.system_prompt(&session.project_name, &session.project_type_hint);
+
+    println!();
+    println!("{}", dim("Meringkas percakapan..."));
+    println!();
+
+    let result = agent
+        .summarize(&session.history, extra, |delta: &str| {
+            print!("{delta}");
+            let _ = std::io::stdout().flush();
+        })
+        .await;
+
+    let summary = match result {
+        Ok(summary) if !summary.trim().is_empty() => summary,
+        Ok(_) => {
+            println!(
+                "{}",
+                red("Model tidak memberikan ringkasan - percakapan tidak diubah.")
+            );
+            return;
+        }
+        Err(err) => {
+            println!();
+            println!("{} {err}", red("Gagal meringkas percakapan:"));
+            return;
+        }
+    };
+
+    println!();
+    println!();
+
+    session.history = build_compacted_history(system_prompt, &summary);
+    if let Err(err) = session_store::save(&session.root, &session.history) {
+        println!(
+            "{}",
+            yellow(&format!("(couldn't save session to disk: {err})"))
+        );
+    }
+    println!(
+        "{}",
+        green("Percakapan diringkas - sesi dilanjutkan dari ringkasan ini.")
+    );
+}
+
+/// Builds the replacement history after a `compact`: just the system
+/// prompt (so `Agent::run`'s `history.is_empty()` check never wrongly
+/// inserts a second one on the next turn) followed by the summary itself,
+/// presented as an assistant turn recapping progress so far.
+fn build_compacted_history(system_prompt: String, summary: &str) -> Vec<Message> {
+    vec![
+        Message::system(system_prompt),
+        Message::assistant_text(format!(
+            "(Ringkasan percakapan sebelumnya, dibuat oleh `compact`)\n\n{summary}"
+        )),
+    ]
+}
+
 fn handle_config(session: &mut Session, rest: &str) {
     if rest.is_empty() {
         println!("{}", session.settings.describe());
@@ -1021,6 +1100,7 @@ fn print_help() {
     println!("  project [name|path]   pick a project with arrow keys, switch straight to <name>, or pass a <path> (e.g. ~/projects) to change the projects folder itself");
     println!("  resume                pick a saved session (any project) with arrow keys and switch straight to it");
     println!("  export [filename]     save the current conversation as readable Markdown");
+    println!("  compact [instructions] summarize the conversation so far and continue from that recap instead of the full history");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
     println!("  clear                 clear conversation history and the screen");
     println!("  !<command>            run a raw shell command directly");
@@ -2134,6 +2214,29 @@ mod tests {
             format_time_ago(Duration::from_secs(2 * 86400)),
             "2 hari lalu"
         );
+    }
+
+    #[test]
+    fn build_compacted_history_keeps_the_system_prompt_first() {
+        // Regression coverage: history.is_empty() is what makes Agent::run
+        // insert a fresh system prompt - if a compacted history didn't
+        // still start with one, the very next real turn would either go
+        // out with no system prompt at all, or (if the check were somehow
+        // bypassed) end up with two. Either way this is the one invariant
+        // that must hold for a compacted session to behave like a normal
+        // one afterward.
+        let history = build_compacted_history("be helpful".to_string(), "did X, next is Y");
+
+        assert_eq!(history.len(), 2);
+        assert!(!history.is_empty(), "must never look like a fresh session");
+        assert_eq!(history[0].role, crate::message::Role::System);
+        assert_eq!(history[0].content.as_deref(), Some("be helpful"));
+        assert_eq!(history[1].role, crate::message::Role::Assistant);
+        assert!(history[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("did X, next is Y"));
     }
 
     #[test]

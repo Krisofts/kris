@@ -42,7 +42,7 @@ impl Agent {
         }
     }
 
-    fn system_prompt(&self, project_name: &str, project_type_hint: &str) -> String {
+    pub(crate) fn system_prompt(&self, project_name: &str, project_type_hint: &str) -> String {
         // Tool schemas travel in the request's `tools` field now (native
         // tool-calling via llama-server --jinja), not spelled out as JSON
         // prose here - keeps this prompt, and its reprocessing cost on
@@ -303,6 +303,47 @@ impl Agent {
         on_delta(&notice);
         history.push(Message::assistant_text(notice.clone()));
         Ok(notice)
+    }
+
+    /// Asks the model for a plain-text recap of `history` so far - no
+    /// `tools` attached at all, so unlike `run` it can only ever answer in
+    /// prose, never call one. Backs the `compact` REPL command, which
+    /// replaces a long conversation with this recap instead of KRIS's
+    /// usual context-budget trimming (`enforce_context_budget`), which
+    /// only ever drops old turns outright rather than preserving anything
+    /// from them.
+    pub async fn summarize(
+        &self,
+        history: &[Message],
+        extra_instructions: &str,
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<String> {
+        let mut messages = history.to_vec();
+
+        let mut request = "Summarize this conversation so far in a few short paragraphs: \
+             what's been done, key decisions and files touched, and what's still outstanding. \
+             Be concise - this summary replaces the full conversation history, so include \
+             only what's actually needed to continue the work."
+            .to_string();
+        if !extra_instructions.is_empty() {
+            request.push(' ');
+            request.push_str(extra_instructions);
+        }
+        messages.push(Message::user(request));
+
+        let outcome = self
+            .client
+            .chat_stream(
+                &messages,
+                None,
+                self.temperature,
+                self.max_tokens,
+                &mut on_delta,
+                |_name: &str| {},
+            )
+            .await?;
+
+        Ok(outcome.content.unwrap_or_default())
     }
 
     /// Decides whether the prompt is close enough to `context_size` to need
