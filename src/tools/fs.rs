@@ -135,12 +135,26 @@ impl Tool for TreeTool {
         // confirmed on-device to explode a single `tree` call into
         // hundreds of thousands of tokens on an ordinary repo and blow
         // straight through the context budget on the very first turn.
+        //
+        // Deliberately NOT using `WalkBuilder::min_depth` to exclude the
+        // root entry itself (filtering by `entry.depth() > 0` below
+        // instead): the `ignore` crate only loads a directory's own
+        // .gitignore when its `WalkEvent::Dir` is actually processed, and
+        // `min_depth(1)` suppresses that event for the walked root -
+        // silently disabling every rule in the *root's own* .gitignore
+        // (where a Rust/Node project's `/target`, `node_modules/`, etc.
+        // almost always live) for its direct children, while nested
+        // .gitignore files elsewhere still worked. Confirmed on-device:
+        // this was the dominant cause of `tree` exploding to hundreds of
+        // thousands of tokens on an ordinary git project - far more so
+        // than the .git leak above, since a project's own build output is
+        // typically much larger than .git's loose object count.
         let mut entries: Vec<_> = WalkBuilder::new(root)
             .hidden(false)
             .filter_entry(|entry| entry.file_name() != ".git")
-            .min_depth(Some(1))
             .build()
             .filter_map(Result::ok)
+            .filter(|entry| entry.depth() > 0)
             .collect();
         entries.sort_by(|a, b| a.path().cmp(b.path()));
 
@@ -317,6 +331,41 @@ mod tests {
         assert!(out.contains("a.rs"));
         assert!(out.contains(".env"), "other dotfiles should still show up");
         assert!(!out.contains(".git"), "must never descend into .git");
+    }
+
+    #[test]
+    fn tree_respects_the_root_directorys_own_gitignore() {
+        // Regression test: TreeTool used to pass `.min_depth(Some(1))` to
+        // exclude the root entry itself, but the `ignore` crate only loads
+        // a directory's own .gitignore when its `WalkEvent::Dir` is
+        // actually processed - `min_depth(1)` suppresses that event for
+        // the walked root, silently disabling every rule in the *root's
+        // own* .gitignore (where `/target`, `node_modules/`, etc. almost
+        // always live) for its direct children. Confirmed on-device: this
+        // was the dominant cause of `tree` exploding to hundreds of
+        // thousands of tokens on an ordinary git project, since a real
+        // project's build output dwarfs .git's own object count.
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        fs::create_dir_all(dir.path().join("target/debug/deps")).unwrap();
+        for i in 0..50 {
+            fs::write(dir.path().join(format!("target/debug/deps/f{i}.d")), "x").unwrap();
+        }
+        fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+
+        let tool = TreeTool;
+        let out = tool.execute(dir.path(), &json!({})).unwrap();
+
+        assert!(out.contains("a.rs"));
+        assert!(
+            !out.contains("target"),
+            "the root's own .gitignore must still exclude /target: {out}"
+        );
     }
 
     #[test]
