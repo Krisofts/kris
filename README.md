@@ -39,6 +39,11 @@ Switch at any time with `mode offline` / `mode online` / `mode claude` /
   crash) doesn't lose it. Switching projects with `project <name>` resumes
   *that* project's own last conversation instead of starting blank; `clear`
   wipes it for good.
+- Seeds every brand-new, empty project with its own `KRIS.md` (house rules:
+  keep files under 300 lines, always run and smoke-test before finishing)
+  and folds a project's `KRIS.md` straight into every session so its
+  conventions actually get followed, not just written once and forgotten.
+  Customize `~/.config/kris/KRIS.md` to change the default template.
 
 ## Build
 

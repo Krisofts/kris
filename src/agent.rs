@@ -106,9 +106,19 @@ impl Agent {
         let root = project.root;
 
         if history.is_empty() {
-            history.push(Message::system(
-                self.system_prompt(project.name, project.type_hint),
-            ));
+            let mut prompt = self.system_prompt(project.name, project.type_hint);
+            // Folded into the system prompt itself (not a separate
+            // message) so every backend's shape handles it uniformly, and
+            // only ever read once per session (right here, alongside the
+            // system prompt itself) rather than on every turn - the same
+            // reasoning that keeps the rest of this prompt short applies:
+            // a project's own KRIS.md conventions only need to enter
+            // context once, not be reprocessed every iteration.
+            if let Some(conventions) = crate::kris_md::read_project_conventions(root) {
+                prompt.push_str("\n\n---\nProject conventions (from this project's own KRIS.md - follow these):\n\n");
+                prompt.push_str(&conventions);
+            }
+            history.push(Message::system(prompt));
         }
 
         // Recorded so a request failure with no progress yet (just the

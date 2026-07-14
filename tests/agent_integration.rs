@@ -3,8 +3,9 @@
 //! tool-call accumulation, and tool execution loop can be exercised
 //! without needing a real llama.cpp build or GGUF model.
 
+use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kris::agent::{Agent, Project};
@@ -154,6 +155,47 @@ async fn read_request_headers(stream: &mut TcpStream) -> String {
     }
 
     header_text
+}
+
+/// Like `read_request_headers`, but also returns the request body - for
+/// tests that need to inspect what was actually sent (e.g. confirming a
+/// project's KRIS.md conventions made it into the system prompt).
+async fn read_request_headers_and_body(stream: &mut TcpStream) -> (String, String) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    let headers_end = loop {
+        let n = stream.read(&mut chunk).await.expect("read request");
+        assert!(n > 0, "connection closed before headers were fully sent");
+        buf.extend_from_slice(&chunk[..n]);
+
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos;
+        }
+    };
+
+    let header_text = String::from_utf8_lossy(&buf[..headers_end]).to_string();
+
+    let content_length: usize = header_text
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().to_string())
+        })
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let body_start = headers_end + 4;
+    while buf.len() < body_start + content_length {
+        let n = stream.read(&mut chunk).await.expect("read body");
+        assert!(n > 0, "connection closed before body was fully sent");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    let body = String::from_utf8_lossy(&buf[body_start..body_start + content_length]).to_string();
+    (header_text, body)
 }
 
 async fn respond(stream: &mut TcpStream, content_type: &str, body: &str) {
@@ -851,5 +893,63 @@ async fn summarize_returns_the_models_plain_text_recap_for_the_compact_command()
     assert_eq!(
         streamed, summary,
         "the recap should stream live via on_delta just like a normal answer"
+    );
+}
+
+#[tokio::test]
+async fn project_kris_md_conventions_are_folded_into_the_system_prompt() {
+    // A project's own KRIS.md is meant to actually steer the model every
+    // session, not just sit there as a file it has to remember to
+    // read_file on its own initiative - Agent::run folds it straight into
+    // the system prompt on the first turn.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured_body: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let captured_clone = captured_body.clone();
+
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (_, body) = read_request_headers_and_body(&mut stream).await;
+        *captured_clone.lock().unwrap() = body;
+        respond(&mut stream, "text/event-stream", FINAL_ANSWER_SSE).await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("KRIS.md"), "Always write tests first.").unwrap();
+
+    let base_url = format!("http://{addr}");
+    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
+
+    let mut history: Vec<Message> = Vec::new();
+    agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "halo",
+            5,
+            |_delta| {},
+            |_name, _args, _result| {},
+            |_| {},
+        )
+        .await
+        .expect("agent turn should succeed");
+
+    let body = captured_body.lock().unwrap().clone();
+    assert!(
+        body.contains("Always write tests first."),
+        "KRIS.md content should be folded into the request's system prompt: {body}"
     );
 }

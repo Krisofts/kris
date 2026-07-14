@@ -18,6 +18,7 @@ use serde_json::Value;
 use crate::agent::{heuristic_tokens, Agent, Project};
 use crate::config::{Provider, Settings};
 use crate::export;
+use crate::kris_md;
 use crate::message::Message;
 use crate::picker;
 use crate::server;
@@ -143,6 +144,7 @@ impl Session {
         let root = resolve_root(&settings.workspace, &settings.active_project);
         let (project_name, project_type_hint) = project_hint(&root);
         let history = session_store::load(&root);
+        kris_md::seed_new_project(&root);
 
         Self {
             settings,
@@ -175,6 +177,7 @@ impl Session {
         self.project_name = name;
         self.project_type_hint = hint;
         self.history = session_store::load(&self.root);
+        kris_md::seed_new_project(&self.root);
     }
 
     /// Switches which folder acts as the workspace (the parent holding

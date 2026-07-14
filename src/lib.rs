@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod diff;
 pub mod export;
+pub mod kris_md;
 pub mod message;
 pub mod picker;
 pub mod repl;
