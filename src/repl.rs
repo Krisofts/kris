@@ -1210,8 +1210,14 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 // worth seeing in full rather than just its first line - a
                 // boxed, line-prefixed block reads far easier than a wall
                 // of text, and matches the ┌─/│/└─ style the confirmation
-                // prompts already use elsewhere.
-                if tool_category(tool_name) == ToolCategory::Command && result.lines().count() > 1 {
+                // prompts already use elsewhere. Also how a command that
+                // backgrounded a process (still holding stdout/stderr open
+                // - run_command's own "output capture incomplete" note)
+                // always ends up in this same box - never just a dim
+                // one-liner easy to miss - since that note is always
+                // appended alongside the exit code line, guaranteeing
+                // more than one line.
+                if should_box_command_output(tool_name, result) {
                     print_boxed_output(result, is_error);
                 } else {
                     let summary = result.lines().next().unwrap_or("").trim();
@@ -1260,6 +1266,22 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 }
             },
             |tool_name: &str| {
+                // Also re-arms the spinner: a mid-turn system notice
+                // (context trimmed, or auto-continue nudging a stuck
+                // round) is printed via on_delta, which - correctly, for
+                // an actual final answer - permanently stops the spinner
+                // for the rest of the turn. But these notices aren't the
+                // final answer; more waiting on the model follows right
+                // after, so without this the spinner would otherwise stay
+                // dark for the rest of the turn instead of resuming.
+                waiting.store(true, Ordering::SeqCst);
+                // Whatever reasoning happened before this point belongs to
+                // a response that's already wrapping up (either resolving
+                // into this tool call, or superseded by a fresh nudge) -
+                // without this, the spinner could keep showing "Reasoning"
+                // for a new wait that hasn't actually shown any reasoning
+                // of its own yet.
+                reasoning_started.store(false, Ordering::SeqCst);
                 let label = friendly_tool_label(tool_name);
                 if let Ok(mut current) = activity.lock() {
                     *current = label.to_string();
@@ -1317,6 +1339,19 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
         }
         Err(err) => Err(err),
     }
+}
+
+/// Whether a tool's result should render in `print_boxed_output`'s closed
+/// box rather than a single dim summary line - true for any multi-line
+/// `run_command`/`git_commit` result. In particular, a command that
+/// backgrounded a process (still holding stdout/stderr open) always
+/// qualifies: run_command's own "output capture incomplete" note is always
+/// appended alongside the exit code line, so that result is never just one
+/// line - it's never at risk of being shown as an easy-to-miss dim
+/// one-liner instead of the (blue-bordered, since it's not an error)
+/// box.
+fn should_box_command_output(tool_name: &str, result: &str) -> bool {
+    tool_category(tool_name) == ToolCategory::Command && result.lines().count() > 1
 }
 
 /// Prints a command's full result in a closed box (╭─╮ / │ … │ / ╰─╯),
@@ -1762,6 +1797,26 @@ mod tests {
         assert_eq!(tool_bullet("edit_file"), green("●"));
         assert_eq!(tool_bullet("run_command"), yellow("●"));
         assert_eq!(tool_bullet("ask_question"), cyan("●"));
+    }
+
+    #[test]
+    fn a_backgrounded_process_result_always_gets_boxed_not_a_dim_one_liner() {
+        // Regression test: run_command's own "output capture incomplete"
+        // note (appended whenever a command backgrounds a process that's
+        // still holding stdout/stderr open) must always land in the boxed,
+        // blue-bordered rendering - never the plain dim "⎿ summary" line,
+        // which would be easy to miss for something worth flagging clearly.
+        let result = "exit code: 0\n\n(output capture incomplete - this command likely \
+             started a background process that's still holding stdout/stderr open, e.g. \
+             via `&` or `| tee`. Redirect its output to a file instead, e.g. `cmd > \
+             out.log 2>&1 &`, then read that file separately to check on it.)";
+
+        assert!(should_box_command_output("run_command", result));
+        // Not an error - is_error only reflects the tool call itself
+        // failing (bad args, unknown tool), never a command that ran but
+        // whose output happened to include this note - so print_boxed_output
+        // would color this box blue, not red.
+        assert!(!result.starts_with("Error: "));
     }
 
     #[test]

@@ -1106,6 +1106,7 @@ async fn auto_continues_past_a_stuck_round_and_recovers_with_a_final_answer() {
     );
 
     let mut history: Vec<Message> = Vec::new();
+    let mut activity_seen: Vec<String> = Vec::new();
 
     let answer = agent
         .run(
@@ -1119,13 +1120,20 @@ async fn auto_continues_past_a_stuck_round_and_recovers_with_a_final_answer() {
             3,
             |_delta| {},
             |_name, _args, _result| {},
-            |_| {},
+            |name| activity_seen.push(name.to_string()),
             || {},
         )
         .await
         .expect("recovering after an auto-continue nudge should be a successful turn");
 
     assert_eq!(answer, "The file says hi.");
+    // Regression test: the auto-continue nudge is printed via on_delta,
+    // which the REPL treats as "final content arrived, stop the spinner
+    // for good" - but this isn't the final answer, so on_activity must
+    // still fire right after to re-arm it for the wait that follows.
+    // Without this, the REPL's spinner would stay dark for the rest of
+    // the turn instead of resuming.
+    assert!(activity_seen.iter().any(|name| name.is_empty()));
 }
 
 #[tokio::test]

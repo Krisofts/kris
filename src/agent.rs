@@ -135,7 +135,7 @@ impl Agent {
         // freshly pushed user message, nothing answered) can roll that dangling
         // message back out of history instead of a caller's retry duplicating
         // it - see the `Err` arm below, which only truncates in that case.
-        let turn_start = history.len();
+        let mut turn_start = history.len();
         history.push(Message::user(user_input));
 
         // Every provider validates tool schemas strictly and expects its
@@ -177,7 +177,13 @@ impl Agent {
         'turn: loop {
             for _ in 0..max_iterations {
                 if self
-                    .enforce_context_budget(history, &mut measured, &mut on_delta)
+                    .enforce_context_budget(
+                        history,
+                        &mut measured,
+                        &mut on_delta,
+                        &mut on_activity,
+                        &mut turn_start,
+                    )
                     .await
                 {
                     // Trimmed every older turn it's allowed to and it still
@@ -315,6 +321,10 @@ impl Agent {
                              approach, or if you already have enough information, give a \
                              direct final answer right now instead of calling another tool.",
                         ));
+                        // The notice just now wasn't the final answer -
+                        // more waiting on the model follows right after,
+                        // which needs the spinner's feedback back on.
+                        on_activity("");
                         continue 'turn;
                     }
 
@@ -388,6 +398,10 @@ impl Agent {
                      task. If you already have enough information, give the final answer \
                      now instead of continuing to call tools.",
                 ));
+                // The notice just now wasn't the final answer - more
+                // waiting on the model follows right after, which needs
+                // the spinner's feedback back on.
+                on_activity("");
                 continue 'turn;
             }
 
@@ -461,11 +475,25 @@ impl Agent {
     /// been appended since - no network round trip. Before the first such
     /// report (or right after a trim invalidates it), the heuristic alone
     /// is the estimate.
+    ///
+    /// `turn_start` is the index of the current turn's own initiating user
+    /// message - trimming only ever considers `Role::User` messages
+    /// *before* it as "an older, completed turn" to drop, never the
+    /// current turn's own boundary. That distinction matters once
+    /// auto-continue can push its own `Message::user(...)` nudges mid-turn
+    /// (also `Role::User`, but still part of *this* turn, not a new one):
+    /// naively treating "the last user message" as the boundary would let
+    /// a nudge get mistaken for the start of a new turn and drop the
+    /// actual original request out from under itself. Adjusted in place
+    /// (by exactly how many messages were removed) whenever a drop shifts
+    /// indices, so it stays valid for the caller to keep using afterward.
     async fn enforce_context_budget(
         &self,
         history: &mut Vec<Message>,
         measured: &mut Option<(usize, u32)>,
         on_delta: &mut impl FnMut(&str),
+        on_activity: &mut impl FnMut(&str),
+        turn_start: &mut usize,
     ) -> bool {
         let soft_limit = (self.context_size as f64 * 0.9) as usize;
 
@@ -483,19 +511,20 @@ impl Agent {
 
         let mut dropped_turns = 0;
 
-        // Always keep at least the most recent turn (the last user message
-        // onward) so the current request never gets erased out from under
-        // itself. Recompute turn boundaries after each drop rather than
-        // reusing stale indices, since draining shifts everything after it.
+        // Always keep at least the current turn (from `turn_start`
+        // onward) so it never gets erased out from under itself. Recompute
+        // boundaries after each drop rather than reusing stale indices,
+        // since draining shifts everything after it (including
+        // `turn_start` itself, adjusted below).
         loop {
-            let turn_starts: Vec<usize> = history
+            let earlier_turn_starts: Vec<usize> = history[..*turn_start]
                 .iter()
                 .enumerate()
                 .filter(|(_, m)| m.role == Role::User)
                 .map(|(i, _)| i)
                 .collect();
 
-            if turn_starts.len() <= 1 || heuristic_tokens(history) <= soft_limit {
+            if earlier_turn_starts.is_empty() || heuristic_tokens(history) <= soft_limit {
                 break;
             }
 
@@ -504,9 +533,14 @@ impl Agent {
             } else {
                 0
             };
-            let next_turn_start = turn_starts[1];
+            // Drop up through the next-oldest turn's own start - or, if
+            // this was the only older turn left, straight up to the
+            // current turn's boundary.
+            let next_turn_start = earlier_turn_starts.get(1).copied().unwrap_or(*turn_start);
 
+            let removed = next_turn_start - start;
             history.drain(start..next_turn_start);
+            *turn_start -= removed;
             dropped_turns += 1;
         }
 
@@ -521,6 +555,11 @@ impl Agent {
                 yellow("(older conversation history trimmed to stay within the context window)")
             );
             on_delta(&notice);
+            // This notice isn't the final answer - the request that
+            // follows right after still needs the spinner's "still
+            // working" feedback, which on_delta alone would otherwise
+            // permanently silence for the rest of the turn.
+            on_activity("");
         }
 
         heuristic_tokens(history) > soft_limit
@@ -757,12 +796,64 @@ mod tests {
             Message::assistant_text("x".repeat(2000)),
         ];
         let mut measured = None;
+        let mut turn_start = 0;
 
         let over_budget = agent
-            .enforce_context_budget(&mut history, &mut measured, &mut |_| {})
+            .enforce_context_budget(
+                &mut history,
+                &mut measured,
+                &mut |_| {},
+                &mut |_| {},
+                &mut turn_start,
+            )
             .await;
 
         assert!(over_budget);
+    }
+
+    #[tokio::test]
+    async fn enforce_context_budget_does_not_treat_an_auto_continue_nudge_as_a_new_turn() {
+        // Regression check: auto-continue pushes its own Message::user(...)
+        // nudge mid-turn (see `run`'s "got stuck" and "reached this round's
+        // limit" branches) to give the model a fresh batch of iterations.
+        // enforce_context_budget's only signal for "where the current turn
+        // starts" is the most recent Role::User message - so if a nudge
+        // lands while the turn is already near budget, this checks whether
+        // it wrongly treats the nudge itself as the start of a new turn and
+        // drops the *original* user request (and everything answered so
+        // far this turn) as if it were old, completed history.
+        let agent = test_agent(100);
+        let mut history = vec![
+            Message::system("system prompt"),
+            Message::user("original request"),
+            Message::assistant_text("x".repeat(2000)),
+            Message::user(
+                "You got stuck repeating the same tool call(s) without making progress...",
+            ),
+        ];
+        let mut measured = None;
+        // The current turn actually started at "original request" (index
+        // 1) - the nudge at index 3 is a continuation of the same turn,
+        // not a new one, exactly as `run()` itself would track it.
+        let mut turn_start = 1;
+
+        agent
+            .enforce_context_budget(
+                &mut history,
+                &mut measured,
+                &mut |_| {},
+                &mut |_| {},
+                &mut turn_start,
+            )
+            .await;
+
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.as_deref() == Some("original request")),
+            "the original user request should never be dropped mid-turn just because an \
+             auto-continue nudge added a second Role::User message"
+        );
     }
 
     #[tokio::test]
@@ -775,9 +866,16 @@ mod tests {
             Message::user("hi"),
         ];
         let mut measured = None;
+        let mut turn_start = 3;
 
         let over_budget = agent
-            .enforce_context_budget(&mut history, &mut measured, &mut |_| {})
+            .enforce_context_budget(
+                &mut history,
+                &mut measured,
+                &mut |_| {},
+                &mut |_| {},
+                &mut turn_start,
+            )
             .await;
 
         assert!(!over_budget);
@@ -785,5 +883,8 @@ mod tests {
         // prompt and the small current turn.
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].content.as_deref(), Some("hi"));
+        // turn_start must stay valid (adjusted for the drop), not point
+        // past the end of the now-shorter history.
+        assert_eq!(turn_start, 1);
     }
 }
