@@ -1,11 +1,11 @@
 //! The template KRIS seeds into every brand-new project's own `KRIS.md` -
 //! house rules the model should follow there. Kept short and readable on
 //! purpose: unlike the rest of the system prompt (reprocessed every turn
-//! and deliberately kept minimal for phone-CPU latency), a project's own
-//! `KRIS.md` only gets folded in once, on the first turn of a session
-//! (`Agent::run`), so it's fine for it to say more. Customize
-//! `~/.config/kris/KRIS.md` to change what gets seeded into new projects
-//! from then on; falls back to `DEFAULT_TEMPLATE` if that doesn't exist.
+//! and deliberately kept minimal), a project's own `KRIS.md` only gets
+//! folded in once, on the first turn of a session (`Agent::run`), so it's
+//! fine for it to say more. Customize `~/.config/kris/KRIS.md` to change
+//! what gets seeded into new projects from then on; falls back to
+//! `DEFAULT_TEMPLATE` if that doesn't exist.
 
 use std::fs;
 use std::path::Path;

@@ -4,16 +4,18 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Which backend serves the model: a local `llama-server` (fully offline),
-/// an online OpenAI-compatible API (Gemini's compatibility endpoint,
-/// OpenRouter's, Opper's, or OpenCode Zen's), or Claude's native Messages
-/// API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Which online provider serves the model: an OpenAI-compatible API
+/// (Gemini's compatibility endpoint, OpenRouter's, Opper's, or OpenCode
+/// Zen's), or Claude's native Messages API. KRIS is online-only - every
+/// request goes to one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
-    Local,
     Gemini,
     Claude,
+    // Needs the least commitment to try (one key, many models, including
+    // `:free`-suffixed ones), so it's the default.
+    #[default]
     OpenRouter,
     Opper,
     Opencode,
@@ -22,7 +24,6 @@ pub enum Provider {
 impl Provider {
     fn as_str(self) -> &'static str {
         match self {
-            Provider::Local => "local",
             Provider::Gemini => "gemini",
             Provider::Claude => "claude",
             Provider::OpenRouter => "openrouter",
@@ -31,16 +32,11 @@ impl Provider {
         }
     }
 
-    /// Accepts the internal names plus the friendlier "offline"/"online"
-    /// aliases the `mode` command speaks, so `config set provider online`
-    /// and `mode online` land on the same value. "online" stays mapped to
-    /// Gemini specifically (its long-standing meaning here) - Claude,
-    /// OpenRouter, Opper, and OpenCode Zen are only ever selected by their
-    /// own name(s), not the generic alias.
+    /// Accepts the internal names plus a couple of friendlier aliases the
+    /// `mode` command speaks.
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "local" | "offline" | "llama" => Some(Provider::Local),
-            "gemini" | "online" => Some(Provider::Gemini),
+            "gemini" => Some(Provider::Gemini),
             "claude" | "anthropic" => Some(Provider::Claude),
             "openrouter" | "or" => Some(Provider::OpenRouter),
             "opper" => Some(Provider::Opper),
@@ -52,39 +48,30 @@ impl Provider {
 
 /// Persisted at `~/.config/kris/config.toml`. Every field has a sane
 /// default so a first run with no config file at all still works, as long
-/// as `model_path` gets set (via `config set model_path ...` or by
-/// `scripts/setup-termux.sh`, which writes it directly).
+/// as an API key gets set for whichever provider is active (via
+/// `config set <provider>_api_key ...` or the matching environment
+/// variable).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Selects offline (`local` llama-server) vs online (`gemini`) at
-    /// runtime, so the same install can switch between the two without
-    /// re-editing anything but this one value.
+    /// Selects which online provider serves requests. Defaults to
+    /// OpenRouter since it needs the least commitment to try (one key,
+    /// many models, including `:free`-suffixed ones).
     pub provider: Provider,
-    pub model_path: String,
-    pub llama_server_path: String,
-    pub llama_url: String,
-    pub context_size: u32,
     pub temperature: f32,
     pub max_tokens: u32,
-    pub threads: Option<u32>,
-    pub mlock: bool,
-    pub flash_attn: bool,
-    pub cache_type_k: Option<String>,
-    pub cache_type_v: Option<String>,
-    /// OpenAI-compatible base URL for the online provider (Gemini's compat
-    /// endpoint by default). The client appends `/chat/completions`.
+    /// OpenAI-compatible base URL for Gemini's own compat endpoint. The
+    /// client appends `/chat/completions`.
     pub gemini_url: String,
-    /// Model id sent in online requests, e.g. `gemini-2.5-flash`.
+    /// Model id sent in Gemini requests, e.g. `gemini-2.5-flash`.
     pub gemini_model: String,
-    /// API key for the online provider. Left empty by default: the
-    /// `GEMINI_API_KEY` environment variable is preferred and checked
-    /// first, so the key need not be written to disk in plain text at all.
+    /// API key for Gemini. Left empty by default: the `GEMINI_API_KEY`
+    /// environment variable is preferred and checked first, so the key
+    /// need not be written to disk in plain text at all.
     pub gemini_api_key: String,
-    /// Context-window budget used for history trimming in online mode,
-    /// kept separate from `context_size` (which doubles as llama-server's
-    /// `-c` allocation) so a large online window doesn't make the local
-    /// server try to reserve gigabytes of KV cache.
+    /// Context-window budget used for history trimming, tracked
+    /// separately per provider since it varies a lot by whichever model
+    /// is selected.
     pub gemini_context_size: u32,
     /// Base URL for Claude's native Messages API.
     pub claude_url: String,
@@ -183,27 +170,13 @@ impl Default for Settings {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
         Self {
-            provider: Provider::Local,
-            model_path: String::new(),
-            llama_server_path: home
-                .join("llama.cpp/build/bin/llama-server")
-                .display()
-                .to_string(),
-            llama_url: "http://127.0.0.1:8080".to_string(),
-            context_size: 8192,
+            provider: Provider::default(),
             temperature: 0.2,
             // Bounds how long a single reply can run if the model ever
             // latches onto a repetitive loop and never emits a stop
-            // token - at phone-CPU decode speeds, 4096 tokens of that
-            // could mean tens of minutes stuck "thinking" before the cap
-            // even kicks in. Raise via `config set max_tokens <n>` for a
-            // task that genuinely needs longer replies.
+            // token. Raise via `config set max_tokens <n>` for a task
+            // that genuinely needs longer replies.
             max_tokens: 1024,
-            threads: None,
-            mlock: false,
-            flash_attn: true,
-            cache_type_k: Some("q8_0".to_string()),
-            cache_type_v: Some("q8_0".to_string()),
             gemini_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
             gemini_model: "gemini-2.5-flash".to_string(),
             gemini_api_key: String::new(),
@@ -311,11 +284,24 @@ impl Settings {
     pub fn set_field(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "provider" => {
-                self.provider = Provider::parse(value).with_context(|| {
-                    format!(
-                        "expected local/offline, gemini/online, claude, or openrouter, got \"{value}\""
-                    )
-                })?;
+                let normalized = value.trim().to_ascii_lowercase();
+                if matches!(
+                    normalized.as_str(),
+                    "local" | "offline" | "llama" | "online"
+                ) {
+                    // KRIS no longer has an offline/local mode at all (nor
+                    // a generic "online" toggle now that everything is) -
+                    // an old config.toml or a stale habit shouldn't refuse
+                    // to load or error out, just fall back to the current
+                    // default provider instead.
+                    self.provider = Provider::default();
+                } else {
+                    self.provider = Provider::parse(value).with_context(|| {
+                        format!(
+                            "expected gemini, claude, openrouter, opper, or opencode, got \"{value}\""
+                        )
+                    })?;
+                }
             }
             "gemini_url" => self.gemini_url = value.to_string(),
             "gemini_model" => self.gemini_model = value.to_string(),
@@ -378,16 +364,6 @@ impl Settings {
                 }
                 self.opencode_context_size = parsed;
             }
-            "model_path" => self.model_path = value.to_string(),
-            "llama_server_path" => self.llama_server_path = value.to_string(),
-            "llama_url" => self.llama_url = value.to_string(),
-            "context_size" => {
-                let parsed: u32 = value.parse().context("expected an integer")?;
-                if parsed == 0 {
-                    anyhow::bail!("context_size must be greater than 0");
-                }
-                self.context_size = parsed;
-            }
             "temperature" => {
                 let parsed: f32 = value.parse().context("expected a number")?;
                 if !(0.0..=2.0).contains(&parsed) {
@@ -402,30 +378,16 @@ impl Settings {
                 }
                 self.max_tokens = parsed;
             }
-            "threads" => {
-                let parsed: u32 = value.parse().context("expected an integer")?;
-                if parsed == 0 {
-                    anyhow::bail!(
-                        "threads must be greater than 0 (unset it instead to use the default)"
-                    );
-                }
-                self.threads = Some(parsed);
-            }
-            "mlock" => self.mlock = value.parse().context("expected true or false")?,
-            "flash_attn" => self.flash_attn = value.parse().context("expected true or false")?,
-            "cache_type_k" => self.cache_type_k = Some(value.to_string()),
-            "cache_type_v" => self.cache_type_v = Some(value.to_string()),
             "workspace" => self.workspace = normalize_workspace_path(value),
             "active_project" => self.active_project = value.to_string(),
-            // Legacy key from before this file's fields were renamed -
-            // silently ignored (not rejected, so an old config.toml still
-            // loads) rather than mapped onto `workspace`. It used to
-            // default to the whole home directory for anyone who hadn't
-            // customized it, which is far too broad to adopt as the new
-            // workspace root; the old `workspace` key (the single active
-            // project's own directory) usually already sits inside the
-            // right parent folder and is a much safer value to keep.
-            "projects_root" => {}
+            // Legacy keys from before KRIS dropped offline/local llama.cpp
+            // support entirely (model_path, llama_server_path, llama_url,
+            // context_size, threads, mlock, flash_attn, cache_type_k/v) or
+            // from before "workspace" took over "projects_root"'s meaning -
+            // silently ignored (not rejected) so an old config.toml still
+            // loads instead of refusing to start.
+            "projects_root" | "model_path" | "llama_server_path" | "llama_url" | "context_size"
+            | "threads" | "mlock" | "flash_attn" | "cache_type_k" | "cache_type_v" => {}
             "bypass_permissions" => {
                 self.bypass_permissions = value.parse().context("expected true or false")?
             }
@@ -444,14 +406,13 @@ impl Settings {
         toml_render_inner(self, true)
     }
 
-    /// Resolves the active online provider's API key, preferring its
-    /// environment variable (`GEMINI_API_KEY` / `ANTHROPIC_API_KEY` /
-    /// `OPENROUTER_API_KEY`) over the persisted config value so the key
-    /// need never be written to disk at all. Returns `None` for the local
-    /// provider, which needs no key.
+    /// Resolves the active provider's API key, preferring its environment
+    /// variable (`GEMINI_API_KEY` / `ANTHROPIC_API_KEY` /
+    /// `OPENROUTER_API_KEY` / `OPPER_API_KEY` / `OPENCODE_API_KEY`) over
+    /// the persisted config value so the key need never be written to
+    /// disk at all.
     pub fn resolved_api_key(&self) -> Option<String> {
         let (env_var, configured) = match self.provider {
-            Provider::Local => return None,
             Provider::Gemini => ("GEMINI_API_KEY", &self.gemini_api_key),
             Provider::Claude => ("ANTHROPIC_API_KEY", &self.claude_api_key),
             Provider::OpenRouter => ("OPENROUTER_API_KEY", &self.openrouter_api_key),
@@ -469,11 +430,10 @@ impl Settings {
     }
 
     /// Context-window budget the history-trimmer should respect for the
-    /// active provider - each online window is tracked separately from the
-    /// local llama-server allocation (and from each other).
+    /// active provider - each one is tracked separately since it varies a
+    /// lot by whichever model is selected behind it.
     pub fn effective_context_size(&self) -> u32 {
         match self.provider {
-            Provider::Local => self.context_size,
             Provider::Gemini => self.gemini_context_size,
             Provider::Claude => self.claude_context_size,
             Provider::OpenRouter => self.openrouter_context_size,
@@ -483,9 +443,9 @@ impl Settings {
     }
 
     /// Soft warnings about combinations that parse fine individually but
-    /// don't make sense together - printed at startup, not enforced,
-    /// since llama-server would otherwise just fail confusingly deep
-    /// into a request instead of up front.
+    /// don't make sense together - printed at startup, not enforced, since
+    /// the provider would otherwise just fail confusingly deep into a
+    /// request instead of up front.
     pub fn sanity_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -499,44 +459,19 @@ impl Settings {
             ));
         }
 
-        if self.provider == Provider::Gemini && self.resolved_api_key().is_none() {
-            warnings.push(
-                "online mode (provider = gemini) is selected but no API key is set - export \
-                 GEMINI_API_KEY, or run `config set gemini_api_key <key>`."
-                    .to_string(),
-            );
-        }
-
-        if self.provider == Provider::Claude && self.resolved_api_key().is_none() {
-            warnings.push(
-                "Claude mode (provider = claude) is selected but no API key is set - export \
-                 ANTHROPIC_API_KEY, or run `config set claude_api_key <key>`."
-                    .to_string(),
-            );
-        }
-
-        if self.provider == Provider::OpenRouter && self.resolved_api_key().is_none() {
-            warnings.push(
-                "OpenRouter mode (provider = openrouter) is selected but no API key is set - \
-                 export OPENROUTER_API_KEY, or run `config set openrouter_api_key <key>`."
-                    .to_string(),
-            );
-        }
-
-        if self.provider == Provider::Opper && self.resolved_api_key().is_none() {
-            warnings.push(
-                "Opper mode (provider = opper) is selected but no API key is set - export \
-                 OPPER_API_KEY, or run `config set opper_api_key <key>`."
-                    .to_string(),
-            );
-        }
-
-        if self.provider == Provider::Opencode && self.resolved_api_key().is_none() {
-            warnings.push(
-                "OpenCode Zen mode (provider = opencode) is selected but no API key is set - \
-                 export OPENCODE_API_KEY, or run `config set opencode_api_key <key>`."
-                    .to_string(),
-            );
+        if self.resolved_api_key().is_none() {
+            let (env_var, config_key) = match self.provider {
+                Provider::Gemini => ("GEMINI_API_KEY", "gemini_api_key"),
+                Provider::Claude => ("ANTHROPIC_API_KEY", "claude_api_key"),
+                Provider::OpenRouter => ("OPENROUTER_API_KEY", "openrouter_api_key"),
+                Provider::Opper => ("OPPER_API_KEY", "opper_api_key"),
+                Provider::Opencode => ("OPENCODE_API_KEY", "opencode_api_key"),
+            };
+            warnings.push(format!(
+                "provider = {} is selected but no API key is set - export {env_var}, or run \
+                 `config set {config_key} <key>`.",
+                self.provider.as_str()
+            ));
         }
 
         warnings
@@ -544,9 +479,8 @@ impl Settings {
 }
 
 /// Tiny hand-rolled TOML reader/writer covering exactly the flat
-/// string/int/float/bool/option shape `Settings` uses, so the crate
-/// doesn't need a full `toml` dependency just to persist a dozen scalar
-/// fields (keeps the dependency tree, and thus Termux build time, down).
+/// string/int/float/bool shape `Settings` uses, so the crate doesn't need
+/// a full `toml` dependency just to persist a dozen scalar fields.
 fn toml_render(settings: &Settings) -> String {
     toml_render_inner(settings, false)
 }
@@ -554,26 +488,8 @@ fn toml_render(settings: &Settings) -> String {
 fn toml_render_inner(settings: &Settings, redact: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!("provider = {:?}\n", settings.provider.as_str()));
-    out.push_str(&format!("model_path = {:?}\n", settings.model_path));
-    out.push_str(&format!(
-        "llama_server_path = {:?}\n",
-        settings.llama_server_path
-    ));
-    out.push_str(&format!("llama_url = {:?}\n", settings.llama_url));
-    out.push_str(&format!("context_size = {}\n", settings.context_size));
     out.push_str(&format!("temperature = {}\n", settings.temperature));
     out.push_str(&format!("max_tokens = {}\n", settings.max_tokens));
-    if let Some(threads) = settings.threads {
-        out.push_str(&format!("threads = {threads}\n"));
-    }
-    out.push_str(&format!("mlock = {}\n", settings.mlock));
-    out.push_str(&format!("flash_attn = {}\n", settings.flash_attn));
-    if let Some(v) = &settings.cache_type_k {
-        out.push_str(&format!("cache_type_k = {v:?}\n"));
-    }
-    if let Some(v) = &settings.cache_type_v {
-        out.push_str(&format!("cache_type_v = {v:?}\n"));
-    }
     out.push_str(&format!("gemini_url = {:?}\n", settings.gemini_url));
     out.push_str(&format!("gemini_model = {:?}\n", settings.gemini_model));
     let api_key = if redact && !settings.gemini_api_key.is_empty() {
@@ -724,18 +640,14 @@ mod tests {
     #[test]
     fn round_trips_through_render_and_parse() {
         let settings = Settings {
-            model_path: "/data/model.gguf".to_string(),
-            context_size: 4096,
-            threads: Some(4),
+            max_tokens: 4096,
             ..Settings::default()
         };
 
         let rendered = toml_render(&settings);
         let parsed = toml_parse(&rendered).unwrap();
 
-        assert_eq!(parsed.model_path, "/data/model.gguf");
-        assert_eq!(parsed.context_size, 4096);
-        assert_eq!(parsed.threads, Some(4));
+        assert_eq!(parsed.max_tokens, 4096);
     }
 
     #[test]
@@ -753,6 +665,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_local_only_keys_are_silently_ignored_not_rejected() {
+        // Regression coverage for dropping offline/local llama.cpp mode:
+        // an old config.toml written before that removal still has
+        // model_path/llama_server_path/llama_url/context_size/threads/
+        // mlock/flash_attn/cache_type_k/cache_type_v lines - loading it
+        // must not fail just because those fields no longer exist.
+        let raw = "\
+            model_path = \"/data/model.gguf\"\n\
+            llama_server_path = \"/data/llama-server\"\n\
+            llama_url = \"http://127.0.0.1:8080\"\n\
+            context_size = \"8192\"\n\
+            threads = \"4\"\n\
+            mlock = \"false\"\n\
+            flash_attn = \"true\"\n\
+            cache_type_k = \"q8_0\"\n\
+            cache_type_v = \"q8_0\"\n\
+            max_tokens = \"2048\"\n";
+
+        let parsed = toml_parse(raw).unwrap();
+        assert_eq!(parsed.max_tokens, 2048);
+    }
+
+    #[test]
+    fn legacy_local_and_online_provider_values_fall_back_to_the_default() {
+        // "local"/"offline"/"llama" no longer mean anything (KRIS is
+        // online-only), and "online" was only ever a generic alias for
+        // Gemini specifically - with nothing left to contrast it against,
+        // that alias falls back to the default provider too rather than
+        // erroring on an old config file.
+        let mut settings = Settings::default();
+
+        settings.set_field("provider", "local").unwrap();
+        assert_eq!(settings.provider, Provider::default());
+
+        settings.set_field("provider", "offline").unwrap();
+        assert_eq!(settings.provider, Provider::default());
+
+        settings.set_field("provider", "online").unwrap();
+        assert_eq!(settings.provider, Provider::default());
+    }
+
+    #[test]
     fn set_field_rejects_unknown_key() {
         let mut settings = Settings::default();
         assert!(settings.set_field("does_not_exist", "x").is_err());
@@ -761,12 +715,8 @@ mod tests {
     #[test]
     fn provider_accepts_friendly_aliases() {
         let mut settings = Settings::default();
-        assert_eq!(settings.provider, Provider::Local);
+        assert_eq!(settings.provider, Provider::OpenRouter);
 
-        settings.set_field("provider", "online").unwrap();
-        assert_eq!(settings.provider, Provider::Gemini);
-        settings.set_field("provider", "offline").unwrap();
-        assert_eq!(settings.provider, Provider::Local);
         settings.set_field("provider", "gemini").unwrap();
         assert_eq!(settings.provider, Provider::Gemini);
         settings.set_field("provider", "claude").unwrap();
@@ -805,7 +755,6 @@ mod tests {
     #[test]
     fn effective_context_size_follows_provider() {
         let mut settings = Settings {
-            context_size: 8192,
             gemini_context_size: 128_000,
             claude_context_size: 200_000,
             openrouter_context_size: 64_000,
@@ -813,7 +762,6 @@ mod tests {
             opencode_context_size: 16_000,
             ..Settings::default()
         };
-        assert_eq!(settings.effective_context_size(), 8192);
         settings.provider = Provider::Gemini;
         assert_eq!(settings.effective_context_size(), 128_000);
         settings.provider = Provider::Claude;
@@ -1009,10 +957,10 @@ mod tests {
     }
 
     #[test]
-    fn resolved_api_key_is_none_for_local_provider() {
+    fn resolved_api_key_is_none_when_nothing_is_configured() {
         let settings = Settings {
-            provider: Provider::Local,
-            claude_api_key: "should-be-ignored".to_string(),
+            provider: Provider::Claude,
+            claude_api_key: String::new(),
             ..Settings::default()
         };
         assert_eq!(settings.resolved_api_key(), None);

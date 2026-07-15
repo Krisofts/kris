@@ -1,7 +1,7 @@
 //! End-to-end test of client.rs + agent.rs against a hand-rolled mock
-//! HTTP/SSE server standing in for llama-server, so the streaming parser,
-//! tool-call accumulation, and tool execution loop can be exercised
-//! without needing a real llama.cpp build or GGUF model.
+//! HTTP/SSE server standing in for a real provider, so the streaming
+//! parser, tool-call accumulation, and tool execution loop can be
+//! exercised without needing a real API key or network access.
 
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,9 +93,7 @@ async fn handle_connection(mut stream: TcpStream, chat_calls: Arc<AtomicUsize>) 
         .to_string();
 
     match path.as_str() {
-        "/health" => respond(&mut stream, "application/json", "{}").await,
-        "/tokenize" => respond(&mut stream, "application/json", r#"{"tokens":[1,2,3]}"#).await,
-        "/v1/chat/completions" => {
+        "/chat/completions" => {
             let call_index = chat_calls.fetch_add(1, Ordering::SeqCst);
             let body = if call_index == 0 {
                 TOOL_CALL_SSE
@@ -248,9 +246,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Answers the first request with a normal tool call, then drops the
-/// connection with no response at all on the second - standing in for
-/// llama-server getting reaped, or a flaky network, partway through a
-/// multi-iteration turn.
+/// connection with no response at all on the second - standing in for a
+/// flaky network partway through a multi-iteration turn.
 async fn spawn_tool_call_then_drop_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -311,8 +308,7 @@ async fn handle_endless_tool_call_connection(mut stream: TcpStream, chat_calls: 
         .unwrap_or("");
 
     match path {
-        "/health" => respond(&mut stream, "application/json", "{}").await,
-        "/v1/chat/completions" => {
+        "/chat/completions" => {
             let index = chat_calls.fetch_add(1, Ordering::SeqCst);
             let payload = serde_json::json!({
                 "choices": [{
@@ -357,8 +353,7 @@ async fn spawn_single_response_server(body: &'static str) -> String {
                     .unwrap_or("");
 
                 match path {
-                    "/health" => respond(&mut stream, "application/json", "{}").await,
-                    "/v1/chat/completions" => respond(&mut stream, "text/event-stream", body).await,
+                    "/chat/completions" => respond(&mut stream, "text/event-stream", body).await,
                     other => panic!("mock server got an unexpected request path: {other}"),
                 }
             });
@@ -375,7 +370,12 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
 
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
     let agent = Agent::new(
         client,
         ToolRegistry::with_defaults(false, false),
@@ -430,7 +430,12 @@ async fn on_activity_reports_the_tool_name_while_its_arguments_are_still_streami
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
 
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
     let agent = Agent::new(
         client,
         ToolRegistry::with_defaults(false, false),
@@ -478,16 +483,21 @@ async fn on_activity_reports_the_tool_name_while_its_arguments_are_still_streami
 async fn connection_failure_after_progress_keeps_history_instead_of_rolling_it_back() {
     // Regression test: a request failure used to always roll the *whole*
     // turn back out of history via `history.truncate(turn_start)` - fine
-    // when nothing had happened yet, but if llama-server got reaped (or the
-    // network dropped) after a tool call had already completed this turn,
-    // it discarded that real progress too, forcing a retry to redo the
-    // whole task from scratch instead of continuing from where it left off.
+    // when nothing had happened yet, but if the network dropped after a
+    // tool call had already completed this turn, it discarded that real
+    // progress too, forcing a retry to redo the whole task from scratch
+    // instead of continuing from where it left off.
     let base_url = spawn_tool_call_then_drop_server().await;
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
 
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
     let agent = Agent::new(
         client,
         ToolRegistry::with_defaults(false, false),
@@ -616,7 +626,12 @@ async fn truncated_reasoning_reply_surfaces_a_diagnostic_instead_of_silence() {
     );
     let base_url = spawn_single_response_server(body).await;
 
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
 
     let mut streamed = String::new();
     let outcome = client
@@ -654,7 +669,12 @@ async fn reasoning_trace_is_not_dumped_to_the_terminal() {
     );
     let base_url = spawn_single_response_server(body).await;
 
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
 
     let mut streamed = String::new();
     let outcome = client
@@ -705,7 +725,12 @@ async fn done_marker_ends_the_stream_even_if_the_connection_stays_open() {
     });
 
     let base_url = format!("http://{addr}");
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
@@ -723,17 +748,16 @@ async fn done_marker_ends_the_stream_even_if_the_connection_stays_open() {
 
 #[tokio::test]
 async fn a_stream_that_goes_silent_times_out_instead_of_hanging_forever() {
-    // Regression test for an on-device symptom: a large local model
-    // decoding slowly on a phone CPU could still be making steady
-    // progress well past any reasonable "this looks stuck" cutoff - a
-    // blanket whole-request timeout used to kill it regardless, which got
-    // misread as a dropped connection and auto-retried, sending a fresh
-    // request that hit the exact same wall - visible in llama-server's own
-    // log as one cancelled task after another, forever. There must still
-    // be *some* bound, though, for a connection that goes genuinely silent
-    // (no bytes at all) rather than just slow - confirmed here with a
-    // short inactivity timeout so the test itself doesn't have to wait out
-    // the real, deliberately generous production value.
+    // Regression test for an on-device symptom: a reasoning model could
+    // still be making steady progress well past any reasonable "this looks
+    // stuck" cutoff - a blanket whole-request timeout used to kill it
+    // regardless, which got misread as a dropped connection and
+    // auto-retried, sending a fresh request that hit the exact same wall,
+    // over and over, forever. There must still be *some* bound, though,
+    // for a connection that goes genuinely silent (no bytes at all) rather
+    // than just slow - confirmed here with a short inactivity timeout so
+    // the test itself doesn't have to wait out the real, deliberately
+    // generous production value.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -754,8 +778,13 @@ async fn a_stream_that_goes_silent_times_out_instead_of_hanging_forever() {
     });
 
     let base_url = format!("http://{addr}");
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None)
-        .with_stream_inactivity_timeout(Duration::from_millis(200));
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    )
+    .with_stream_inactivity_timeout(Duration::from_millis(200));
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
@@ -779,7 +808,12 @@ async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
     let base_url = spawn_endless_tool_call_server().await;
     let dir = tempfile::tempdir().unwrap();
 
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
     let agent = Agent::new(
         client,
         ToolRegistry::with_defaults(false, false),
@@ -826,7 +860,12 @@ async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
     let base_url = spawn_single_response_server(HALLUCINATED_TOOL_SSE).await;
 
     let dir = tempfile::tempdir().unwrap();
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
     let agent = Agent::new(
         client,
         ToolRegistry::with_defaults(false, false),
@@ -869,7 +908,12 @@ async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
 async fn summarize_returns_the_models_plain_text_recap_for_the_compact_command() {
     let base_url = spawn_single_response_server(SUMMARY_SSE).await;
 
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
     let agent = Agent::new(
         client,
         ToolRegistry::with_defaults(false, false),
@@ -920,7 +964,12 @@ async fn project_kris_md_conventions_are_folded_into_the_system_prompt() {
     fs::write(dir.path().join("KRIS.md"), "Always write tests first.").unwrap();
 
     let base_url = format!("http://{addr}");
-    let client = ModelClient::new(base_url, "test-model".to_string(), Backend::Llama, None);
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
     let agent = Agent::new(
         client,
         ToolRegistry::with_defaults(false, false),

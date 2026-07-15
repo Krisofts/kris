@@ -9,8 +9,8 @@ use super::{Tool, ToolError};
 
 /// Above this many lines, `read_file` without an explicit range truncates
 /// and tells the model to use `offset`/`limit` or `outline_file` instead -
-/// on an 8k-context phone model, one big source file can otherwise eat the
-/// entire budget in a single tool call.
+/// a smaller-context model can otherwise have one big source file eat a
+/// large share of its budget in a single tool call.
 const SOFT_LINE_CAP: usize = 500;
 
 pub struct ReadFileTool;

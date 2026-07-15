@@ -43,21 +43,17 @@ impl Agent {
     }
 
     pub(crate) fn system_prompt(&self, project_name: &str, project_type_hint: &str) -> String {
-        // Tool schemas travel in the request's `tools` field now (native
-        // tool-calling via llama-server --jinja), not spelled out as JSON
-        // prose here - keeps this prompt, and its reprocessing cost on
-        // every turn, small.
+        // Tool schemas travel in the request's `tools` field, not spelled
+        // out as JSON prose here - keeps this prompt small.
         let type_line = if project_type_hint.is_empty() {
             String::new()
         } else {
             format!(" {project_type_hint}")
         };
 
-        // Kept tight on purpose beyond this opening line: every word here is
-        // reprocessed on the first turn of each session (and again whenever
-        // the KV cache can't be reused), which is real latency on
-        // phone-class CPUs - a longer, more thorough-sounding prompt past
-        // this isn't a free win.
+        // Kept tight on purpose beyond this opening line: every word here
+        // is reprocessed on the first turn of each session, and a longer,
+        // more thorough-sounding prompt past this isn't a free win.
         format!(
             "You are KRIS, a powerful, agentic coding assistant that reads, writes, and runs \
              real commands directly in the user's terminal to get engineering tasks done, not \
@@ -128,13 +124,11 @@ impl Agent {
         let turn_start = history.len();
         history.push(Message::user(user_input));
 
-        // A remote provider (Gemini, Claude) validates tool schemas
-        // strictly and expects its own shape, so hand it the matching
-        // sanitized form; llama-server takes the full schema as-is.
+        // Every provider validates tool schemas strictly and expects its
+        // own shape, so hand it the matching sanitized form.
         let tool_schemas = match self.client.backend() {
             Backend::OpenAiCompat => self.tools.describe_all_gemini(),
             Backend::Anthropic => self.tools.describe_all_anthropic(),
-            Backend::Llama => self.tools.describe_all(),
         };
 
         // Tracks the previous iteration's tool call(s) so an identical
@@ -144,11 +138,11 @@ impl Agent {
         // through the rest of `max_iterations` asking the same thing.
         let mut previous_call_signature: Option<String> = None;
 
-        // Last exact prompt-token count llama-server reported, paired with
+        // Last exact prompt-token count the provider reported, paired with
         // the history length it was measured at, so the budget check can
         // extrapolate the current size (that count plus a heuristic estimate
-        // of whatever's been appended since) instead of paying for a fresh
-        // `/tokenize` round trip every iteration.
+        // of whatever's been appended since) instead of re-tokenizing the
+        // whole conversation every iteration.
         let mut measured: Option<(usize, u32)> = None;
 
         for _ in 0..max_iterations {
@@ -196,9 +190,9 @@ impl Agent {
                     // Only roll back when nothing came of this turn yet - once
                     // at least one iteration has completed (tool calls/results
                     // already in history), keep them. Losing the connection
-                    // mid-task (llama-server reaped, a flaky network) shouldn't
-                    // throw away work already done; a caller can resume from
-                    // here instead of redoing the whole task.
+                    // mid-task (a flaky network) shouldn't throw away work
+                    // already done; a caller can resume from here instead of
+                    // redoing the whole task.
                     if history.len() == turn_start + 1 {
                         history.truncate(turn_start);
                     }
@@ -366,12 +360,12 @@ impl Agent {
     /// should stop rather than send a request doomed to be rejected by the
     /// provider anyway.
     ///
-    /// The size estimate is cheap: when llama-server has already reported an
+    /// The size estimate is cheap: when the provider has already reported an
     /// exact `prompt_tokens` for an earlier request this turn (`measured`),
     /// it extrapolates from that plus a chars/4 heuristic for whatever's
-    /// been appended since - no network round trip. Only before the first
-    /// such report (or right after a trim invalidates it) does it fall back
-    /// to the old path: a chars/4 gate, then a real `/tokenize` call.
+    /// been appended since - no network round trip. Before the first such
+    /// report (or right after a trim invalidates it), the heuristic alone
+    /// is the estimate.
     async fn enforce_context_budget(
         &self,
         history: &mut Vec<Message>,
@@ -385,14 +379,7 @@ impl Agent {
                 let len = len.min(history.len());
                 prompt_tokens as usize + heuristic_tokens(&history[len..])
             }
-            None => {
-                let heuristic = heuristic_tokens(history);
-                if heuristic < soft_limit * 3 / 4 {
-                    return false;
-                }
-                let joined = joined_text(history);
-                self.client.tokenize(&joined).await.unwrap_or(heuristic)
-            }
+            None => heuristic_tokens(history),
         };
 
         if estimate <= soft_limit {
@@ -465,20 +452,12 @@ pub fn heuristic_tokens(history: &[Message]) -> usize {
         .sum()
 }
 
-fn joined_text(history: &[Message]) -> String {
-    history
-        .iter()
-        .filter_map(|m| m.content.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Defensive fallback: if the server ever returns a tool call as plain
-/// content instead of the structured `tool_calls` field (e.g. --jinja
-/// wasn't enabled, an older llama-server build, or this model's chat
-/// template just isn't getting server-side tool-call parsing), scan for a
-/// single balanced `{...}` JSON object describing a call and pull out a
-/// (name, args) pair. Different model families spell this differently -
+/// Defensive fallback: if the provider ever returns a tool call as plain
+/// content instead of the structured `tool_calls` field (some models
+/// routed through a gateway like OpenRouter don't reliably emit structured
+/// tool calls at all), scan for a single balanced `{...}` JSON object
+/// describing a call and pull out a (name, args) pair. Different model
+/// families spell this differently -
 /// KRIS's own `{"tool": ..., "args": {...}}`, and the OpenAI/Hermes-style
 /// `{"name": ..., "arguments": {...}}` that Qwen models leak (often
 /// wrapped in `<tool_call>...</tool_call>` tags) plus its nested
@@ -622,10 +601,9 @@ mod tests {
     }
 
     fn test_agent(context_size: u32) -> Agent {
-        // `Backend::OpenAiCompat` so `tokenize()` bails out immediately
-        // (it only works against a real local llama-server) and falls back
-        // to the heuristic without any network I/O - the base URL is never
-        // actually reached.
+        // The base URL is never actually reached by these tests - context
+        // budget enforcement only ever uses the chars/4 heuristic now, no
+        // network I/O.
         let client = ModelClient::new(
             "http://localhost".to_string(),
             "test-model".to_string(),

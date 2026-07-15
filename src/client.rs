@@ -10,13 +10,9 @@ use crate::message::{FunctionCall, Message, Role, ToolCall};
 /// Which flavour of endpoint we're talking to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// A local `llama-server` (llama.cpp, `--jinja`). Accepts and benefits
-    /// from llama.cpp-specific request fields (`cache_prompt`,
-    /// `repeat_penalty`) and exposes `/tokenize` and `/health`.
-    Llama,
-    /// A remote OpenAI-compatible API (Gemini's compat endpoint). Reached
-    /// over HTTPS with a bearer token; only standard OpenAI request fields
-    /// are sent, since the extra llama.cpp ones would be rejected.
+    /// A remote OpenAI-compatible API (Gemini's compat endpoint,
+    /// OpenRouter's, Opper's, or OpenCode Zen's). Reached over HTTPS with a
+    /// bearer token; only standard OpenAI request fields are sent.
     OpenAiCompat,
     /// Claude's native Messages API (`/v1/messages`). Not OpenAI-shaped at
     /// all: system prompt is a separate top-level field, message content is
@@ -32,17 +28,16 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// How long a streaming response is allowed to go with *no new bytes at
 /// all* before it's treated as genuinely stalled, rather than just slow.
-/// Generous on purpose: a large local model on a phone CPU can take a
-/// while between tokens without actually being stuck, and every new byte
-/// that arrives resets this - it only fires on true silence, unlike a
-/// blanket whole-request timeout that would also kill a stream making
-/// perfectly steady (if slow) progress.
+/// Generous on purpose: a reasoning model can spend a while "thinking"
+/// before its first visible token without actually being stuck, and every
+/// new byte that arrives resets this - it only fires on true silence,
+/// unlike a blanket whole-request timeout that would also kill a stream
+/// making perfectly steady (if slow) progress.
 const STREAM_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Talks to an OpenAI-compatible chat-completions endpoint - either a local
-/// `llama-server` over plain HTTP (fully offline), or a remote provider like
-/// Gemini over HTTPS. The `backend` decides which endpoint-specific request
-/// fields and auth are used.
+/// Talks to a remote provider's chat-completions endpoint over HTTPS. The
+/// `backend` decides which endpoint-specific request fields and auth are
+/// used.
 pub struct ModelClient {
     http: reqwest::Client,
     base_url: String,
@@ -72,40 +67,22 @@ struct ChatRequest<'a> {
     temperature: f32,
     max_tokens: u32,
     stream: bool,
-    /// Lets llama-server reuse the KV cache for the unchanged prefix
-    /// (system prompt + earlier turns) instead of recomputing it every
-    /// request - the single biggest latency win available on CPU. A
-    /// llama.cpp extension, so it's omitted for remote providers that would
-    /// reject the unknown field.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_prompt: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
-    /// Sent explicitly (rather than left to llama-server's own default)
-    /// because some chat-template builds bias heavily toward always
+    /// Sent explicitly rather than left to the provider's own default -
+    /// some chat-template-driven backends bias heavily toward always
     /// emitting a tool call once `tools` is present unless `tool_choice`
-    /// says otherwise - "auto" is what actually lets the model answer in
+    /// says otherwise; "auto" is what actually lets the model answer in
     /// plain text when no tool is warranted.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'a str>,
-    /// Sent explicitly rather than left to llama-server's default -
-    /// without a real penalty against repeating itself, a small model at
-    /// low temperature (KRIS defaults to 0.2, deterministic on purpose
-    /// for coding tasks) is prone to latching onto a repetitive loop and
-    /// never emitting a stop token, running all the way to `max_tokens`
-    /// instead of a normal-length reply. A llama.cpp field name, so it's
-    /// omitted for remote providers (which use `frequency_penalty` instead
-    /// and would reject this one).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repeat_penalty: Option<f32>,
-    /// Asks llama-server to append a final usage chunk (with `choices: []`)
+    /// Asks the provider to append a final usage chunk (with `choices: []`)
     /// carrying the exact `prompt_tokens` it actually processed. That count
     /// is what the context-budget check needs, and getting it here for free
-    /// avoids a separate `/tokenize` round trip that re-tokenizes the whole
-    /// conversation every turn once it grows large - real overhead on a
-    /// phone. It's also strictly more accurate than tokenizing the raw
-    /// message text ourselves, since it reflects the chat-template and tool-
-    /// schema tokens the server actually rendered.
+    /// avoids re-tokenizing the whole conversation ourselves every turn once
+    /// it grows large. It's also strictly more accurate than estimating from
+    /// the raw message text, since it reflects the chat-template and tool-
+    /// schema tokens the provider actually rendered.
     stream_options: StreamOptions,
     /// OpenRouter's reasoning-effort override (see `ModelClient::
     /// with_reasoning_effort`). Omitted entirely unless explicitly set, so
@@ -133,10 +110,10 @@ pub struct StreamOutcome {
     /// answer that just happens to start the same way still gets shown
     /// once it's clear it isn't one.
     pub held_back: Option<String>,
-    /// Exact number of prompt tokens llama-server reported processing for
-    /// this request (from the streamed usage chunk), or `None` if the
-    /// server build didn't send one. Lets the caller track context usage
-    /// without a separate `/tokenize` call.
+    /// Exact number of prompt tokens the provider reported processing for
+    /// this request (from the streamed usage chunk), or `None` if it
+    /// didn't send one. Lets the caller track context usage without
+    /// re-tokenizing the conversation itself.
     pub prompt_tokens: Option<u32>,
 }
 
@@ -150,24 +127,24 @@ enum StreamMode {
 
 /// Cap on how much text the "might be a leaked tool call" heuristic will
 /// hold back before giving up and flushing it live regardless. Without a
-/// cap, a reply that merely *starts* with `{`/`` ` ``/`<` (Qwen occasionally
-/// opens a plain-text answer with a stray `<tool_call>`-shaped fragment
-/// before abandoning it) stayed buffered for the *entire* remaining
-/// generation - `on_delta` never fired, so the REPL's "thinking..." spinner
-/// never updated, making a merely slow reply look completely frozen.
+/// cap, a reply that merely *starts* with `{`/`` ` ``/`<` (some models
+/// occasionally open a plain-text answer with a stray `<tool_call>`-shaped
+/// fragment before abandoning it) stayed buffered for the *entire*
+/// remaining generation - `on_delta` never fired, so the REPL's
+/// "thinking..." spinner never updated, making a merely slow reply look
+/// completely frozen.
 ///
-/// Confirmed against a real llama-server (Qwen2.5-Coder-1.5B, build
-/// b9888): when `--jinja` doesn't actually engage grammar-constrained
-/// tool-calling for a given model/template, attaching `tools` to the
-/// request doesn't make the model emit structured `tool_calls` at all -
-/// it just writes a plain-text ` ```json ` fence attempting to imitate one,
-/// unconstrained, with no natural stopping point. That's a real, observed
-/// failure mode here, not a hypothetical - so this leans toward showing
-/// something on screen sooner rather than optimizing for never
-/// prematurely revealing a real leaked tool call (which is typically
-/// short and well under this anyway). It only shortens the *visible*
-/// silence, not total generation time - that needs a working
-/// tool-calling grammar (recent llama.cpp) or a smaller max_tokens.
+/// Confirmed on-device: a model routed through a gateway without reliable
+/// grammar-constrained tool-calling can attach `tools` to the request and
+/// still not emit structured `tool_calls` at all - it just writes a
+/// plain-text ` ```json ` fence attempting to imitate one, unconstrained,
+/// with no natural stopping point. That's a real, observed failure mode
+/// here, not a hypothetical - so this leans toward showing something on
+/// screen sooner rather than optimizing for never prematurely revealing a
+/// real leaked tool call (which is typically short and well under this
+/// anyway). It only shortens the *visible* silence, not total generation
+/// time - that needs the provider to actually support tool-calling
+/// reliably for the chosen model, or a smaller max_tokens.
 const MAX_HELD_BACK_BYTES: usize = 150;
 
 /// Advances the held-back/live decision state machine by one content
@@ -221,18 +198,17 @@ impl ModelClient {
     ) -> Self {
         // Deliberately no blanket `.timeout()` here - reqwest's applies to
         // the *entire* request lifetime including streaming the response
-        // body, which used to kill a request outright once it ran past
-        // that long regardless of whether it was still making steady
-        // progress. Confirmed on-device: a 7B model generating on a phone
-        // CPU can easily need more than 10 minutes for a full response,
-        // and hitting this wall mid-stream got misread as a dropped
-        // connection - triggering the auto-retry, which sent a fresh
-        // request that then hit the exact same wall, over and over,
-        // visible in llama-server's own log as one cancelled task after
-        // another. `connect_timeout` still bounds the one phase that
-        // legitimately should be quick (establishing the TCP connection);
-        // an actually-stalled stream (no bytes at all for a while) is
-        // caught separately, per-chunk, in the read loop below instead.
+        // body, which would kill a request outright once it ran past that
+        // long regardless of whether it was still making steady progress.
+        // Confirmed on-device: a reasoning model can legitimately need
+        // several minutes for a full response, and hitting a wall mid-
+        // stream got misread as a dropped connection - triggering the
+        // auto-retry, which sent a fresh request that then hit the exact
+        // same wall, over and over. `connect_timeout` still bounds the one
+        // phase that legitimately should be quick (establishing the TCP
+        // connection); an actually-stalled stream (no bytes at all for a
+        // while) is caught separately, per-chunk, in the read loop below
+        // instead.
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .build()
@@ -250,9 +226,9 @@ impl ModelClient {
     }
 
     /// Sets the `reasoning.effort` override sent with every request on the
-    /// OpenAI-compatible path (OpenRouter's own field - ignored by
-    /// llama-server and Gemini's compat endpoint, which never receive it
-    /// since only `server::client_for`'s OpenRouter branch calls this).
+    /// OpenAI-compatible path (OpenRouter's own field - Gemini's compat
+    /// endpoint never receives it since only `server::client_for`'s
+    /// OpenRouter branch calls this).
     pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
         self.reasoning_effort = effort;
         self
@@ -268,20 +244,17 @@ impl ModelClient {
     }
 
     /// Which backend this client talks to - lets the agent pick the right
-    /// tool-schema flavour (llama-server takes full JSON Schema; a remote
-    /// provider needs it sanitized to the subset it accepts).
+    /// tool-schema flavour a remote provider accepts.
     pub fn backend(&self) -> Backend {
         self.backend
     }
 
-    /// The chat-completions URL for this backend. llama-server mounts the
-    /// OpenAI routes under `/v1`; Gemini's compat base already ends in
-    /// `.../openai`, so the route is just `/chat/completions`; Claude's
-    /// native route is `/v1/messages`.
+    /// The chat-completions URL for this backend. Gemini's compat base
+    /// already ends in `.../openai`, so the route is just
+    /// `/chat/completions`; Claude's native route is `/v1/messages`.
     fn chat_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         match self.backend {
-            Backend::Llama => format!("{base}/v1/chat/completions"),
             Backend::OpenAiCompat => format!("{base}/chat/completions"),
             Backend::Anthropic => format!("{base}/v1/messages"),
         }
@@ -302,7 +275,7 @@ impl ModelClient {
         on_activity: impl FnMut(&str),
     ) -> Result<StreamOutcome> {
         match self.backend {
-            Backend::Llama | Backend::OpenAiCompat => {
+            Backend::OpenAiCompat => {
                 self.chat_stream_openai(
                     messages,
                     tools,
@@ -328,8 +301,8 @@ impl ModelClient {
     }
 
     /// Retries the initial connection (not a mid-stream drop) a few times
-    /// with backoff, since a connection refusal right after starting
-    /// llama-server usually means it's still loading the model.
+    /// with backoff, since a connection refusal can be a transient blip
+    /// rather than the provider actually being down.
     async fn chat_stream_openai(
         &self,
         messages: &[Message],
@@ -341,20 +314,14 @@ impl ModelClient {
     ) -> Result<StreamOutcome> {
         let url = self.chat_url();
 
-        // The llama.cpp-only fields are sent only to that backend; a remote
-        // OpenAI-compatible provider would reject the unknown keys.
-        let is_llama = self.backend == Backend::Llama;
-
         let request = ChatRequest {
             model: &self.model,
             messages,
             temperature,
             max_tokens,
             stream: true,
-            cache_prompt: is_llama.then_some(true),
             tools,
             tool_choice: tools.map(|_| "auto"),
-            repeat_penalty: is_llama.then_some(1.1),
             stream_options: StreamOptions {
                 include_usage: true,
             },
@@ -396,30 +363,22 @@ impl ModelClient {
 
         // Labeled so "[DONE]" can end the whole read loop immediately,
         // rather than relying on the connection itself closing right
-        // after: on-device, a server/proxy that keeps an idle keep-alive
-        // connection open past the final SSE event left byte_stream.next()
-        // parked waiting for more bytes that were never coming, hanging
-        // the entire turn forever with no error and no recovery. The
-        // Anthropic path already breaks on its own terminal event
-        // (MessageStop) for the same reason - this brings the OpenAI-
-        // compatible path (llama-server, Gemini, OpenRouter) in line with
-        // it instead of trusting the transport to end things.
-        // This path is shared by llama-server, Gemini, and OpenRouter - a
-        // hardcoded "llama-server" here used to show up verbatim even when
-        // talking to an online provider, confusingly blaming the wrong
-        // backend for a dropped connection.
-        let source = if is_llama {
-            "llama-server"
-        } else {
-            "the model"
-        };
+        // after: a server/proxy that keeps an idle keep-alive connection
+        // open past the final SSE event left byte_stream.next() parked
+        // waiting for more bytes that were never coming, hanging the
+        // entire turn forever with no error and no recovery. The Anthropic
+        // path already breaks on its own terminal event (MessageStop) for
+        // the same reason - this brings the OpenAI-compatible path
+        // (Gemini, OpenRouter, Opper, OpenCode Zen) in line with it
+        // instead of trusting the transport to end things.
+        let source = "the model";
 
         'outer: loop {
             // Times out on total silence, not on how long the whole
-            // response takes - a slow-but-still-arriving stream (a big
-            // local model decoding slowly on a phone CPU) keeps resetting
-            // this every time a chunk arrives, however long the response
-            // as a whole ends up taking.
+            // response takes - a slow-but-still-arriving stream (a
+            // reasoning model taking its time) keeps resetting this every
+            // time a chunk arrives, however long the response as a whole
+            // ends up taking.
             let chunk = match tokio::time::timeout(
                 self.stream_inactivity_timeout,
                 byte_stream.next(),
@@ -710,55 +669,6 @@ impl ModelClient {
             prompt_tokens,
         })
     }
-
-    /// Exact token count for `text` via llama-server's `/tokenize`
-    /// endpoint, used for context-window budgeting instead of a rough
-    /// chars/4 guess.
-    pub async fn tokenize(&self, text: &str) -> Result<usize> {
-        // Only llama-server exposes `/tokenize`; for a remote provider the
-        // caller falls back to its own heuristic when this errors, so bail
-        // early rather than firing a request that would just 404.
-        if self.backend != Backend::Llama {
-            anyhow::bail!("tokenize is only available on the local llama-server backend");
-        }
-
-        let url = format!("{}/tokenize", self.base_url.trim_end_matches('/'));
-
-        #[derive(Serialize)]
-        struct Req<'a> {
-            content: &'a str,
-        }
-        #[derive(Deserialize)]
-        struct Resp {
-            tokens: Vec<Value>,
-        }
-
-        let resp: Resp = self
-            .http
-            .post(&url)
-            .json(&Req { content: text })
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        Ok(resp.tokens.len())
-    }
-
-    /// Checks llama-server's `/health` endpoint with a short timeout, for
-    /// quick "is it up?" checks rather than waiting on inference.
-    pub async fn health(&self) -> bool {
-        let url = format!("{}/health", self.base_url.trim_end_matches('/'));
-
-        self.http
-            .get(url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
-    }
 }
 
 #[derive(Deserialize)]
@@ -827,7 +737,7 @@ struct FunctionDelta {
 }
 
 /// Deserializes a tool-call `arguments` field that may arrive as either a
-/// JSON string (OpenAI/llama.cpp) or a JSON object (Gemini), normalizing
+/// JSON string (the OpenAI standard) or a JSON object (Gemini), normalizing
 /// both to a string.
 fn deserialize_arguments<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
@@ -1273,7 +1183,7 @@ mod tests {
 
     #[test]
     fn parses_usage_only_final_chunk() {
-        // The chunk llama-server appends when stream_options.include_usage
+        // The chunk a provider appends when stream_options.include_usage
         // is set: empty choices, a usage object carrying prompt_tokens.
         let chunk: ChatChunk = serde_json::from_str(
             r#"{"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":7}}"#,
@@ -1319,10 +1229,8 @@ mod tests {
             temperature: 0.2,
             max_tokens: 512,
             stream: true,
-            cache_prompt: None,
             tools: None,
             tool_choice: None,
-            repeat_penalty: None,
             stream_options: StreamOptions {
                 include_usage: true,
             },

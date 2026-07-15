@@ -37,12 +37,6 @@ use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION, COMMAND_RUNNING};
 const DEFAULT_MAX_ITERATIONS: u32 = 40;
 const FIX_MIN_ITERATIONS: u32 = 40;
 
-const MODEL_PRESETS: &[(&str, &str)] = &[
-    ("1.5b", "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"),
-    ("3b", "qwen2.5-coder-3b-instruct-q4_k_m.gguf"),
-    ("7b", "qwen2.5-coder-7b-instruct-q4_k_m.gguf"),
-];
-
 /// Every REPL command `dispatch` recognizes as the first word of a line -
 /// kept as its own list (rather than derived from `dispatch`'s `match`)
 /// so tab-completion has something to complete against without needing
@@ -52,9 +46,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "version",
     "clear",
     "health",
-    "serve",
     "mode",
-    "model",
     "project",
     "resume",
     "export",
@@ -336,7 +328,7 @@ fn print_sanity_warnings(settings: &Settings) {
 /// around the padded string so they don't throw off the width math).
 fn print_banner(session: &Session) {
     let title = format!("KRIS v{}", env!("CARGO_PKG_VERSION"));
-    let subtitle = "local & online coding assistant";
+    let subtitle = "online coding assistant";
     let width = title.len().max(subtitle.len());
 
     println!("{}", cyan(&format!("╭{}╮", "─".repeat(width + 2))));
@@ -400,30 +392,9 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
             println!("{}", dim("Conversation history cleared."));
         }
         "health" => {
-            if server::check_health(&session.settings).await {
-                println!(
-                    "{}",
-                    green(&format!(
-                        "llama-server is up at {}",
-                        session.settings.llama_url
-                    ))
-                );
-            } else {
-                println!(
-                    "{}",
-                    red(&format!(
-                        "llama-server is not reachable at {}",
-                        session.settings.llama_url
-                    ))
-                );
-                println!("Run `serve` to start it.");
-            }
-        }
-        "serve" => {
             server::ensure_running(&session.settings).await;
         }
         "mode" => handle_mode(session, rest),
-        "model" => handle_model(session, rest),
         "project" => handle_project(session, rest),
         "resume" => handle_resume(session),
         "export" => handle_export(session, rest),
@@ -513,15 +484,7 @@ fn run_raw_shell(session: &Session, command: &str) {
 /// provider, for the banner and the `mode` command.
 fn describe_mode(settings: &Settings) -> (&'static str, String) {
     match settings.provider {
-        Provider::Local => (
-            "offline",
-            if settings.model_path.is_empty() {
-                "(not configured)".to_string()
-            } else {
-                settings.model_path.clone()
-            },
-        ),
-        Provider::Gemini => ("online", settings.gemini_model.clone()),
+        Provider::Gemini => ("gemini", settings.gemini_model.clone()),
         Provider::Claude => ("claude", settings.claude_model.clone()),
         Provider::OpenRouter => ("openrouter", settings.openrouter_model.clone()),
         Provider::Opper => ("opper", settings.opper_model.clone()),
@@ -529,18 +492,16 @@ fn describe_mode(settings: &Settings) -> (&'static str, String) {
     }
 }
 
-/// Switches between offline (local llama-server) and an online provider
-/// (Gemini, Claude, OpenRouter, Opper, or OpenCode Zen) at runtime. Clears the
-/// conversation, since backends don't share a KV cache and a history
-/// built against one model is best restarted on another. Accepts
-/// `offline`/`local`, `online`/`gemini`, `claude`/`anthropic`,
+/// Switches between the five online providers (Gemini, Claude, OpenRouter,
+/// Opper, or OpenCode Zen) at runtime. Clears the conversation, since
+/// providers don't share context and a history built against one model is
+/// best restarted on another. Accepts `gemini`, `claude`/`anthropic`,
 /// `openrouter`/`or`, `opper`, and `opencode`/`zen`.
 fn handle_mode(session: &mut Session, arg: &str) {
     if arg.is_empty() {
         let (mode, model) = describe_mode(&session.settings);
         println!("Current mode: {mode} ({model})");
-        println!("Usage: mode offline    use the local llama.cpp server");
-        println!("       mode online     use the Gemini API");
+        println!("Usage: mode gemini     use the Gemini API");
         println!("       mode claude     use the Claude API");
         println!("       mode openrouter use the OpenRouter API");
         println!("       mode opper      use the Opper API");
@@ -560,20 +521,6 @@ fn handle_mode(session: &mut Session, arg: &str) {
     }
 
     match session.settings.provider {
-        Provider::Local => {
-            println!("{}", green("Switched to offline mode (local llama.cpp)."));
-            if session.settings.model_path.is_empty() {
-                println!(
-                    "{}",
-                    dim("No model_path set yet - pick one with `model 3b` or `config set model_path <gguf>`.")
-                );
-            } else {
-                println!(
-                    "{}",
-                    dim("Run `serve` to start llama-server if it isn't up.")
-                );
-            }
-        }
         Provider::Gemini => {
             println!(
                 "{}",
@@ -653,55 +600,6 @@ fn handle_mode(session: &mut Session, arg: &str) {
                 );
             }
         }
-    }
-}
-
-fn handle_model(session: &mut Session, arg: &str) {
-    if arg.is_empty() {
-        println!("Current model_path: {}", session.settings.model_path);
-        println!(
-            "Presets: {}",
-            MODEL_PRESETS
-                .iter()
-                .map(|(k, _)| *k)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        println!("Usage: model <preset>  (or `config set model_path <path>` for a custom GGUF)");
-        return;
-    }
-
-    match MODEL_PRESETS.iter().find(|(key, _)| *key == arg) {
-        Some((_, filename)) => {
-            let Some(home) = dirs::home_dir() else {
-                println!("{}", red("Could not determine home directory."));
-                return;
-            };
-            session.settings.model_path = home.join(filename).display().to_string();
-            if let Err(err) = session.settings.save() {
-                println!("{}", red(&format!("Failed to save config: {err}")));
-                return;
-            }
-            println!(
-                "{}",
-                green(&format!(
-                    "model_path set to {}",
-                    session.settings.model_path
-                ))
-            );
-            println!("{}", dim("If llama-server is already running, stop it and run `serve` again to load the new model."));
-        }
-        None => println!(
-            "{}",
-            red(&format!(
-                "Unknown preset \"{arg}\". Try: {}",
-                MODEL_PRESETS
-                    .iter()
-                    .map(|(k, _)| *k)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        ),
     }
 }
 
@@ -1093,13 +991,9 @@ fn print_help() {
     println!("  review [notes]        review pending changes (git diff) for correctness bugs and simplification");
     println!("  security-review [notes] review pending changes (git diff) for security issues");
     println!(
-        "  mode [offline|online|claude|openrouter|opper|opencode] show/switch between local llama.cpp, Gemini, Claude, OpenRouter, Opper, and OpenCode Zen"
+        "  mode [gemini|claude|openrouter|opper|opencode] show/switch between Gemini, Claude, OpenRouter, Opper, and OpenCode Zen"
     );
-    println!("  health                check whether the active backend is reachable");
-    println!(
-        "  serve                 start llama-server in the background if needed (offline mode)"
-    );
-    println!("  model [preset]        show/switch the local Qwen2.5-Coder model (1.5b/3b/7b)");
+    println!("  health                check whether the active provider has an API key configured");
     println!("  project [name|path]   pick a project with arrow keys, switch straight to <name>, or pass a <path> (e.g. ~/projects) to change the projects folder itself");
     println!("  resume                pick a saved session (any project) with arrow keys and switch straight to it");
     println!("  export [filename]     save the current conversation as readable Markdown");
@@ -1128,9 +1022,8 @@ const MAX_CONNECTION_RETRIES: u32 = 2;
 
 /// Runs one turn, retrying (via `server::ensure_running`) up to
 /// `MAX_CONNECTION_RETRIES` times if the request fails with what looks
-/// like a connection error - covers both llama-server getting killed
-/// (backgrounded process reaped, phone low on memory, etc.) while KRIS
-/// was idle between turns, and a flaky connection to an online provider.
+/// like a connection error - covers a flaky connection to the active
+/// provider.
 async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations: u32) {
     if !server::check_health(&session.settings).await
         && !server::ensure_running(&session.settings).await
@@ -1147,7 +1040,6 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
     // already completed, `run` keeps them instead - recorded here so each
     // retry can tell which case it's in.
     let history_len_before = session.history.len();
-    let is_local = session.settings.provider == Provider::Local;
     let mut current_prompt = prompt.to_string();
 
     for attempt in 0..=MAX_CONNECTION_RETRIES {
@@ -1161,34 +1053,22 @@ async fn ask_with_iterations(session: &mut Session, prompt: &str, max_iterations
             return;
         }
 
-        let message = if is_local {
-            "Lost connection to llama-server - trying to restart it...".to_string()
-        } else {
-            format!(
-                "Lost connection to the model - retrying ({}/{MAX_CONNECTION_RETRIES})...",
-                attempt + 1
-            )
-        };
+        let message = format!(
+            "Lost connection to the model - retrying ({}/{MAX_CONNECTION_RETRIES})...",
+            attempt + 1
+        );
         println!();
         println!("{}", yellow(&message));
 
-        // `ensure_running` manages a local llama-server (including waiting
-        // up to 60s for it to come back up); for an online provider it's
-        // just a check that an API key is still configured, since there's
-        // no local process to relaunch.
         if !server::ensure_running(&session.settings).await {
             print_turn_error(session, &err);
             return;
         }
 
-        if !is_local {
-            // A local retry already waited inside `ensure_running` for the
-            // server to come back; an online endpoint gets a short,
-            // growing backoff instead of being hit again immediately,
-            // mirroring the client's own retry pacing for the initial
-            // connect (client.rs's MAX_ATTEMPTS loop).
-            tokio::time::sleep(Duration::from_secs(2 * (attempt as u64 + 1))).await;
-        }
+        // A short, growing backoff instead of retrying again immediately,
+        // mirroring the client's own retry pacing for the initial connect
+        // (client.rs's MAX_ATTEMPTS loop).
+        tokio::time::sleep(Duration::from_secs(2 * (attempt as u64 + 1))).await;
 
         // Progress survived the disconnect (history grew past its pre-turn
         // length) - nudge the model to pick up from there instead of
@@ -1222,10 +1102,6 @@ fn print_turn_error(session: &Session, err: &anyhow::Error) {
     println!();
     println!("{} {err}", red("Error talking to the model:"));
     let hint = match session.settings.provider {
-        Provider::Local => format!(
-            "Make sure llama-server is running at {}",
-            session.settings.llama_url
-        ),
         Provider::Gemini => format!(
             "Check your network connection and that GEMINI_API_KEY is valid (model {} at {}).",
             session.settings.gemini_model, session.settings.gemini_url
@@ -1275,13 +1151,7 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
     let spinner_counts = counts.clone();
     let activity: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let spinner_activity = activity.clone();
-    let is_local = session.settings.provider == Provider::Local;
-    let spinner = tokio::spawn(spin(
-        spinner_waiting,
-        spinner_counts,
-        is_local,
-        spinner_activity,
-    ));
+    let spinner = tokio::spawn(spin(spinner_waiting, spinner_counts, spinner_activity));
 
     let history_len_before = session.history.len();
     let started = Instant::now();
@@ -1693,20 +1563,14 @@ fn spinner_verb(elapsed_secs: u64) -> &'static str {
 /// than exiting the moment `waiting` first goes false - `run_turn` flips
 /// it back to true after each tool call, so this needs to keep ticking
 /// and simply stay quiet in between, ready to resume drawing for the next
-/// wait instead of having already exited after the first one. `is_local`
-/// picks which long-wait note applies (see below) - a reasoning model
-/// routed through an online provider can easily spend over a minute on a
-/// hidden "thinking" trace before its first visible token, which isn't
-/// the same "may be stuck" situation a local llama-server sitting at
-/// max_tokens for that long usually is. `activity` is set by
-/// `Agent::run`'s `on_activity` callback to the tool the model is
-/// currently in the middle of calling (cleared once it's actually
+/// wait instead of having already exited after the first one. `activity`
+/// is set by `Agent::run`'s `on_activity` callback to the tool the model
+/// is currently in the middle of calling (cleared once it's actually
 /// executed or a fresh iteration starts) - shown once known instead of
 /// leaving the generic rotating verb as the only signal the whole time.
 async fn spin(
     waiting: Arc<AtomicBool>,
     counts: Arc<SharedTurnCounts>,
-    is_local: bool,
     activity: Arc<Mutex<String>>,
 ) {
     const FRAMES: [&str; 10] = ["-", "\\", "|", "/", "-", "\\", "|", "/", "*", "+"];
@@ -1725,24 +1589,17 @@ async fn spin(
             let elapsed = started.elapsed().as_secs();
 
             // A visible running clock, not just a spinning glyph, so a
-            // genuinely long wait (a local model stuck generating a
-            // repetitive reply, or a slow tool call) reads as "still
-            // working, N seconds so far" instead of looking identically
-            // frozen at 5s and at 5 minutes. Past a minute, that's long
-            // enough for a plain chat reply that it's worth a nudge toward
-            // what to check, rather than just letting it keep spinning
-            // silently - `\x1b[K` (clear to end of line) instead of
-            // padding with spaces, since this label's length changes as
+            // genuinely long wait (a slow tool call, or a reasoning model
+            // still "thinking") reads as "still working, N seconds so far"
+            // instead of looking identically frozen at 5s and at 5
+            // minutes. Past a minute, that's long enough it's worth a
+            // nudge that this is expected rather than letting it keep
+            // spinning silently - `\x1b[K` (clear to end of line) instead
+            // of padding with spaces, since this label's length changes as
             // the elapsed count grows.
             let verb = spinner_verb(elapsed);
             let mut label = if elapsed < 60 {
                 format!("{verb}... {elapsed}s")
-            } else if is_local {
-                format!(
-                    "{verb}... {elapsed}s (taking a while - if the model seems stuck in a \
-                     repetitive loop, check ~/llama-server.log, or try `config set max_tokens \
-                     256` to bound it)"
-                )
             } else {
                 format!(
                     "{verb}... {elapsed}s (a reasoning model can take a while before its \
@@ -1814,7 +1671,7 @@ mod tests {
 
     #[test]
     fn completer_matches_a_single_command_exactly() {
-        assert_eq!(complete_at_end("mod"), vec!["mode", "model"]);
+        assert_eq!(complete_at_end("mod"), vec!["mode"]);
         assert_eq!(complete_at_end("fix"), vec!["fix"]);
     }
 
@@ -2000,7 +1857,7 @@ mod tests {
         // not a "connect" or "timeout" one. Confirmed on-device against
         // OpenRouter, where this used to fall through to a dead end (no
         // retry, no restart attempt) instead of being treated as the same
-        // kind of transient failure a dropped connection to llama-server is.
+        // kind of transient failure any other dropped connection is.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 

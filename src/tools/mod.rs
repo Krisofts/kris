@@ -133,9 +133,10 @@ impl ToolRegistry {
     }
 
     /// OpenAI `tools` array shape (`{"type":"function","function":{...}}`),
-    /// what llama-server's `--jinja` template rendering expects so the
-    /// model gets grammar-constrained structured tool calls instead of
-    /// having to be told the schema in the system prompt as prose.
+    /// the base every OpenAI-compatible provider expects so the model gets
+    /// structured tool calls instead of having to be told the schema in
+    /// the system prompt as prose. `describe_all_gemini` sanitizes this
+    /// further for providers with a stricter schema validator.
     pub fn describe_all(&self) -> Vec<Value> {
         let mut names = self.names();
         names.sort_unstable();
@@ -158,12 +159,12 @@ impl ToolRegistry {
 
     /// Same tool list as `describe_all`, but with each parameter schema
     /// sanitized down to the subset a remote OpenAI-compatible provider
-    /// (Gemini) accepts. Gemini's function-calling validates the schema
-    /// strictly and rejects the whole request on keywords it doesn't know
-    /// (`additionalProperties`, `$schema`, `default`, …), so those are
-    /// stripped here. KRIS's built-in tools already use a clean subset, so
-    /// this is mostly a guard for any future tool - but a single unknown
-    /// keyword would otherwise 400 the entire turn.
+    /// (Gemini, OpenRouter, Opper, OpenCode Zen) accepts. Several validate
+    /// the schema strictly and reject the whole request on keywords they
+    /// don't know (`additionalProperties`, `$schema`, `default`, …), so
+    /// those are stripped here. KRIS's built-in tools already use a clean
+    /// subset, so this is mostly a guard for any future tool - but a
+    /// single unknown keyword would otherwise 400 the entire turn.
     pub fn describe_all_gemini(&self) -> Vec<Value> {
         let mut schemas = self.describe_all();
         for entry in &mut schemas {
@@ -208,7 +209,7 @@ impl ToolRegistry {
 
 /// Recursively strips JSON Schema keywords that remote providers' (Gemini,
 /// Claude) function-calling schema validators reject, so a schema written
-/// for the fuller subset llama.cpp accepts still passes there. Only removes
+/// against the fuller JSON Schema subset still passes there. Only removes
 /// keys; the structural `type`/`properties`/`required`/`items`/`enum`/
 /// `description` that both providers do support are left untouched.
 fn sanitize_remote_schema(value: &mut Value) {

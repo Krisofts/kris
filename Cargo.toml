@@ -2,7 +2,7 @@
 name = "kris"
 version = "0.3.0"
 edition = "2021"
-description = "Coding assistant CLI for Termux - offline via llama.cpp/Qwen, or online via Gemini"
+description = "Online coding assistant CLI for Termux and beyond - Gemini, Claude, OpenRouter, Opper, or OpenCode Zen"
 license = "MIT"
 
 [lib]

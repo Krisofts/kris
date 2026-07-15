@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Chat message in the OpenAI `/v1/chat/completions` schema that
-/// `llama-server --jinja` expects, including the `tool_calls` /
+/// Chat message in the OpenAI `chat/completions` schema every
+/// OpenAI-compatible provider expects, including the `tool_calls` /
 /// `tool_call_id` fields native tool-calling relies on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
