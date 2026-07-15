@@ -24,11 +24,15 @@ Project conventions KRIS should follow here.
 
 ## Before finishing a task
 
-- Always run the project (build/start it, or run its test suite) after
-  making changes - not just after writing code that looks correct.
+- Always run the project's full test suite after making changes - not
+  just after writing code that looks correct, and not just a quick,
+  partial check.
+- Always run the project's own linter and formatter, if it has one, and
+  make sure both are clean (e.g. `cargo clippy` + `cargo fmt` for Rust,
+  `eslint`/`prettier` for JS/TS, `ruff`/`black` for Python).
 - Always do a smoke test - actually exercise the change - before
-  considering a task done, not just relying on it compiling or passing
-  lint.
+  considering a task done, not just relying on it compiling, passing
+  tests, or passing lint.
 ";
 
 /// The user's own customized `~/.config/kris/KRIS.md`, if they've edited
@@ -83,6 +87,9 @@ mod tests {
 
         let content = fs::read_to_string(dir.path().join("KRIS.md")).unwrap();
         assert!(content.contains("300 lines"));
+        assert!(content.contains("full test suite"));
+        assert!(content.contains("cargo clippy"));
+        assert!(content.contains("cargo fmt"));
         assert!(content.contains("smoke test"));
     }
 
