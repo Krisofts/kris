@@ -405,6 +405,73 @@ async fn handle_oscillating_tool_call_connection(
     }
 }
 
+/// Calls a tool for the first 3 requests, then gives a plain-text final
+/// answer from the 4th request onward - stands in for a model that hits a
+/// round's tool-call budget without answering, then actually converges once
+/// nudged and given a fresh batch of steps.
+async fn spawn_recovers_after_nudge_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(handle_recovers_after_nudge_connection(
+                stream,
+                chat_calls.clone(),
+            ));
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+async fn handle_recovers_after_nudge_connection(
+    mut stream: TcpStream,
+    chat_calls: Arc<AtomicUsize>,
+) {
+    let header_text = read_request_headers(&mut stream).await;
+    let path = header_text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("");
+
+    match path {
+        "/chat/completions" => {
+            let index = chat_calls.fetch_add(1, Ordering::SeqCst);
+            if index < 3 {
+                let payload = serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": format!("call_{index}"),
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": format!("{{\"path\": \"file_{index}.txt\"}}"),
+                                }
+                            }]
+                        }
+                    }]
+                });
+                let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+                respond(&mut stream, "text/event-stream", &body).await;
+            } else {
+                respond(&mut stream, "text/event-stream", FINAL_ANSWER_SSE).await;
+            }
+        }
+        other => panic!("mock server got an unexpected request path: {other}"),
+    }
+}
+
 async fn spawn_single_response_server(body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -971,6 +1038,52 @@ async fn oscillating_tool_calls_are_detected_as_a_stuck_cycle() {
     );
     // Stopped well before exhausting all 10 available iterations.
     assert!(chat_calls.load(Ordering::SeqCst) < 10);
+}
+
+#[tokio::test]
+async fn auto_continues_past_a_stuck_round_and_recovers_with_a_final_answer() {
+    // Regression test for auto-continue: hitting a round's max_iterations
+    // without a final answer used to always be a dead end for the turn -
+    // now KRIS nudges the model and gives it a fresh batch of steps
+    // automatically, and if the model actually converges on an answer in
+    // that next round, the turn succeeds instead of giving up.
+    let base_url = spawn_recovers_after_nudge_server().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
+
+    let mut history: Vec<Message> = Vec::new();
+
+    let answer = agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "read a few files then answer",
+            3,
+            |_delta| {},
+            |_name, _args, _result| {},
+            |_| {},
+        )
+        .await
+        .expect("recovering after an auto-continue nudge should be a successful turn");
+
+    assert_eq!(answer, "The file says hi.");
 }
 
 #[tokio::test]

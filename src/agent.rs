@@ -139,7 +139,9 @@ impl Agent {
         // more distinct calls (A, B, A, B, ...) without ever converging on
         // an answer, which a single-previous-call comparison can never
         // catch since each individual comparison only ever sees a
-        // *different* immediately-prior call.
+        // *different* immediately-prior call. Kept across auto-continue
+        // rounds (never reset), so a relapse into the same cycle right
+        // after being nudged is still caught immediately.
         let mut call_signatures: Vec<String> = Vec::new();
 
         // Last exact prompt-token count the provider reported, paired with
@@ -149,186 +151,241 @@ impl Agent {
         // whole conversation every iteration.
         let mut measured: Option<(usize, u32)> = None;
 
-        for _ in 0..max_iterations {
-            if self
-                .enforce_context_budget(history, &mut measured, &mut on_delta)
-                .await
-            {
-                // Trimmed every older turn it's allowed to and it still
-                // isn't enough - the current, in-progress turn's own tool
-                // calls/results (which trimming never touches, by design)
-                // have grown past the budget on their own. Sending the
-                // request anyway would just get rejected by the provider
-                // with its own, far less clear, context-length error -
-                // confirmed on-device against OpenRouter's
-                // tencent/hy3:free, which does exactly that after a long
-                // run of tool calls within one turn.
-                let notice = format!(
-                    "This turn has produced more tool output than fits in the model's \
-                     context window (~{} tokens) and there's no older conversation left \
-                     to trim - it's grown too large within a single turn. Ask KRIS to \
-                     continue with a smaller, more focused next step instead of \
-                     extending this one further.",
-                    self.context_size
-                );
-                on_delta(&notice);
-                history.push(Message::assistant_text(notice.clone()));
-                return Ok(notice);
-            }
+        // A stuck loop - a repeat cycle, or genuinely running out of steps -
+        // gets nudged with a follow-up message and retried automatically
+        // this many times before KRIS gives up and hands control back with
+        // a notice, instead of stopping cold on the very first sign of
+        // trouble and making the user type "continue" themselves for
+        // something the model could plausibly recover from on its own.
+        const MAX_AUTO_CONTINUES: u32 = 2;
+        let mut auto_continues_left = MAX_AUTO_CONTINUES;
 
-            let sent_len = history.len();
-            let outcome = match self
-                .client
-                .chat_stream(
-                    history,
-                    Some(&tool_schemas),
-                    self.temperature,
-                    self.max_tokens,
-                    &mut on_delta,
-                    &mut on_activity,
-                )
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    // Only roll back when nothing came of this turn yet - once
-                    // at least one iteration has completed (tool calls/results
-                    // already in history), keep them. Losing the connection
-                    // mid-task (a flaky network) shouldn't throw away work
-                    // already done; a caller can resume from here instead of
-                    // redoing the whole task.
-                    if history.len() == turn_start + 1 {
-                        history.truncate(turn_start);
-                    }
-                    return Err(err);
-                }
-            };
-
-            if let Some(prompt_tokens) = outcome.prompt_tokens {
-                measured = Some((sent_len, prompt_tokens));
-            }
-
-            let held_back = outcome.held_back;
-
-            let tool_calls = if outcome.tool_calls.is_empty() {
-                outcome
-                    .content
-                    .as_deref()
-                    .and_then(parse_tool_call_from_text)
-                    // Confirmed on-device: without a working tool-calling
-                    // grammar, a model can hallucinate a call to a tool
-                    // name that doesn't exist at all (e.g. "hello", echoing
-                    // the user's greeting) - executing that just produces
-                    // an "unknown tool" error the model then rambles about
-                    // instead of answering normally. Only trust this
-                    // fallback for a name that's actually registered;
-                    // anything else falls through to being shown as plain
-                    // text like any other answer.
-                    .filter(|(name, _)| self.tools.names().contains(&name.as_str()))
-                    .map(|(name, args)| {
-                        vec![ToolCall {
-                            id: "call_fallback_0".to_string(),
-                            kind: "function".to_string(),
-                            function: FunctionCall {
-                                name,
-                                arguments: args.to_string(),
-                            },
-                        }]
-                    })
-                    .unwrap_or_default()
-            } else {
-                outcome.tool_calls
-            };
-
-            if tool_calls.is_empty() {
-                // Nothing resolved to a tool call after all, so whatever
-                // was held back from live streaming (it looked like it
-                // might be a leaked call) was actually just part of the
-                // answer - show it now before returning.
-                if let Some(held_back) = held_back {
-                    on_delta(&held_back);
+        'turn: loop {
+            for _ in 0..max_iterations {
+                if self
+                    .enforce_context_budget(history, &mut measured, &mut on_delta)
+                    .await
+                {
+                    // Trimmed every older turn it's allowed to and it still
+                    // isn't enough - the current, in-progress turn's own tool
+                    // calls/results (which trimming never touches, by design)
+                    // have grown past the budget on their own. Sending the
+                    // request anyway would just get rejected by the provider
+                    // with its own, far less clear, context-length error -
+                    // confirmed on-device against OpenRouter's
+                    // tencent/hy3:free, which does exactly that after a long
+                    // run of tool calls within one turn. Not auto-continued:
+                    // more steps in this same turn would only add to the
+                    // pile that's already too big.
+                    let notice = format!(
+                        "This turn has produced more tool output than fits in the model's \
+                         context window (~{} tokens) and there's no older conversation left \
+                         to trim - it's grown too large within a single turn. Ask KRIS to \
+                         continue with a smaller, more focused next step instead of \
+                         extending this one further.",
+                        self.context_size
+                    );
+                    on_delta(&notice);
+                    history.push(Message::assistant_text(notice.clone()));
+                    return Ok(notice);
                 }
 
-                let answer = outcome.content.unwrap_or_default();
-                history.push(Message::assistant_text(answer.clone()));
-                return Ok(answer);
-            }
-
-            let signature = tool_calls
-                .iter()
-                .map(|call| format!("{}:{}", call.function.name, call.function.arguments))
-                .collect::<Vec<_>>()
-                .join("|");
-
-            let is_immediate_repeat =
-                call_signatures.last().map(String::as_str) == Some(signature.as_str());
-            call_signatures.push(signature);
-
-            let stuck_cycle = if is_immediate_repeat {
-                Some(1)
-            } else {
-                detect_repeating_cycle(&call_signatures)
-            };
-
-            if let Some(period) = stuck_cycle {
-                let notice = if period == 1 {
-                    "Stopped: the same tool call was proposed again right after it was \
-                         declined or failed, with nothing else changed. Ask again with more \
-                         detail, or approve the action if you do want it to run."
-                        .to_string()
-                } else {
-                    format!(
-                        "Stopped: got stuck cycling through the same {period} tool calls \
-                         over and over without making progress toward an answer. Ask KRIS to \
-                         continue with more specific guidance instead of repeating the same \
-                         steps."
+                let sent_len = history.len();
+                let outcome = match self
+                    .client
+                    .chat_stream(
+                        history,
+                        Some(&tool_schemas),
+                        self.temperature,
+                        self.max_tokens,
+                        &mut on_delta,
+                        &mut on_activity,
                     )
-                };
-                on_delta(&notice);
-                history.push(Message::assistant_text(notice.clone()));
-                return Ok(notice);
-            }
-
-            history.push(Message::assistant_tool_calls(
-                outcome.content.clone(),
-                tool_calls.clone(),
-            ));
-
-            for call in &tool_calls {
-                let args = match call.parsed_arguments() {
-                    Ok(args) => args,
+                    .await
+                {
+                    Ok(outcome) => outcome,
                     Err(err) => {
-                        let msg = format!("Error: invalid JSON arguments: {err}");
-                        on_tool_call(&call.function.name, &json!({}), &msg);
-                        history.push(Message::tool_result(call.id.clone(), msg));
-                        continue;
+                        // Only roll back when nothing came of this turn yet - once
+                        // at least one iteration has completed (tool calls/results
+                        // already in history), keep them. Losing the connection
+                        // mid-task (a flaky network) shouldn't throw away work
+                        // already done; a caller can resume from here instead of
+                        // redoing the whole task.
+                        if history.len() == turn_start + 1 {
+                            history.truncate(turn_start);
+                        }
+                        return Err(err);
                     }
                 };
 
-                let result = match self.tools.execute(&call.function.name, root, &args) {
-                    Ok(output) => output,
-                    Err(ToolError::UnknownTool(name)) => {
-                        let available = self.tools.names().join(", ");
+                if let Some(prompt_tokens) = outcome.prompt_tokens {
+                    measured = Some((sent_len, prompt_tokens));
+                }
+
+                let held_back = outcome.held_back;
+
+                let tool_calls = if outcome.tool_calls.is_empty() {
+                    outcome
+                        .content
+                        .as_deref()
+                        .and_then(parse_tool_call_from_text)
+                        // Confirmed on-device: without a working tool-calling
+                        // grammar, a model can hallucinate a call to a tool
+                        // name that doesn't exist at all (e.g. "hello", echoing
+                        // the user's greeting) - executing that just produces
+                        // an "unknown tool" error the model then rambles about
+                        // instead of answering normally. Only trust this
+                        // fallback for a name that's actually registered;
+                        // anything else falls through to being shown as plain
+                        // text like any other answer.
+                        .filter(|(name, _)| self.tools.names().contains(&name.as_str()))
+                        .map(|(name, args)| {
+                            vec![ToolCall {
+                                id: "call_fallback_0".to_string(),
+                                kind: "function".to_string(),
+                                function: FunctionCall {
+                                    name,
+                                    arguments: args.to_string(),
+                                },
+                            }]
+                        })
+                        .unwrap_or_default()
+                } else {
+                    outcome.tool_calls
+                };
+
+                if tool_calls.is_empty() {
+                    // Nothing resolved to a tool call after all, so whatever
+                    // was held back from live streaming (it looked like it
+                    // might be a leaked call) was actually just part of the
+                    // answer - show it now before returning.
+                    if let Some(held_back) = held_back {
+                        on_delta(&held_back);
+                    }
+
+                    let answer = outcome.content.unwrap_or_default();
+                    history.push(Message::assistant_text(answer.clone()));
+                    return Ok(answer);
+                }
+
+                let signature = tool_calls
+                    .iter()
+                    .map(|call| format!("{}:{}", call.function.name, call.function.arguments))
+                    .collect::<Vec<_>>()
+                    .join("|");
+
+                let is_immediate_repeat =
+                    call_signatures.last().map(String::as_str) == Some(signature.as_str());
+                call_signatures.push(signature);
+
+                let stuck_cycle = if is_immediate_repeat {
+                    Some(1)
+                } else {
+                    detect_repeating_cycle(&call_signatures)
+                };
+
+                if let Some(period) = stuck_cycle {
+                    if auto_continues_left > 0 {
+                        auto_continues_left -= 1;
+                        on_delta(&format!(
+                            "\n{}\n",
+                            yellow(
+                                "(got stuck repeating the same tool calls - auto-continuing \
+                                 with a nudge to try a different approach)"
+                            )
+                        ));
+                        history.push(Message::user(
+                            "You got stuck repeating the same tool call(s) without making \
+                             progress. Stop repeating them: either try a clearly different \
+                             approach, or if you already have enough information, give a \
+                             direct final answer right now instead of calling another tool.",
+                        ));
+                        continue 'turn;
+                    }
+
+                    let notice = if period == 1 {
+                        "Stopped: the same tool call was proposed again right after it was \
+                             declined or failed, even after being nudged to try something \
+                             different. Ask again with more detail, or approve the action if \
+                             you do want it to run."
+                            .to_string()
+                    } else {
                         format!(
-                            "Error: there is no tool called \"{name}\". Available tools: \
-                             {available}. Use exactly one of these names."
+                            "Stopped: got stuck cycling through the same {period} tool calls \
+                             over and over without making progress toward an answer, even \
+                             after being nudged to try something different. Ask KRIS to \
+                             continue with more specific guidance instead of repeating the \
+                             same steps."
                         )
-                    }
-                    Err(err) => format!("Error: {err}"),
-                };
+                    };
+                    on_delta(&notice);
+                    history.push(Message::assistant_text(notice.clone()));
+                    return Ok(notice);
+                }
 
-                on_tool_call(&call.function.name, &args, &result);
-                history.push(Message::tool_result(call.id.clone(), result));
+                history.push(Message::assistant_tool_calls(
+                    outcome.content.clone(),
+                    tool_calls.clone(),
+                ));
+
+                for call in &tool_calls {
+                    let args = match call.parsed_arguments() {
+                        Ok(args) => args,
+                        Err(err) => {
+                            let msg = format!("Error: invalid JSON arguments: {err}");
+                            on_tool_call(&call.function.name, &json!({}), &msg);
+                            history.push(Message::tool_result(call.id.clone(), msg));
+                            continue;
+                        }
+                    };
+
+                    let result = match self.tools.execute(&call.function.name, root, &args) {
+                        Ok(output) => output,
+                        Err(ToolError::UnknownTool(name)) => {
+                            let available = self.tools.names().join(", ");
+                            format!(
+                                "Error: there is no tool called \"{name}\". Available tools: \
+                                 {available}. Use exactly one of these names."
+                            )
+                        }
+                        Err(err) => format!("Error: {err}"),
+                    };
+
+                    on_tool_call(&call.function.name, &args, &result);
+                    history.push(Message::tool_result(call.id.clone(), result));
+                }
             }
-        }
 
-        let notice = "Reached the maximum number of tool calls without a final answer. Ask \
-             KRIS to continue - the conversation so far is kept, so it can pick up where it \
-             left off instead of starting over."
-            .to_string();
-        on_delta(&notice);
-        history.push(Message::assistant_text(notice.clone()));
-        Ok(notice)
+            // Fell all the way through this round's `max_iterations` without
+            // ever returning - the model kept calling tools right up to the
+            // budget without producing a final answer.
+            if auto_continues_left > 0 {
+                auto_continues_left -= 1;
+                on_delta(&format!(
+                    "\n{}\n",
+                    yellow(
+                        "(reached this round's tool-call limit without an answer yet - \
+                         auto-continuing with a fresh batch of steps)"
+                    )
+                ));
+                history.push(Message::user(
+                    "Continue - you still have more tool-call steps available for this \
+                     task. If you already have enough information, give the final answer \
+                     now instead of continuing to call tools.",
+                ));
+                continue 'turn;
+            }
+
+            let notice = format!(
+                "Reached the maximum number of tool calls without a final answer, even after \
+                 automatically continuing {MAX_AUTO_CONTINUES} extra time(s). Ask KRIS to \
+                 continue - the conversation so far is kept, so it can pick up where it left \
+                 off instead of starting over."
+            );
+            on_delta(&notice);
+            history.push(Message::assistant_text(notice.clone()));
+            return Ok(notice);
+        }
     }
 
     /// Asks the model for a plain-text recap of `history` so far - no
