@@ -9,7 +9,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -69,8 +70,90 @@ pub trait Tool {
     fn execute(&self, root: &Path, args: &Value) -> Result<String, ToolError>;
 }
 
+/// Which of Claude Code's three broad action groups a tool call belongs
+/// to, for the "Read N files · Edited N files · Ran N commands" recap
+/// (both the REPL's own, and `run_command`'s live status line - see
+/// `SharedTurnCounts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCategory {
+    Read,
+    Edit,
+    Command,
+    Other,
+}
+
+pub fn tool_category(name: &str) -> ToolCategory {
+    match name {
+        "read_file" | "list_directory" | "tree" | "find_files" | "search_code" | "outline_file"
+        | "git" => ToolCategory::Read,
+        "write_file" | "append_file" | "edit_file" | "delete_file" | "delete_directory"
+        | "move_file" | "create_directory" => ToolCategory::Edit,
+        "run_command" | "git_commit" => ToolCategory::Command,
+        _ => ToolCategory::Other,
+    }
+}
+
+#[derive(Default)]
+pub struct TurnCounts {
+    pub read: usize,
+    pub edited: usize,
+    pub commands: usize,
+}
+
+impl TurnCounts {
+    pub fn summary(&self) -> Option<String> {
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+
+        let parts: Vec<String> = [
+            (self.read, "Read", "file"),
+            (self.edited, "Edited", "file"),
+            (self.commands, "Ran", "command"),
+        ]
+        .into_iter()
+        .filter(|(n, ..)| *n > 0)
+        .map(|(n, verb, word)| format!("{verb} {}", plural(n, word)))
+        .collect();
+
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
+/// Thread-safe tally shared between the REPL's closure recording tool
+/// calls (on the main task), its spinner (its own tokio task) that
+/// displays a running "Read N files · Ran N commands" recap live while a
+/// turn is in progress, and `run_command`'s own synchronous status line -
+/// so a slow command in progress shows the same live recap instead of
+/// going blank for however long it takes to finish.
+#[derive(Default)]
+pub struct SharedTurnCounts {
+    read: AtomicUsize,
+    edited: AtomicUsize,
+    commands: AtomicUsize,
+}
+
+impl SharedTurnCounts {
+    pub fn record(&self, tool_name: &str) {
+        let counter = match tool_category(tool_name) {
+            ToolCategory::Read => &self.read,
+            ToolCategory::Edit => &self.edited,
+            ToolCategory::Command => &self.commands,
+            ToolCategory::Other => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> TurnCounts {
+        TurnCounts {
+            read: self.read.load(Ordering::Relaxed),
+            edited: self.edited.load(Ordering::Relaxed),
+            commands: self.commands.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    turn_counts: Arc<SharedTurnCounts>,
 }
 
 impl Default for ToolRegistry {
@@ -91,6 +174,7 @@ impl ToolRegistry {
     pub fn with_defaults(bypass_permissions: bool, auto_approve_edits: bool) -> Self {
         let mut registry = Self {
             tools: HashMap::new(),
+            turn_counts: Arc::new(SharedTurnCounts::default()),
         };
 
         // Shared so approving one filesystem change with "always" covers
@@ -110,13 +194,25 @@ impl ToolRegistry {
         registry.register(edit::DeleteDirectoryTool::new(auto_approve.clone()));
         registry.register(edit::MoveFileTool::new(auto_approve.clone()));
         registry.register(edit::CreateDirectoryTool::new(auto_approve));
-        registry.register(run_command::RunCommandTool::new(bypass_permissions));
+        registry.register(run_command::RunCommandTool::new(
+            bypass_permissions,
+            registry.turn_counts.clone(),
+        ));
         registry.register(git::GitTool);
         registry.register(git::GitCommitTool::new(bypass_permissions));
         registry.register(outline::OutlineFileTool);
         registry.register(ask::AskQuestionTool);
 
         registry
+    }
+
+    /// The same shared per-turn tally `run_command`'s own live status line
+    /// reads from - exposed so a caller (the REPL) can record completed
+    /// tool calls into it and read it back for its own spinner/recap,
+    /// without constructing a second, disconnected instance that
+    /// `run_command` would never see.
+    pub fn turn_counts(&self) -> Arc<SharedTurnCounts> {
+        self.turn_counts.clone()
     }
 
     fn register<T>(&mut self, tool: T)
@@ -246,6 +342,48 @@ fn sanitize_remote_schema(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_category_classifies_every_built_in_tool() {
+        assert_eq!(tool_category("read_file"), ToolCategory::Read);
+        assert_eq!(tool_category("search_code"), ToolCategory::Read);
+        assert_eq!(tool_category("git"), ToolCategory::Read);
+        assert_eq!(tool_category("write_file"), ToolCategory::Edit);
+        assert_eq!(tool_category("append_file"), ToolCategory::Edit);
+        assert_eq!(tool_category("run_command"), ToolCategory::Command);
+        assert_eq!(tool_category("git_commit"), ToolCategory::Command);
+        assert_eq!(tool_category("something_unknown"), ToolCategory::Other);
+    }
+
+    #[test]
+    fn turn_counts_summary_omits_zero_categories_and_pluralizes() {
+        let counts = SharedTurnCounts::default();
+        assert_eq!(counts.snapshot().summary(), None);
+
+        counts.record("read_file");
+        assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
+
+        counts.record("edit_file");
+        assert_eq!(
+            counts.snapshot().summary().as_deref(),
+            Some("Read 1 file · Edited 1 file")
+        );
+
+        counts.record("run_command");
+        counts.record("run_command");
+        assert_eq!(
+            counts.snapshot().summary().as_deref(),
+            Some("Read 1 file · Edited 1 file · Ran 2 commands")
+        );
+    }
+
+    #[test]
+    fn turn_counts_ignores_uncategorized_tools() {
+        let counts = SharedTurnCounts::default();
+        counts.record("outline_file");
+        counts.record("something_unknown");
+        assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
+    }
 
     #[test]
     fn auto_approve_edits_seeds_edit_tools_without_reading_stdin() {

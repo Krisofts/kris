@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -6,7 +7,7 @@ use serde_json::{json, Value};
 use crate::client::{Backend, ModelClient};
 use crate::message::{FunctionCall, Message, Role, ToolCall};
 use crate::style::yellow;
-use crate::tools::{ToolError, ToolRegistry};
+use crate::tools::{SharedTurnCounts, ToolError, ToolRegistry};
 
 /// Groups the three pieces of per-workspace context `run` needs, mainly to
 /// keep its argument count reasonable rather than because they're a
@@ -40,6 +41,14 @@ impl Agent {
             max_tokens,
             context_size,
         }
+    }
+
+    /// The same shared per-turn tally `run_command`'s own live status line
+    /// reads from - see `ToolRegistry::turn_counts` for why this needs to
+    /// be the *same* instance rather than a fresh one the REPL constructs
+    /// on its own.
+    pub fn turn_counts(&self) -> Arc<SharedTurnCounts> {
+        self.tools.turn_counts()
     }
 
     pub(crate) fn system_prompt(&self, project_name: &str, project_type_hint: &str) -> String {
@@ -88,6 +97,10 @@ impl Agent {
     /// executed (`on_tool_call`, once the arguments have fully arrived and
     /// it's run) - so a caller can show what's being prepared instead of
     /// just a generic "still waiting" status for that whole stretch.
+    /// `on_reasoning` fires once per iteration, the moment a reasoning
+    /// model's hidden "thinking" trace first shows up on the wire (never
+    /// its actual content, just the fact that it started) - real proof the
+    /// model is working, distinct from simply still waiting on a response.
     #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
@@ -98,6 +111,7 @@ impl Agent {
         mut on_delta: impl FnMut(&str),
         mut on_tool_call: impl FnMut(&str, &Value, &str),
         mut on_activity: impl FnMut(&str),
+        mut on_reasoning: impl FnMut(),
     ) -> Result<String> {
         let root = project.root;
 
@@ -200,6 +214,7 @@ impl Agent {
                         self.max_tokens,
                         &mut on_delta,
                         &mut on_activity,
+                        &mut on_reasoning,
                     )
                     .await
                 {
@@ -423,6 +438,7 @@ impl Agent {
                 self.max_tokens,
                 &mut on_delta,
                 |_name: &str| {},
+                || {},
             )
             .await?;
 

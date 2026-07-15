@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,10 @@ use crate::server;
 use crate::session_store;
 use crate::style::{blue, bold, cyan, dim, green, red, yellow};
 use crate::term::{terminal_width, truncate_to_width};
-use crate::tools::{ToolRegistry, AWAITING_CONFIRMATION, COMMAND_RUNNING};
+use crate::tools::{
+    tool_category, SharedTurnCounts, ToolCategory, ToolRegistry, AWAITING_CONFIRMATION,
+    COMMAND_RUNNING,
+};
 
 // Raised from 10/24/20: a multi-file task (scaffold a project, add a
 // feature, verify with clippy/tests) easily needs more tool calls than
@@ -1147,11 +1150,28 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
 
     let waiting = Arc::new(AtomicBool::new(true));
     let spinner_waiting = waiting.clone();
-    let counts = Arc::new(SharedTurnCounts::default());
+    // The same shared tally `run_command`'s own live status line reads
+    // from (see `ToolRegistry::turn_counts`) - not a separate instance -
+    // so a slow command in progress shows this turn's real "Read N ·
+    // Edited N · Ran N" recap instead of going blank the whole time.
+    let counts = agent.turn_counts();
     let spinner_counts = counts.clone();
     let activity: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let spinner_activity = activity.clone();
-    let spinner = tokio::spawn(spin(spinner_waiting, spinner_counts, spinner_activity));
+    // Set once a reasoning model's hidden "thinking" trace actually shows
+    // up on the wire (never its content, just the fact that it started) -
+    // real proof the model is working, so the spinner can switch out of
+    // its plain elapsed-time display into something livelier. Reset back
+    // to false every time `waiting` is re-armed for the next iteration's
+    // wait, so a later iteration doesn't inherit an earlier one's state.
+    let reasoning_started = Arc::new(AtomicBool::new(false));
+    let spinner_reasoning_started = reasoning_started.clone();
+    let spinner = tokio::spawn(spin(
+        spinner_waiting,
+        spinner_counts,
+        spinner_activity,
+        spinner_reasoning_started,
+    ));
 
     let history_len_before = session.history.len();
     let started = Instant::now();
@@ -1177,7 +1197,11 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 if waiting.swap(false, Ordering::SeqCst) {
                     clear_line();
                 }
-                println!("{} {}", cyan("●"), bold(&format_tool_call(tool_name, args)));
+                println!(
+                    "{} {}",
+                    tool_bullet(tool_name),
+                    bold(&format_tool_call(tool_name, args))
+                );
                 counts.record(tool_name);
 
                 let is_error = result.starts_with("Error: ");
@@ -1199,7 +1223,14 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                             ""
                         };
                         let line = format!("  ⎿ {truncated}{ellipsis}");
-                        println!("{}", if is_error { red(&line) } else { dim(&line) });
+                        println!(
+                            "{}",
+                            if is_error {
+                                red(&line)
+                            } else {
+                                colorize_diff_stat(&line)
+                            }
+                        );
                     }
                 }
 
@@ -1217,6 +1248,9 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 // own round trip, and each of those waits deserves the
                 // same "still working" feedback the first one got.
                 waiting.store(true, Ordering::SeqCst);
+                // Next iteration's wait starts fresh in "no reasoning yet"
+                // territory - it shouldn't inherit this iteration's own.
+                reasoning_started.store(false, Ordering::SeqCst);
                 // This tool call is done, so it's no longer "being
                 // prepared" - clear it rather than let it linger and
                 // wrongly describe whatever the next iteration turns out
@@ -1230,6 +1264,9 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
                 if let Ok(mut current) = activity.lock() {
                     *current = label.to_string();
                 }
+            },
+            || {
+                reasoning_started.store(true, Ordering::SeqCst);
             },
         )
         .await;
@@ -1279,86 +1316,6 @@ async fn run_turn(session: &mut Session, prompt: &str, max_iterations: u32) -> R
             Ok(())
         }
         Err(err) => Err(err),
-    }
-}
-
-/// Which of Claude Code's three broad action groups a tool call belongs
-/// to, for the end-of-turn "Read N files · Edited N files · Ran N
-/// commands" recap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolCategory {
-    Read,
-    Edit,
-    Command,
-    Other,
-}
-
-fn tool_category(name: &str) -> ToolCategory {
-    match name {
-        "read_file" | "list_directory" | "tree" | "find_files" | "search_code" | "outline_file"
-        | "git" => ToolCategory::Read,
-        "write_file" | "append_file" | "edit_file" | "delete_file" | "delete_directory"
-        | "move_file" | "create_directory" => ToolCategory::Edit,
-        "run_command" | "git_commit" => ToolCategory::Command,
-        _ => ToolCategory::Other,
-    }
-}
-
-#[derive(Default)]
-struct TurnCounts {
-    read: usize,
-    edited: usize,
-    commands: usize,
-}
-
-impl TurnCounts {
-    fn summary(&self) -> Option<String> {
-        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
-
-        let parts: Vec<String> = [
-            (self.read, "Read", "file"),
-            (self.edited, "Edited", "file"),
-            (self.commands, "Ran", "command"),
-        ]
-        .into_iter()
-        .filter(|(n, ..)| *n > 0)
-        .map(|(n, verb, word)| format!("{verb} {}", plural(n, word)))
-        .collect();
-
-        (!parts.is_empty()).then(|| parts.join(" · "))
-    }
-}
-
-/// Thread-safe tally shared between the closure recording tool calls (in
-/// `run_turn`, on the main task) and the spinner (its own tokio task) that
-/// displays a running "Read N files · Ran N commands" recap live, next to
-/// the "thinking..." label, while the turn is still in progress - unlike
-/// `TurnCounts`, which is a plain snapshot, not something updated from two
-/// tasks at once.
-#[derive(Default)]
-struct SharedTurnCounts {
-    read: AtomicUsize,
-    edited: AtomicUsize,
-    commands: AtomicUsize,
-}
-
-impl SharedTurnCounts {
-    fn record(&self, tool_name: &str) {
-        let counter = match tool_category(tool_name) {
-            ToolCategory::Read => &self.read,
-            ToolCategory::Edit => &self.edited,
-            ToolCategory::Command => &self.commands,
-            ToolCategory::Other => return,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> TurnCounts {
-        TurnCounts {
-            read: self.read.load(Ordering::Relaxed),
-            edited: self.edited.load(Ordering::Relaxed),
-            commands: self.commands.load(Ordering::Relaxed),
-        }
     }
 }
 
@@ -1496,6 +1453,20 @@ fn friendly_tool_label(tool_name: &str) -> &str {
     }
 }
 
+/// Colors the leading "●" by which of Claude Code's three broad action
+/// groups the tool belongs to - blue for a read, green for an edit, yellow
+/// for a command - so a scroll of tool calls sorts itself out at a glance
+/// on a narrow Termux screen instead of every line starting with the same
+/// undifferentiated cyan dot regardless of what actually happened.
+fn tool_bullet(tool_name: &str) -> String {
+    match tool_category(tool_name) {
+        ToolCategory::Read => blue("●"),
+        ToolCategory::Edit => green("●"),
+        ToolCategory::Command => yellow("●"),
+        ToolCategory::Other => cyan("●"),
+    }
+}
+
 fn format_tool_call(tool_name: &str, args: &Value) -> String {
     let label = friendly_tool_label(tool_name);
 
@@ -1523,6 +1494,42 @@ fn format_tool_call(tool_name: &str, args: &Value) -> String {
         Some(summary) => format!("{label}({summary})"),
         None => format!("{label}()"),
     }
+}
+
+/// Recolors a trailing "(+N -M)" diff-stat suffix (as emitted by
+/// write_file/append_file/edit_file's result strings) green/red within an
+/// otherwise dim tool-result summary line - insertions green, removals red,
+/// matching how the full diff view (`render_unified_diff`) already colors
+/// its own +/- lines, instead of the stat blending into the single dim
+/// gray the rest of the line uses. Falls back to plain `dim` for any line
+/// that doesn't actually end in that shape (most tool results don't).
+fn colorize_diff_stat(line: &str) -> String {
+    if let Some(open) = line.rfind("(+") {
+        let rest = &line[open..];
+        if let Some(close_rel) = rest.find(')') {
+            let inner = &rest[1..close_rel];
+            if let Some((add_part, rem_part)) = inner.split_once(' ') {
+                if let (Some(add_digits), Some(rem_digits)) =
+                    (add_part.strip_prefix('+'), rem_part.strip_prefix('-'))
+                {
+                    let digits_ok =
+                        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+                    if digits_ok(add_digits) && digits_ok(rem_digits) {
+                        let before = &line[..open];
+                        let after = &rest[close_rel + 1..];
+                        return format!(
+                            "{}({} {}){}",
+                            dim(before),
+                            green(&format!("+{add_digits}")),
+                            red(&format!("-{rem_digits}")),
+                            dim(after)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    dim(line)
 }
 
 fn clear_line() {
@@ -1559,6 +1566,26 @@ fn spinner_verb(elapsed_secs: u64) -> &'static str {
     SPINNER_VERBS[index]
 }
 
+/// "5s" below a minute, "1m 05s" past it - a plain seconds count keeps
+/// growing into an unreadable number on a genuinely long wait, so once
+/// there's more than a minute of it, showing minutes and seconds separately
+/// stays easy to read at a glance.
+fn format_wait_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// A small animated ellipsis for the reasoning-phase spinner label, cycling
+/// every tick - purely cosmetic liveliness distinct from the plain elapsed
+/// counter used before reasoning shows up.
+fn reasoning_dots(tick: usize) -> &'static str {
+    const DOTS: [&str; 4] = ["", ".", "..", "..."];
+    DOTS[tick % DOTS.len()]
+}
+
 /// Runs for the whole turn (stopped externally via `.abort()`), rather
 /// than exiting the moment `waiting` first goes false - `run_turn` flips
 /// it back to true after each tool call, so this needs to keep ticking
@@ -1568,10 +1595,14 @@ fn spinner_verb(elapsed_secs: u64) -> &'static str {
 /// is currently in the middle of calling (cleared once it's actually
 /// executed or a fresh iteration starts) - shown once known instead of
 /// leaving the generic rotating verb as the only signal the whole time.
+/// `reasoning_started` is set by `Agent::run`'s `on_reasoning` callback the
+/// moment a reasoning model's hidden trace actually shows up on the wire -
+/// real proof of life, distinct from simply still waiting on a response.
 async fn spin(
     waiting: Arc<AtomicBool>,
     counts: Arc<SharedTurnCounts>,
     activity: Arc<Mutex<String>>,
+    reasoning_started: Arc<AtomicBool>,
 ) {
     const FRAMES: [&str; 10] = ["-", "\\", "|", "/", "-", "\\", "|", "/", "*", "+"];
     let mut i = 0;
@@ -1587,24 +1618,32 @@ async fn spin(
             && !COMMAND_RUNNING.load(Ordering::SeqCst)
         {
             let elapsed = started.elapsed().as_secs();
+            let is_reasoning = reasoning_started.load(Ordering::SeqCst);
 
-            // A visible running clock, not just a spinning glyph, so a
-            // genuinely long wait (a slow tool call, or a reasoning model
-            // still "thinking") reads as "still working, N seconds so far"
-            // instead of looking identically frozen at 5s and at 5
-            // minutes. Past a minute, that's long enough it's worth a
-            // nudge that this is expected rather than letting it keep
-            // spinning silently - `\x1b[K` (clear to end of line) instead
-            // of padding with spaces, since this label's length changes as
-            // the elapsed count grows.
-            let verb = spinner_verb(elapsed);
-            let mut label = if elapsed < 60 {
-                format!("{verb}... {elapsed}s")
+            let mut label = if is_reasoning {
+                // Nothing left to prove at this point - the wire itself
+                // confirmed the model is actively reasoning, so this drops
+                // the elapsed counter in favor of a livelier, more colorful
+                // indicator instead of repeating the same reassurance.
+                format!("Reasoning{}", reasoning_dots(i))
             } else {
-                format!(
-                    "{verb}... {elapsed}s (a reasoning model can take a while before its \
-                     first visible token - this is expected, not a hang)"
-                )
+                // A visible running clock, not just a spinning glyph, so a
+                // genuinely long wait (a slow tool call, or a reasoning
+                // model whose trace hasn't shown up yet) reads as "still
+                // working, N seconds so far" instead of looking identically
+                // frozen at 5s and at 5 minutes. Past a minute, that's long
+                // enough it's worth a nudge that this is expected rather
+                // than letting it keep spinning silently.
+                let verb = spinner_verb(elapsed);
+                let wait = format_wait_elapsed(elapsed);
+                if elapsed < 60 {
+                    format!("{verb}... {wait}")
+                } else {
+                    format!(
+                        "{verb}... {wait} (a reasoning model can take a while before its \
+                         first visible token - this is expected, not a hang)"
+                    )
+                }
             };
 
             // What's actually happening behind the scenes right now, once
@@ -1641,7 +1680,15 @@ async fn spin(
                 .saturating_sub(prefix_width);
             let label = truncate_to_width(&label, max_label_width);
 
-            print!("\r\x1b[K{} {}", dim(frame), dim(&label));
+            // Brighter cyan instead of the usual dim gray once reasoning is
+            // confirmed underway - a splash of color reads as more "alive"
+            // than the same muted tone used for the plain "still waiting"
+            // phase.
+            if is_reasoning {
+                print!("\r\x1b[K{} {}", cyan(frame), cyan(&label));
+            } else {
+                print!("\r\x1b[K{} {}", dim(frame), dim(&label));
+            }
             let _ = std::io::stdout().flush();
             i += 1;
         }
@@ -1710,6 +1757,14 @@ mod tests {
     }
 
     #[test]
+    fn tool_bullet_colors_by_category() {
+        assert_eq!(tool_bullet("read_file"), blue("●"));
+        assert_eq!(tool_bullet("edit_file"), green("●"));
+        assert_eq!(tool_bullet("run_command"), yellow("●"));
+        assert_eq!(tool_bullet("ask_question"), cyan("●"));
+    }
+
+    #[test]
     fn format_tool_call_uses_the_friendly_label_with_its_argument() {
         assert_eq!(
             format_tool_call("read_file", &serde_json::json!({ "path": "a.rs" })),
@@ -1740,6 +1795,19 @@ mod tests {
     }
 
     #[test]
+    fn colorize_diff_stat_recolors_insertions_green_and_removals_red() {
+        let out = colorize_diff_stat("  ⎿ Wrote 123 bytes to a.rs (+6 -8)");
+        assert!(out.contains(&green("+6")));
+        assert!(out.contains(&red("-8")));
+    }
+
+    #[test]
+    fn colorize_diff_stat_falls_back_to_dim_without_a_stat_suffix() {
+        let out = colorize_diff_stat("  ⎿ some other tool output");
+        assert_eq!(out, dim("  ⎿ some other tool output"));
+    }
+
+    #[test]
     fn split_exit_code_extracts_the_code_and_leaves_the_rest() {
         let (code, body) = split_exit_code("exit code: 0\nrunning 3 tests\nok");
         assert_eq!(code, Some("0"));
@@ -1767,48 +1835,6 @@ mod tests {
     fn spinner_verb_wraps_around_after_the_last_one() {
         let period = 8 * SPINNER_VERBS.len() as u64;
         assert_eq!(spinner_verb(0), spinner_verb(period));
-    }
-
-    #[test]
-    fn tool_category_classifies_every_built_in_tool() {
-        assert_eq!(tool_category("read_file"), ToolCategory::Read);
-        assert_eq!(tool_category("search_code"), ToolCategory::Read);
-        assert_eq!(tool_category("git"), ToolCategory::Read);
-        assert_eq!(tool_category("write_file"), ToolCategory::Edit);
-        assert_eq!(tool_category("append_file"), ToolCategory::Edit);
-        assert_eq!(tool_category("run_command"), ToolCategory::Command);
-        assert_eq!(tool_category("git_commit"), ToolCategory::Command);
-        assert_eq!(tool_category("something_unknown"), ToolCategory::Other);
-    }
-
-    #[test]
-    fn turn_counts_summary_omits_zero_categories_and_pluralizes() {
-        let counts = SharedTurnCounts::default();
-        assert_eq!(counts.snapshot().summary(), None);
-
-        counts.record("read_file");
-        assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
-
-        counts.record("edit_file");
-        assert_eq!(
-            counts.snapshot().summary().as_deref(),
-            Some("Read 1 file · Edited 1 file")
-        );
-
-        counts.record("run_command");
-        counts.record("run_command");
-        assert_eq!(
-            counts.snapshot().summary().as_deref(),
-            Some("Read 1 file · Edited 1 file · Ran 2 commands")
-        );
-    }
-
-    #[test]
-    fn turn_counts_ignores_uncategorized_tools() {
-        let counts = SharedTurnCounts::default();
-        counts.record("outline_file");
-        counts.record("something_unknown");
-        assert_eq!(counts.snapshot().summary().as_deref(), Some("Read 1 file"));
     }
 
     #[test]

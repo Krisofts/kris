@@ -540,6 +540,7 @@ async fn agent_streams_a_tool_call_then_a_final_answer() {
             |delta| streamed_text.push_str(delta),
             |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
             |_| {},
+            || {},
         )
         .await
         .expect("agent turn should succeed against the mock server");
@@ -610,6 +611,7 @@ async fn on_activity_reports_the_tool_name_while_its_arguments_are_still_streami
                 );
                 activity_seen.push(name.to_string());
             },
+            || {},
         )
         .await
         .expect("agent turn should succeed against the mock server");
@@ -660,6 +662,7 @@ async fn connection_failure_after_progress_keeps_history_instead_of_rolling_it_b
             |_delta| {},
             |_name, _args, _result| {},
             |_| {},
+            || {},
         )
         .await
         .expect_err("the second request should fail once the connection is dropped");
@@ -709,6 +712,7 @@ async fn agent_streams_a_tool_call_then_a_final_answer_via_claude() {
             |delta| streamed_text.push_str(delta),
             |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
             |_| {},
+            || {},
         )
         .await
         .expect("agent turn should succeed against the mock Claude server");
@@ -740,7 +744,15 @@ async fn a_rejected_request_surfaces_the_provider_error_body() {
     );
 
     let err = client
-        .chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}, |_| {})
+        .chat_stream(
+            &[Message::user("hi")],
+            None,
+            0.2,
+            512,
+            |_| {},
+            |_| {},
+            || {},
+        )
         .await
         .expect_err("a 400 response should surface as an error");
 
@@ -781,6 +793,7 @@ async fn truncated_reasoning_reply_surfaces_a_diagnostic_instead_of_silence() {
             16,
             |delta| streamed.push_str(delta),
             |_| {},
+            || {},
         )
         .await
         .expect("a truncated-with-no-content stream should still succeed");
@@ -816,6 +829,8 @@ async fn reasoning_trace_is_not_dumped_to_the_terminal() {
     );
 
     let mut streamed = String::new();
+    let reasoning_fired = Arc::new(AtomicUsize::new(0));
+    let reasoning_fired_in_closure = reasoning_fired.clone();
     let outcome = client
         .chat_stream(
             &[Message::user("hi")],
@@ -824,6 +839,9 @@ async fn reasoning_trace_is_not_dumped_to_the_terminal() {
             512,
             |delta| streamed.push_str(delta),
             |_| {},
+            move || {
+                reasoning_fired_in_closure.fetch_add(1, Ordering::SeqCst);
+            },
         )
         .await
         .expect("stream should succeed");
@@ -831,6 +849,11 @@ async fn reasoning_trace_is_not_dumped_to_the_terminal() {
     assert!(!streamed.contains("let me check the file"));
     assert_eq!(streamed, "It says hi.");
     assert_eq!(outcome.content.as_deref(), Some("It says hi."));
+    // Regression test: on_reasoning must fire exactly once as soon as the
+    // hidden reasoning trace shows up - proof the model actually started
+    // "thinking" instead of the connection just sitting idle - so the
+    // REPL's spinner can switch to a livelier display at that point.
+    assert_eq!(reasoning_fired.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -873,7 +896,15 @@ async fn done_marker_ends_the_stream_even_if_the_connection_stays_open() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        client.chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}, |_| {}),
+        client.chat_stream(
+            &[Message::user("hi")],
+            None,
+            0.2,
+            512,
+            |_| {},
+            |_| {},
+            || {},
+        ),
     )
     .await
     .expect(
@@ -927,7 +958,15 @@ async fn a_stream_that_goes_silent_times_out_instead_of_hanging_forever() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),
-        client.chat_stream(&[Message::user("hi")], None, 0.2, 512, |_| {}, |_| {}),
+        client.chat_stream(
+            &[Message::user("hi")],
+            None,
+            0.2,
+            512,
+            |_| {},
+            |_| {},
+            || {},
+        ),
     )
     .await
     .expect("a genuinely silent stream should time out well before the test's own 5s bound")
@@ -976,6 +1015,7 @@ async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
             |_delta| {},
             |_name, _args, _result| {},
             |_| {},
+            || {},
         )
         .await
         .expect("hitting max_iterations should still be a successful turn, not an error");
@@ -1028,6 +1068,7 @@ async fn oscillating_tool_calls_are_detected_as_a_stuck_cycle() {
             |_delta| {},
             |_name, _args, _result| {},
             |_| {},
+            || {},
         )
         .await
         .expect("a detected stuck cycle should still be a successful turn, not an error");
@@ -1079,6 +1120,7 @@ async fn auto_continues_past_a_stuck_round_and_recovers_with_a_final_answer() {
             |_delta| {},
             |_name, _args, _result| {},
             |_| {},
+            || {},
         )
         .await
         .expect("recovering after an auto-continue nudge should be a successful turn");
@@ -1127,6 +1169,7 @@ async fn agent_ignores_hallucinated_call_to_a_nonexistent_tool() {
             |_delta| {},
             |name, _args, result| tool_calls_seen.push((name.to_string(), result.to_string())),
             |_| {},
+            || {},
         )
         .await
         .expect("agent turn should succeed even with a hallucinated tool name");
@@ -1229,6 +1272,7 @@ async fn project_kris_md_conventions_are_folded_into_the_system_prompt() {
             |_delta| {},
             |_name, _args, _result| {},
             |_| {},
+            || {},
         )
         .await
         .expect("agent turn should succeed");

@@ -12,7 +12,10 @@ use serde_json::{json, Value};
 use crate::style::{blue, dim};
 use crate::term::{terminal_width, truncate_to_width};
 
-use super::{truncate_to_byte_limit, Tool, ToolError, AWAITING_CONFIRMATION, COMMAND_RUNNING};
+use super::{
+    truncate_to_byte_limit, SharedTurnCounts, Tool, ToolError, AWAITING_CONFIRMATION,
+    COMMAND_RUNNING,
+};
 
 const MAX_OUTPUT: usize = 4000;
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,12 +34,14 @@ const SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
 
 pub struct RunCommandTool {
     auto_approve: Cell<bool>,
+    turn_counts: Arc<SharedTurnCounts>,
 }
 
 impl RunCommandTool {
-    pub fn new(auto_approve: bool) -> Self {
+    pub fn new(auto_approve: bool, turn_counts: Arc<SharedTurnCounts>) -> Self {
         Self {
             auto_approve: Cell::new(auto_approve),
+            turn_counts,
         }
     }
 }
@@ -133,6 +138,11 @@ impl Tool for RunCommandTool {
         // build` pulling dependencies) otherwise leaves the screen
         // completely still, with no way to tell it from a genuine hang,
         // for however long it takes to finish or hit the timeout below.
+        // Shows which command it is and this turn's live "Read N · Edited
+        // N · Ran N" tally too - not just a bare elapsed count - since
+        // `COMMAND_RUNNING` stops the REPL's own spinner (which would
+        // otherwise show both) from drawing over this one for the entire
+        // stretch a command runs.
         let status_code = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.code(),
@@ -143,10 +153,17 @@ impl Tool for RunCommandTool {
                         timed_out = true;
                         break None;
                     }
+                    let label = command_status_label(
+                        command,
+                        start.elapsed().as_secs(),
+                        self.turn_counts.snapshot().summary().as_deref(),
+                    );
+                    let max_label_width = terminal_width().saturating_sub(3);
+                    let label = truncate_to_width(&label, max_label_width);
                     print!(
                         "\r\x1b[K{} {}",
                         dim(SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]),
-                        dim(&format!("running... {}s", start.elapsed().as_secs()))
+                        dim(&label)
                     );
                     let _ = io::stdout().flush();
                     frame += 1;
@@ -221,6 +238,18 @@ impl Tool for RunCommandTool {
 /// same border style `print_boxed_output` in repl.rs uses for a command's
 /// result, so what's about to run and what it produced read as one
 /// consistent shape instead of two different box styles.
+/// Builds the live status line shown for however long a command takes to
+/// finish - pulled out into its own function (rather than inlined in the
+/// polling loop) so the tally actually shows up in it can be asserted on
+/// directly, without capturing real stdout.
+fn command_status_label(command: &str, elapsed_secs: u64, tally: Option<&str>) -> String {
+    let mut label = format!("Run({command}) · running... {elapsed_secs}s");
+    if let Some(tally) = tally {
+        label = format!("{label} · {tally}");
+    }
+    label
+}
+
 fn print_confirmation_box(root: &Path, command: &str) {
     let title = format!("KRIS wants to run a command in {}:", root.display());
 
@@ -291,6 +320,28 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn command_status_label_shows_the_command_and_the_live_tally() {
+        // Regression test: the live status line shown for however long a
+        // command runs used to be a bare "running... Ns", with no way to
+        // tell which command was running or how much of the turn had
+        // already happened - `COMMAND_RUNNING` stops the REPL's own
+        // spinner (which otherwise shows exactly this) from drawing over
+        // this one for that entire stretch, so this line is the only thing
+        // on screen the whole time a slow command runs.
+        let label = command_status_label("cargo build", 5, Some("Read 14 files · Edited 2 files"));
+        assert_eq!(
+            label,
+            "Run(cargo build) · running... 5s · Read 14 files · Edited 2 files"
+        );
+    }
+
+    #[test]
+    fn command_status_label_omits_the_tally_when_theres_nothing_to_show_yet() {
+        let label = command_status_label("cargo build", 0, None);
+        assert_eq!(label, "Run(cargo build) · running... 0s");
+    }
+
+    #[test]
     fn a_backgrounded_child_holding_stdout_open_does_not_hang_forever() {
         // Regression test: `sh -c "cmd &"` returns almost immediately once
         // it backgrounds a process, but that process inherits the same
@@ -302,7 +353,7 @@ mod tests {
         // thread here so the test can bound how long it waits, rather than
         // hanging the whole suite if this regresses.
         let dir = tempfile::tempdir().unwrap();
-        let tool = RunCommandTool::new(true);
+        let tool = RunCommandTool::new(true, Arc::new(SharedTurnCounts::default()));
         let root = dir.path().to_path_buf();
 
         let (tx, rx) = mpsc::channel();

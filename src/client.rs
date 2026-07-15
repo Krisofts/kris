@@ -265,6 +265,7 @@ impl ModelClient {
     /// live, and returns the fully accumulated content/tool_calls once the
     /// stream ends. Dispatches to the OpenAI-shaped or Claude-native
     /// implementation depending on `backend`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn chat_stream(
         &self,
         messages: &[Message],
@@ -273,6 +274,7 @@ impl ModelClient {
         max_tokens: u32,
         on_delta: impl FnMut(&str),
         on_activity: impl FnMut(&str),
+        on_reasoning: impl FnMut(),
     ) -> Result<StreamOutcome> {
         match self.backend {
             Backend::OpenAiCompat => {
@@ -283,10 +285,16 @@ impl ModelClient {
                     max_tokens,
                     on_delta,
                     on_activity,
+                    on_reasoning,
                 )
                 .await
             }
             Backend::Anthropic => {
+                // Claude's native Messages API only ever sends "thinking"
+                // content blocks when a request explicitly opts into
+                // extended thinking, which KRIS never does - so there's
+                // nothing for on_reasoning to ever fire on here.
+                let _ = on_reasoning;
                 self.chat_stream_anthropic(
                     messages,
                     tools,
@@ -303,6 +311,7 @@ impl ModelClient {
     /// Retries the initial connection (not a mid-stream drop) a few times
     /// with backoff, since a connection refusal can be a transient blip
     /// rather than the provider actually being down.
+    #[allow(clippy::too_many_arguments)]
     async fn chat_stream_openai(
         &self,
         messages: &[Message],
@@ -311,6 +320,7 @@ impl ModelClient {
         max_tokens: u32,
         mut on_delta: impl FnMut(&str),
         mut on_activity: impl FnMut(&str),
+        mut on_reasoning: impl FnMut(),
     ) -> Result<StreamOutcome> {
         let url = self.chat_url();
 
@@ -360,6 +370,7 @@ impl ModelClient {
         let mut prompt_tokens = None;
         let mut mode = StreamMode::Deciding(String::new());
         let mut finish_reason: Option<String> = None;
+        let mut reasoning_started = false;
 
         // Labeled so "[DONE]" can end the whole read loop immediately,
         // rather than relying on the connection itself closing right
@@ -424,7 +435,23 @@ impl ModelClient {
                     // toward `got_any_content` either way, so a reasoning-
                     // only stream still triggers the truncation
                     // diagnostic below rather than being mistaken for a
-                    // real answer.
+                    // real answer. `on_reasoning` fires once, the moment
+                    // any of it shows up, so the spinner can switch to a
+                    // livelier display now that there's real proof the
+                    // model has actually started working instead of the
+                    // connection just sitting idle.
+                    let reasoning_text = choice
+                        .delta
+                        .reasoning
+                        .as_deref()
+                        .or(choice.delta.reasoning_content.as_deref());
+                    if let Some(text) = reasoning_text {
+                        if !text.is_empty() && !reasoning_started {
+                            reasoning_started = true;
+                            on_reasoning();
+                        }
+                    }
+
                     if let Some(text) = choice.delta.content {
                         if !text.is_empty() {
                             content.push_str(&text);
@@ -704,6 +731,18 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    /// A reasoning model's hidden chain-of-thought, spelled `reasoning` by
+    /// some providers and `reasoning_content` by others - never printed
+    /// (see `chat_stream_openai`'s own comment on why), but its mere
+    /// presence is still useful: it's the only real signal that the model
+    /// has actually started "thinking" rather than the connection just
+    /// sitting idle, which `chat_stream_openai` surfaces via `on_reasoning`
+    /// so the REPL's spinner can switch out of its plain elapsed-time
+    /// display once there's real proof of life.
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -1204,21 +1243,29 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_delta_is_ignored_rather_than_failing_to_parse() {
-        // A reasoning model's delta.reasoning/reasoning_content is
-        // deliberately not modeled - streaming it raw used to flood a
-        // phone terminal with a wall of chain-of-thought text (confirmed
-        // on-device). It must still parse cleanly as an unknown field
-        // (content stays None) rather than erroring the whole chunk out.
+    fn reasoning_delta_parses_separately_from_content_and_is_never_streamed_to_on_delta() {
+        // A reasoning model's delta.reasoning/reasoning_content is modeled
+        // (so its mere presence can drive on_reasoning), but deliberately
+        // kept out of `content` - streaming it raw used to flood a phone
+        // terminal with a wall of chain-of-thought text (confirmed
+        // on-device).
         let chunk: ChatChunk =
             serde_json::from_str(r#"{"choices":[{"delta":{"reasoning":"pondering..."}}]}"#)
                 .unwrap();
         assert!(chunk.choices[0].delta.content.is_none());
+        assert_eq!(
+            chunk.choices[0].delta.reasoning.as_deref(),
+            Some("pondering...")
+        );
 
         let chunk: ChatChunk =
             serde_json::from_str(r#"{"choices":[{"delta":{"reasoning_content":"pondering..."}}]}"#)
                 .unwrap();
         assert!(chunk.choices[0].delta.content.is_none());
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("pondering...")
+        );
     }
 
     #[test]
