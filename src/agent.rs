@@ -131,12 +131,16 @@ impl Agent {
             Backend::Anthropic => self.tools.describe_all_anthropic(),
         };
 
-        // Tracks the previous iteration's tool call(s) so an identical
-        // repeat (the model proposing the exact same call again right
-        // after it was declined or errored, with nothing about the
-        // situation having changed) stops the turn instead of looping
-        // through the rest of `max_iterations` asking the same thing.
-        let mut previous_call_signature: Option<String> = None;
+        // Every iteration's tool-call signature this turn, oldest first, so
+        // a stuck loop can be caught two ways: an exact repeat of the
+        // immediately-prior call (the model proposing the same thing again
+        // right after it was declined or errored, with nothing else
+        // changed), or a longer cycle - alternating between the same two or
+        // more distinct calls (A, B, A, B, ...) without ever converging on
+        // an answer, which a single-previous-call comparison can never
+        // catch since each individual comparison only ever sees a
+        // *different* immediately-prior call.
+        let mut call_signatures: Vec<String> = Vec::new();
 
         // Last exact prompt-token count the provider reported, paired with
         // the history length it was measured at, so the budget check can
@@ -256,16 +260,34 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join("|");
 
-            if previous_call_signature.as_deref() == Some(signature.as_str()) {
-                let notice = "Stopped: the same tool call was proposed again right after it \
-                     was declined or failed, with nothing else changed. Ask again with more \
-                     detail, or approve the action if you do want it to run."
-                    .to_string();
+            let is_immediate_repeat =
+                call_signatures.last().map(String::as_str) == Some(signature.as_str());
+            call_signatures.push(signature);
+
+            let stuck_cycle = if is_immediate_repeat {
+                Some(1)
+            } else {
+                detect_repeating_cycle(&call_signatures)
+            };
+
+            if let Some(period) = stuck_cycle {
+                let notice = if period == 1 {
+                    "Stopped: the same tool call was proposed again right after it was \
+                         declined or failed, with nothing else changed. Ask again with more \
+                         detail, or approve the action if you do want it to run."
+                        .to_string()
+                } else {
+                    format!(
+                        "Stopped: got stuck cycling through the same {period} tool calls \
+                         over and over without making progress toward an answer. Ask KRIS to \
+                         continue with more specific guidance instead of repeating the same \
+                         steps."
+                    )
+                };
                 on_delta(&notice);
                 history.push(Message::assistant_text(notice.clone()));
                 return Ok(notice);
             }
-            previous_call_signature = Some(signature);
 
             history.push(Message::assistant_tool_calls(
                 outcome.content.clone(),
@@ -450,6 +472,33 @@ pub fn heuristic_tokens(history: &[Message]) -> usize {
             (content_len + calls_len) / 4
         })
         .sum()
+}
+
+/// Detects whether the tail of `signatures` (each entry one iteration's
+/// tool-call signature) consists of a short cycle - period 2 up to 4 -
+/// repeated at least 3 full times in a row, e.g. the model alternating
+/// between the same two tool calls (A, B, A, B, A, B) without ever
+/// converging on a final answer. An exact single-call repeat (period 1) is
+/// handled separately by the caller, since that's unambiguous after just
+/// one repeat; a longer cycle needs a few repetitions before it's safe to
+/// call stuck rather than a coincidence (e.g. running the same build
+/// command twice, a few edits apart, is completely normal).
+fn detect_repeating_cycle(signatures: &[String]) -> Option<usize> {
+    const MIN_REPEATS: usize = 3;
+    const MAX_PERIOD: usize = 4;
+
+    for period in 2..=MAX_PERIOD {
+        let needed = period * MIN_REPEATS;
+        if signatures.len() < needed {
+            continue;
+        }
+        let tail = &signatures[signatures.len() - needed..];
+        let pattern = &tail[..period];
+        if tail.chunks(period).all(|chunk| chunk == pattern) {
+            return Some(period);
+        }
+    }
+    None
 }
 
 /// Defensive fallback: if the provider ever returns a tool call as plain

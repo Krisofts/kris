@@ -333,6 +333,78 @@ async fn handle_endless_tool_call_connection(mut stream: TcpStream, chat_calls: 
     }
 }
 
+/// Like `spawn_endless_tool_call_server`, but alternates between two
+/// distinct tool calls (read_file a.txt, read_file b.txt, a.txt, b.txt, ...)
+/// instead of varying the argument every single time - simulates a model
+/// stuck oscillating between the same two calls without ever converging on
+/// a final answer. Returns the shared call counter too, so a test can assert
+/// how many requests were actually made (i.e. that a cycle got caught early
+/// rather than burning the whole max_iterations budget).
+async fn spawn_oscillating_tool_call_server() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+    let chat_calls_for_server = chat_calls.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(handle_oscillating_tool_call_connection(
+                stream,
+                chat_calls_for_server.clone(),
+            ));
+        }
+    });
+
+    (format!("http://{addr}"), chat_calls)
+}
+
+async fn handle_oscillating_tool_call_connection(
+    mut stream: TcpStream,
+    chat_calls: Arc<AtomicUsize>,
+) {
+    let header_text = read_request_headers(&mut stream).await;
+    let path = header_text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("");
+
+    match path {
+        "/chat/completions" => {
+            let index = chat_calls.fetch_add(1, Ordering::SeqCst);
+            let file = if index.is_multiple_of(2) {
+                "a.txt"
+            } else {
+                "b.txt"
+            };
+            let payload = serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": format!("call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": format!("{{\"path\": \"{file}\"}}"),
+                            }
+                        }]
+                    }
+                }]
+            });
+            let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+            respond(&mut stream, "text/event-stream", &body).await;
+        }
+        other => panic!("mock server got an unexpected request path: {other}"),
+    }
+}
+
 async fn spawn_single_response_server(body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -847,6 +919,58 @@ async fn reaching_max_iterations_persists_the_notice_and_invites_a_continue() {
     let last = history.last().expect("history should not be empty");
     assert_eq!(last.role, Role::Assistant);
     assert_eq!(last.content.as_deref(), Some(answer.as_str()));
+}
+
+#[tokio::test]
+async fn oscillating_tool_calls_are_detected_as_a_stuck_cycle() {
+    // Regression test: a model alternating between the same two distinct
+    // tool calls (A, B, A, B, ...) without ever converging on a final answer
+    // used to silently burn through the entire max_iterations budget before
+    // falling through to the generic "reached the maximum" notice - the old
+    // duplicate check only ever caught an exact repeat of the single
+    // immediately-prior call, not a longer alternating cycle.
+    let (base_url, chat_calls) = spawn_oscillating_tool_call_server().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let client = ModelClient::new(
+        base_url,
+        "test-model".to_string(),
+        Backend::OpenAiCompat,
+        None,
+    );
+    let agent = Agent::new(
+        client,
+        ToolRegistry::with_defaults(false, false),
+        0.2,
+        512,
+        8192,
+    );
+
+    let mut history: Vec<Message> = Vec::new();
+
+    let answer = agent
+        .run(
+            &mut history,
+            Project {
+                root: dir.path(),
+                name: "test-project",
+                type_hint: "",
+            },
+            "alternate between two files forever",
+            10,
+            |_delta| {},
+            |_name, _args, _result| {},
+            |_| {},
+        )
+        .await
+        .expect("a detected stuck cycle should still be a successful turn, not an error");
+
+    assert!(
+        answer.to_lowercase().contains("cycl") || answer.to_lowercase().contains("stuck"),
+        "expected a cycle-detection notice, got: {answer}"
+    );
+    // Stopped well before exhausting all 10 available iterations.
+    assert!(chat_calls.load(Ordering::SeqCst) < 10);
 }
 
 #[tokio::test]
