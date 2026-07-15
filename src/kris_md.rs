@@ -22,6 +22,14 @@ Project conventions KRIS should follow here.
   the new functionality into its own, appropriately named file instead
   of letting it keep growing.
 
+## Documentation
+
+- Always create a README.md for the project if it doesn't have one yet -
+  what it does, how to build/run it, and how to use it.
+- Always keep README.md updated as the project evolves - a new feature,
+  command, or setup step that changes how the project is used belongs
+  there too, not just in code comments or commit messages.
+
 ## Before finishing a task
 
 - Always run the project's full test suite after making changes - not
@@ -91,6 +99,7 @@ mod tests {
         assert!(content.contains("cargo clippy"));
         assert!(content.contains("cargo fmt"));
         assert!(content.contains("smoke test"));
+        assert!(content.contains("README.md"));
     }
 
     #[test]

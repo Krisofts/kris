@@ -30,10 +30,11 @@ machine. Switch providers at any time with `mode gemini` / `mode claude` /
   *that* project's own last conversation instead of starting blank; `clear`
   wipes it for good.
 - Seeds every brand-new, empty project with its own `KRIS.md` (house rules:
-  keep files under 300 lines, always run the full test suite plus the
-  project's own linter/formatter if it has one, and always smoke-test
-  before finishing) and folds a project's `KRIS.md` straight into every
-  session so its conventions actually get followed, not just written once
+  keep files under 300 lines, always create and keep README.md updated,
+  always run the full test suite plus the project's own linter/formatter
+  if it has one, and always smoke-test before finishing) and folds a
+  project's `KRIS.md` straight into every session so its conventions
+  actually get followed, not just written once
   and forgotten.
   Customize `~/.config/kris/KRIS.md` to change the default template.
 
