@@ -232,7 +232,9 @@ Inside the REPL:
 | `health` | check whether the active provider has an API key configured |
 | `mode [gemini\|claude\|openrouter\|opper\|opencode]` | show/switch between providers |
 | `project [name\|path]` | pick a project with arrow keys, switch straight to `<name>`, or pass a `<path>` to change the projects folder itself |
-| `resume` | pick a saved session (any project, most recently used first) with arrow keys and switch straight to it |
+| `resume` | pick a saved session (any project, starred ones first, then most recently used) with arrow keys and switch straight to it |
+| `star [name]` | star/unstar a saved session (shown with a leading ★ and sorted first) - pick with arrow keys, or name a project directly |
+| `delete-session [name]` | permanently delete a saved session from disk (asks for confirmation) - pick with arrow keys, or name a project directly |
 | `export [filename]` | save the current conversation as readable Markdown (defaults to `kris-export-<timestamp>.md` in the project root) |
 | `compact [instructions]` | ask the model to summarize the conversation so far, then continue from that recap instead of the full history |
 | `config [set key value]` | show or change settings (saved to `config.toml`) |

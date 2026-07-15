@@ -52,6 +52,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "mode",
     "project",
     "resume",
+    "star",
+    "delete-session",
     "export",
     "compact",
     "config",
@@ -400,6 +402,8 @@ async fn dispatch(session: &mut Session, line: &str) -> bool {
         "mode" => handle_mode(session, rest),
         "project" => handle_project(session, rest),
         "resume" => handle_resume(session),
+        "star" => handle_star(rest),
+        "delete-session" => handle_delete_session(session, rest),
         "export" => handle_export(session, rest),
         "compact" => handle_compact(session, rest).await,
         "config" => handle_config(session, rest),
@@ -762,11 +766,76 @@ fn apply_project_switch(session: &mut Session, name: &str) {
     );
 }
 
+/// Builds the "★ name (path) - N pesan - time ago" label shown by every
+/// session-picking command (`resume`, `star`, `delete-session`) - the
+/// leading star only appears for a session actually marked starred, so
+/// the same list reads consistently no matter which command shows it.
+fn session_label(s: &session_store::SessionSummary) -> String {
+    let name = s
+        .root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| s.root.display().to_string());
+    let ago = format_time_ago(s.modified.elapsed().unwrap_or_default());
+    let star = if s.starred { "\u{2605} " } else { "" };
+    format!(
+        "{star}{name} ({}) - {} pesan - {ago}",
+        s.root.display(),
+        s.message_count
+    )
+}
+
+/// Shows an arrow-key picker over `sessions` and returns the chosen one's
+/// root - `None` if cancelled, or if the terminal doesn't support the
+/// interactive picker (falls back to a plain numbered list printed to
+/// stdout, same spirit as `project`'s own fallback, since there's no
+/// line-based way to choose without one).
+fn pick_session(sessions: &[session_store::SessionSummary], prompt: &str) -> Option<PathBuf> {
+    let labels: Vec<String> = sessions.iter().map(session_label).collect();
+    let full_prompt = format!("{prompt} (\u{2191}/\u{2193} pilih, Enter konfirmasi, Esc batal):");
+
+    match picker::pick(&full_prompt, &labels, None) {
+        picker::PickOutcome::Chosen(label) => {
+            let index = labels.iter().position(|l| *l == label).unwrap();
+            Some(sessions[index].root.clone())
+        }
+        picker::PickOutcome::Cancelled => None,
+        picker::PickOutcome::Unavailable => {
+            println!("Sesi tersimpan:");
+            for (i, label) in labels.iter().enumerate() {
+                println!("  {}) {label}", i + 1);
+            }
+            println!(
+                "{}",
+                dim("Terminal ini tidak mendukung picker interaktif - sebutkan nama project langsung.")
+            );
+            None
+        }
+    }
+}
+
+/// Finds a saved session by its project folder's own name (not the full
+/// path) - the same direct-target shortcut `project <name>` already
+/// offers, so `star <name>`/`delete-session <name>` don't always require
+/// the interactive picker.
+fn find_session_by_name<'a>(
+    sessions: &'a [session_store::SessionSummary],
+    name: &str,
+) -> Option<&'a session_store::SessionSummary> {
+    sessions.iter().find(|s| {
+        s.root
+            .file_name()
+            .map(|n| n.to_string_lossy() == name)
+            .unwrap_or(false)
+    })
+}
+
 /// KRIS's counterpart to Claude Code's own `/resume`: shows a picker of
-/// every project with a saved conversation (most recently used first,
-/// across the whole machine rather than scoped to the current workspace -
-/// KRIS has no notion of "worktree" to scope by) and switches straight to
-/// whichever one is chosen, loading its session in the process.
+/// every project with a saved conversation (starred ones first, then most
+/// recently used - across the whole machine rather than scoped to the
+/// current workspace, since KRIS has no notion of "worktree" to scope by)
+/// and switches straight to whichever one is chosen, loading its session
+/// in the process.
 fn handle_resume(session: &mut Session) {
     let sessions = session_store::list_sessions();
 
@@ -775,52 +844,130 @@ fn handle_resume(session: &mut Session) {
         return;
     }
 
-    let labels: Vec<String> = sessions
-        .iter()
-        .map(|s| {
-            let name = s
-                .root
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| s.root.display().to_string());
-            let ago = format_time_ago(s.modified.elapsed().unwrap_or_default());
-            format!(
-                "{name} ({}) - {} pesan - {ago}",
-                s.root.display(),
-                s.message_count
-            )
-        })
-        .collect();
+    let Some(root) = pick_session(&sessions, "Pilih sesi untuk dilanjutkan") else {
+        return;
+    };
 
-    let prompt =
-        "Pilih sesi untuk dilanjutkan (\u{2191}/\u{2193} pilih, Enter konfirmasi, Esc batal):";
-
-    match picker::pick(prompt, &labels, None) {
-        picker::PickOutcome::Chosen(label) => {
-            let index = labels.iter().position(|l| *l == label).unwrap();
-            let root = sessions[index].root.clone();
-            session.switch_to_root(&root);
-            if let Err(err) = session.settings.save() {
-                println!("{}", red(&format!("Failed to save config: {err}")));
-            }
-            println!(
-                "{}",
-                green(&format!(
-                    "Melanjutkan sesi di {} ({} pesan)",
-                    session.root.display(),
-                    session.history.len()
-                ))
-            );
-        }
-        picker::PickOutcome::Cancelled => {}
-        picker::PickOutcome::Unavailable => {
-            println!("Sesi tersimpan:");
-            for (i, label) in labels.iter().enumerate() {
-                println!("  {}) {label}", i + 1);
-            }
-            println!("{}", dim("Terminal ini tidak mendukung picker interaktif."));
-        }
+    session.switch_to_root(&root);
+    if let Err(err) = session.settings.save() {
+        println!("{}", red(&format!("Failed to save config: {err}")));
     }
+    println!(
+        "{}",
+        green(&format!(
+            "Melanjutkan sesi di {} ({} pesan)",
+            session.root.display(),
+            session.history.len()
+        ))
+    );
+}
+
+/// Toggles whether a saved session is starred (shown with a leading "★"
+/// and sorted first by `resume`/`delete-session`'s own pickers) - `arg`
+/// picks a session directly by its project folder name, same as `project
+/// <name>`; empty shows the interactive picker instead.
+fn handle_star(arg: &str) {
+    let sessions = session_store::list_sessions();
+
+    if sessions.is_empty() {
+        println!("{}", yellow("Belum ada sesi tersimpan."));
+        return;
+    }
+
+    let target = if arg.is_empty() {
+        pick_session(&sessions, "Pilih sesi untuk di-star/unstar")
+    } else {
+        match find_session_by_name(&sessions, arg) {
+            Some(s) => Some(s.root.clone()),
+            None => {
+                println!(
+                    "{}",
+                    red(&format!("Tidak ada sesi tersimpan bernama \"{arg}\"."))
+                );
+                None
+            }
+        }
+    };
+
+    let Some(root) = target else {
+        return;
+    };
+
+    let currently_starred = sessions
+        .iter()
+        .find(|s| s.root == root)
+        .map(|s| s.starred)
+        .unwrap_or(false);
+    let new_starred = !currently_starred;
+
+    if let Err(err) = session_store::set_starred(&root, new_starred) {
+        println!("{}", red(&format!("Failed to update session: {err}")));
+        return;
+    }
+
+    let (marker, verb) = if new_starred {
+        ("\u{2605}", "ditandai bintang")
+    } else {
+        (" ", "dihapus tandanya")
+    };
+    println!(
+        "{} {}",
+        marker,
+        green(&format!("Sesi {} {}.", root.display(), verb))
+    );
+}
+
+/// Permanently deletes a saved session's file from disk - distinct from
+/// `clear`, which only ever clears the *current* session; this can remove
+/// any saved one, chosen from the picker (or matched directly by project
+/// folder name via `arg`, same as `star`). Asks for a y/N confirmation
+/// first since this can't be undone. Clears it from the active in-memory
+/// history too if it happened to be the one just deleted, so it isn't
+/// immediately re-saved on the next turn.
+fn handle_delete_session(session: &mut Session, arg: &str) {
+    let sessions = session_store::list_sessions();
+
+    if sessions.is_empty() {
+        println!("{}", yellow("Belum ada sesi tersimpan."));
+        return;
+    }
+
+    let target = if arg.is_empty() {
+        pick_session(&sessions, "Pilih sesi untuk dihapus")
+    } else {
+        match find_session_by_name(&sessions, arg) {
+            Some(s) => Some(s.root.clone()),
+            None => {
+                println!(
+                    "{}",
+                    red(&format!("Tidak ada sesi tersimpan bernama \"{arg}\"."))
+                );
+                None
+            }
+        }
+    };
+
+    let Some(root) = target else {
+        return;
+    };
+
+    print!("Hapus sesi {} secara permanen? [y/N]: ", root.display());
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        println!("{}", red("Tidak bisa membaca konfirmasi."));
+        return;
+    }
+    if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+        println!("{}", dim("Dibatalkan."));
+        return;
+    }
+
+    session_store::clear(&root);
+    if root == session.root {
+        session.history.clear();
+    }
+    println!("{}", green(&format!("Sesi {} dihapus.", root.display())));
 }
 
 /// Rough "N ago" label for the `resume` picker - bucketed coarsely (not
@@ -999,6 +1146,8 @@ fn print_help() {
     println!("  health                check whether the active provider has an API key configured");
     println!("  project [name|path]   pick a project with arrow keys, switch straight to <name>, or pass a <path> (e.g. ~/projects) to change the projects folder itself");
     println!("  resume                pick a saved session (any project) with arrow keys and switch straight to it");
+    println!("  star [name]           star/unstar a saved session so it sorts first in resume/delete-session's picker");
+    println!("  delete-session [name] permanently delete a saved session (asks for confirmation)");
     println!("  export [filename]     save the current conversation as readable Markdown");
     println!("  compact [instructions] summarize the conversation so far and continue from that recap instead of the full history");
     println!("  config [set k v]      show or change settings (saved to config.toml)");
@@ -1789,6 +1938,44 @@ mod tests {
     #[test]
     fn friendly_tool_label_falls_back_to_the_raw_name_for_anything_unlisted() {
         assert_eq!(friendly_tool_label("some_future_tool"), "some_future_tool");
+    }
+
+    fn test_session(
+        root: &str,
+        message_count: usize,
+        starred: bool,
+    ) -> session_store::SessionSummary {
+        session_store::SessionSummary {
+            root: PathBuf::from(root),
+            message_count,
+            modified: std::time::SystemTime::now(),
+            starred,
+        }
+    }
+
+    #[test]
+    fn session_label_shows_a_leading_star_only_when_starred() {
+        let starred = session_label(&test_session("/projects/foo", 3, true));
+        assert!(starred.starts_with('\u{2605}'));
+        assert!(starred.contains("foo"));
+        assert!(starred.contains("3 pesan"));
+
+        let unstarred = session_label(&test_session("/projects/bar", 1, false));
+        assert!(!unstarred.starts_with('\u{2605}'));
+        assert!(unstarred.contains("bar"));
+    }
+
+    #[test]
+    fn find_session_by_name_matches_the_projects_own_folder_name() {
+        let sessions = vec![
+            test_session("/projects/foo", 1, false),
+            test_session("/projects/bar", 2, false),
+        ];
+
+        let found = find_session_by_name(&sessions, "bar").unwrap();
+        assert_eq!(found.root, PathBuf::from("/projects/bar"));
+
+        assert!(find_session_by_name(&sessions, "nonexistent").is_none());
     }
 
     #[test]
